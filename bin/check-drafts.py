@@ -4,8 +4,8 @@
 The post-draft cron entries hardcode dates, which silently fire on the wrong
 day if a commissioner moves the draft. This runs hourly, asks each provider
 for the real draft state, and refreshes the snapshot as soon as a draft has
-completed but the cached roster is still empty. It is idempotent: once the
-snapshot has players, it does nothing.
+completed but that league's cached roster is still empty. It tracks providers
+independently, so leagues drafting on different dates each trigger a sync.
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from notifier.config import load_config  # noqa: E402
+from notifier.drafts import completed_unsynced_league_keys  # noqa: E402
 from notifier.logging_utils import configure_logging, structured_log  # noqa: E402
 from notifier.notify import send_plain  # noqa: E402
 from notifier.roster import load_snapshot, refresh_snapshot  # noqa: E402
@@ -70,47 +71,50 @@ def main() -> int:
     configure_logging()
     config = load_config()
     session = requests.Session()
+    snapshot = load_snapshot(config)
 
     states: dict[str, tuple[str, datetime | None]] = {}
+    labels: dict[str, str] = {}
     if config.espn_enabled:
+        league_key = f"espn:{config.espn_league_id}"
+        labels[league_key] = "ESPN"
         try:
-            states["ESPN"] = espn_draft_state(config)
+            states[league_key] = espn_draft_state(config)
         except requests.RequestException as error:
             structured_log(logging.WARNING, "draft.espn_check_failed", error=str(error))
-    for league in load_snapshot(config).leagues:
+    for league in snapshot.leagues:
         if league.provider == "sleeper":
+            labels[league.key] = league.name
             try:
-                states[league.name] = sleeper_draft_state(session, league.league_id)
+                states[league.key] = sleeper_draft_state(session, league.league_id)
             except requests.RequestException as error:
                 structured_log(
                     logging.WARNING, "draft.sleeper_check_failed", error=str(error)
                 )
 
-    for name, (status, when) in states.items():
+    for league_key, (status, when) in states.items():
         structured_log(
             logging.INFO,
             "draft.status",
-            league=name,
+            league=labels.get(league_key, league_key),
             status=status,
             draftAt=when.astimezone(PACIFIC).isoformat() if when else None,
         )
 
-    snapshot = load_snapshot(config)
-    if snapshot.mine():
-        return 0  # already drafted and synced; nothing to do
+    pending_keys = completed_unsynced_league_keys(snapshot, states)
+    if not pending_keys:
+        return 0
 
-    if not any(status == "complete" for status, _ in states.values()):
-        return 0  # nothing has drafted yet
-
-    structured_log(logging.INFO, "draft.completed_syncing")
+    structured_log(logging.INFO, "draft.completed_syncing", leagueKeys=pending_keys)
     refreshed = refresh_snapshot(config)
-    drafted = len(refreshed.mine())
-    if drafted:
+    synced_keys = [key for key in pending_keys if refreshed.is_drafted(key)]
+    synced_players = sum(len(refreshed.mine(key)) for key in synced_keys)
+    if synced_players:
         send_plain(
             session,
             config,
-            f"Draft detected - synced <b>{drafted}</b> players across "
-            f"{len(refreshed.leagues)} leagues. Full roster alerts are live.",
+            f"Draft detected - synced <b>{synced_players}</b> players across "
+            f"{len(synced_keys)} newly drafted league(s). Roster alerts are live.",
         )
     return 0
 

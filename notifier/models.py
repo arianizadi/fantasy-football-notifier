@@ -74,6 +74,14 @@ class RosterSnapshot:
             if player.on_my_team and (league_key is None or player.league_key == league_key)
         ]
 
+    def drafted_leagues(self) -> list[LeagueRef]:
+        """Leagues whose snapshot contains at least one player owned by the user."""
+        drafted_keys = {player.league_key for player in self.players if player.on_my_team}
+        return [league for league in self.leagues if league.key in drafted_keys]
+
+    def is_drafted(self, league_key: str) -> bool:
+        return any(player.on_my_team and player.league_key == league_key for player in self.players)
+
     def league(self, league_key: str) -> LeagueRef | None:
         for ref in self.leagues:
             if ref.key == league_key:

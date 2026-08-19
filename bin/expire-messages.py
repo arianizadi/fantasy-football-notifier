@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from notifier.config import load_config  # noqa: E402
+from notifier.expiry import expire_due_messages  # noqa: E402
 from notifier.logging_utils import configure_logging, structured_log  # noqa: E402
 from notifier.notify import delete_message, history  # noqa: E402
 
@@ -32,23 +33,20 @@ def main() -> int:
         return 0
 
     store = history(config)
-    deletable, too_old = store.due(config.message_ttl_hours * 3600)
-
     session = requests.Session()
-    deleted = [mid for mid in deletable if delete_message(session, config, mid)]
-    failed = [mid for mid in deletable if mid not in deleted]
-
-    # Stop tracking anything handled or now undeletable.
-    store.forget(deleted + too_old + failed)
-    store.save()
+    result = expire_due_messages(
+        store,
+        config.message_ttl_hours * 3600,
+        lambda message_id: delete_message(session, config, message_id),
+    )
 
     structured_log(
         logging.INFO,
         "expire.complete",
         ttlHours=config.message_ttl_hours,
-        deleted=len(deleted),
-        failed=len(failed),
-        pastWindow=len(too_old),
+        deleted=len(result.deleted),
+        failed=len(result.failed),
+        pastWindow=len(result.too_old),
         stillTracked=len(store),
     )
     return 0
