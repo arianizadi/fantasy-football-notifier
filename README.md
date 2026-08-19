@@ -212,7 +212,23 @@ pull request without requiring provider credentials.
 
 ### systemd deployment
 
+Runner is a git checkout of this repo at
+`/home/arian/services/fantasy-news-notifier`, tracking `origin/main`.
+Redeploys are a pull, not a file copy:
+
 ```bash
+ssh Runner
+~/services/fantasy-news-notifier/deploy/redeploy.sh
+```
+
+That fetches, resets to `origin/main`, installs deps, runs the tests, and
+restarts the unit. `.env`, `state/*.json` and `.venv/` are gitignored, so the
+hard reset leaves secrets, dedupe state and the roster snapshot untouched.
+
+First-time install:
+
+```bash
+sudo cp deploy/fantasy-news-notifier.service /etc/systemd/system/
 sudo systemctl enable --now fantasy-news-notifier
 journalctl -t fantasy-news-notify -f
 ```
