@@ -71,20 +71,23 @@ def _context_block(context, leagues, severity: int) -> list[str]:
     lines = [f"<b>{_escape(context.team)} {_escape(context.subject_position)} DEPTH</b>"]
     for entry in context.same_position:
         order = entry.depth_order if entry.depth_order is not None else "-"
-        rank = f"#{entry.search_rank}" if entry.search_rank and entry.search_rank < 99999 else ""
+        # Pre-draft there are no drafted leagues, so ownership is empty. Build
+        # the line from present segments only, or it renders "Name ·  · #23".
+        segments = [f"{order} {_escape(entry.name)}"]
+        owner = _own_tag(entry, leagues)
+        if owner:
+            segments.append(owner)
+        if entry.search_rank and entry.search_rank < 99999:
+            segments.append(f"#{entry.search_rank}")
         marker = " <-- INJURED" if entry.is_subject else ""
-        lines.append(
-            f"  {order} {_escape(entry.name)} · {_own_tag(entry, leagues)}"
-            f"{(' · ' + rank) if rank else ''}{marker}"
-        )
+        lines.append("  " + " · ".join(segments) + marker)
 
     if context.adjacent:
         lines.append(f"<b>{_escape(context.team)} other starters</b>")
         for entry in context.adjacent:
-            lines.append(
-                f"  {_escape(entry.position)} {_escape(entry.name)} · "
-                f"{_own_tag(entry, leagues)}"
-            )
+            owner = _own_tag(entry, leagues)
+            suffix = f" · {owner}" if owner else ""
+            lines.append(f"  {_escape(entry.position)} {_escape(entry.name)}{suffix}")
     return lines
 
 
