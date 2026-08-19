@@ -1,0 +1,25 @@
+[Unit]
+Description=Fantasy football news notifier
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fantasy-notifier
+WorkingDirectory=/opt/fantasy-football-notifier
+ExecStart=/opt/fantasy-football-notifier/.venv/bin/python /opt/fantasy-football-notifier/bin/run-notifier.py
+Restart=always
+RestartSec=15
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=fantasy-news-notify
+
+# The process only needs its own state directory and outbound HTTPS.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/fantasy-football-notifier/state
+
+[Install]
+WantedBy=multi-user.target

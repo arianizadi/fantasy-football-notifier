@@ -1,0 +1,4 @@
+# Refresh the multi-league roster snapshot (ESPN + Sleeper) twice a day.
+# Offset from the espn-sync worker's 8am/8pm Pacific runs so the two never hit
+# ESPN at the same moment.
+15 15,03 * * * flock -n /tmp/fantasy-news-roster.lock /opt/fantasy-football-notifier/.venv/bin/python /opt/fantasy-football-notifier/bin/refresh-roster.py 2>&1 | /usr/bin/systemd-cat -t fantasy-news-roster

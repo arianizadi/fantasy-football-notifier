@@ -1,0 +1,7 @@
+# Check provider draft state hourly. The script is idempotent and refreshes the
+# snapshot only when a configured league has completed its draft.
+7 * * * * flock -n /tmp/fantasy-news-roster.lock /opt/fantasy-football-notifier/.venv/bin/python /opt/fantasy-football-notifier/bin/check-drafts.py 2>&1 | /usr/bin/systemd-cat -t fantasy-news-drafts
+
+# Optional: add dated one-off refreshes after known draft times as a second
+# safety net. Use the server's timezone and the refresh-roster.py command from
+# deploy/refresh-roster.cron.
