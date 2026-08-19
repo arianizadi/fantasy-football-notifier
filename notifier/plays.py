@@ -151,7 +151,8 @@ class DepthCharts:
             search_rank=record.get("search_rank"),
             is_subject=is_subject,
             ownership={
-                league.key: self._state(league.key, name) for league in snapshot.leagues
+                league.key: self._state(league.key, name)
+                for league in snapshot.drafted_leagues()
             },
         )
 
@@ -225,7 +226,9 @@ class DepthCharts:
                     break
 
         per_league: list[LeaguePlays] = []
-        for league in snapshot.leagues:
+        # An empty, pre-draft league must not make every NFL player appear to be
+        # a free agent. Activate each league only after its own roster is present.
+        for league in snapshot.drafted_leagues():
             state, owner = self._state(league.key, subject_name)
             plays = LeaguePlays(league=league, subject_state=state, subject_owner=owner)
 

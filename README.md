@@ -165,7 +165,7 @@ Two automated layers cover scheduled and moved drafts:
 1. **Normal cron** (03:15 / 15:15 UTC) covers routine roster changes.
 2. **`bin/check-drafts.py`, hourly** asks each provider for the real draft state
    and syncs when one completes. This survives a commissioner moving the draft
-   and is idempotent once the snapshot contains players.
+   and tracks each league independently when drafts occur on different dates.
 
 When a draft is detected the notifier Telegrams you and flips itself out of
 preseason mode.
@@ -199,6 +199,16 @@ python3 -m venv .venv && ./.venv/bin/pip install -r requirements.txt
 ./.venv/bin/python bin/run-notifier.py --prime      # avoid a backlog burst
 ./.venv/bin/python bin/run-notifier.py --once --verbose
 ```
+
+### Tests
+
+```bash
+./.venv/bin/pip install -r requirements-dev.txt
+./.venv/bin/python -m pytest -q
+```
+
+GitHub Actions runs the test suite and bytecode compilation on every push and
+pull request without requiring provider credentials.
 
 ### systemd deployment
 

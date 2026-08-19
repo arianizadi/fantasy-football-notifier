@@ -11,6 +11,7 @@ genuinely ambiguous and worth your own eyes.
 
 from __future__ import annotations
 
+import html
 import json
 import logging
 import queue
@@ -132,19 +133,7 @@ class Verifier:
         note = str(parsed.get("note") or "").strip()[:160]
         gap = abs(second - job.first.severity)
 
-        model_label = self.config.verify_model.split("/")[-1]
-        if gap == 0:
-            text = f"2nd opinion: agrees, {second}/5."
-        elif gap == 1:
-            text = f"2nd opinion: {second}/5 (vs {job.first.severity}/5)."
-        else:
-            # A two-point split means the call is genuinely ambiguous.
-            text = (
-                f"2nd opinion: <b>disagrees, {second}/5</b> vs "
-                f"{job.first.severity}/5 - check this one yourself."
-            )
-        if note:
-            text += f"\n{note}"
+        text = format_reply(job.first.severity, second, note)
 
         send_reply(self._session, self.config, text, job.message_id)
         structured_log(
@@ -155,3 +144,20 @@ class Verifier:
             secondSeverity=second,
             gap=gap,
         )
+
+
+def format_reply(first_severity: int, second_severity: int, note: str = "") -> str:
+    """Format safe Telegram HTML from the verifier's untrusted model output."""
+    gap = abs(second_severity - first_severity)
+    if gap == 0:
+        text = f"2nd opinion: agrees, {second_severity}/5."
+    elif gap == 1:
+        text = f"2nd opinion: {second_severity}/5 (vs {first_severity}/5)."
+    else:
+        text = (
+            f"2nd opinion: <b>disagrees, {second_severity}/5</b> vs "
+            f"{first_severity}/5 - check this one yourself."
+        )
+    if note:
+        text += f"\n{html.escape(note, quote=False)}"
+    return text

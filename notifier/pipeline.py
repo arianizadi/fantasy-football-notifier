@@ -99,7 +99,7 @@ class Notifier:
         self._trending: dict[str, int] = {}
         self._trending_at = 0.0
         self.depth: DepthCharts | None = None
-        self.preseason = not self.snapshot.mine()
+        self.preseason = not self.snapshot.drafted_leagues()
         self._rebuild_depth_charts()
 
     # ---------- state refresh ----------
@@ -124,7 +124,7 @@ class Notifier:
             self.snapshot = load_snapshot(self.config)
             self._snapshot_mtime = current
             was_preseason = self.preseason
-            self.preseason = not self.snapshot.mine()
+            self.preseason = not self.snapshot.drafted_leagues()
             self._rebuild_depth_charts()
             if was_preseason and not self.preseason:
                 send_plain(
@@ -219,7 +219,7 @@ class Notifier:
             tier=tier,
             per_league=relevant,
             context=context,
-            all_leagues=list(self.snapshot.leagues),
+            all_leagues=self.snapshot.drafted_leagues(),
         )
 
     def _evaluate_preseason(
@@ -250,7 +250,7 @@ class Notifier:
             context=self.depth.team_context(record, self.snapshot)
             if self.depth is not None
             else None,
-            all_leagues=list(self.snapshot.leagues),
+            all_leagues=self.snapshot.drafted_leagues(),
         )
 
     # ---------- poll ----------
@@ -259,11 +259,15 @@ class Notifier:
         self._reload_roster_if_changed()
         self._refresh_trending()
 
+        items: list[NewsItem] = []
+        feed_was_full = False
+        modified = False
         try:
             items, feed_was_full, modified = self.poller.fetch(self.session)
         except requests.RequestException as error:
             structured_log(logging.WARNING, "rotowire.fetch_failed", error=str(error))
-            return 0
+            # X is an independent primary source. An RSS outage must not stop
+            # queued tweets from reaching the shared evaluation path.
         if not modified and self._tweet_queue.empty():
             return 0
 

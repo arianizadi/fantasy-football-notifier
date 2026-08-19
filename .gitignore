@@ -4,5 +4,6 @@
 .venv/
 __pycache__/
 *.pyc
+.pytest_cache/
 state/*.json
 state/*.log
