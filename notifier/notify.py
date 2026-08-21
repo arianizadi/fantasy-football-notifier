@@ -263,27 +263,6 @@ def send_alert(session: requests.Session, config: Config, alert: Alert) -> int |
     return message_id
 
 
-def send_reply(
-    session: requests.Session, config: Config, text: str, reply_to: int
-) -> int | None:
-    """Threaded reply, used for the second-opinion verification."""
-    if config.dry_run:
-        structured_log(logging.INFO, "notify.dry_run_reply", preview=text[:160])
-        print(f"    [reply to {reply_to}] {text}")
-        return -1
-    return _post(
-        session,
-        config,
-        {
-            "text": text,
-            "reply_to_message_id": reply_to,
-            "allow_sending_without_reply": True,
-            "link_preview_options": {"is_disabled": True},
-            "disable_notification": True,
-        },
-    )
-
-
 def send_plain(session: requests.Session, config: Config, text: str) -> int | None:
     if config.dry_run:
         structured_log(logging.INFO, "notify.dry_run_plain", preview=text[:160])

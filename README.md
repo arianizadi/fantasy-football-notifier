@@ -78,63 +78,37 @@ ESPN, so each league gets its own verdict in the same alert.
 Depth charts are computed in plain code, never asked of the model — a
 hallucinated depth chart would produce confidently wrong waiver advice.
 
-## Model evaluation and stealth review
+## Model choice
 
-Free models vary wildly in whether they can hold a JSON schema, and a model
-that returns prose 30% of the time is worse than a paid one: the failure is
-silent, the classifier falls back to severity 3, and the alert reads as if it
-were judged.
+One model classifies, and nothing reviews it. A second and third opinion were
+built and removed: on a season-ending IR for a Sleeper rank-126 player,
+`deepseek-v4-pro` returned **1/5** ("changes nothing for 99% of rosters"),
+which is badly wrong, and on an earlier labelled set it scored 9/12 against
+Flash's 11/12. Paying a slower model to be less accurate is not a second
+opinion, and three severities on one alert is noise, not signal.
 
-So candidates are measured, not trusted:
+The evaluation tooling stays, because the question "is there a better model
+for the fast path" is worth re-asking:
 
 ```bash
 bin/capture-fixtures.py --tweets 60 --rotowire   # store real items for replay
-bin/eval-models.py --free --limit 10             # score every free candidate
-bin/eval-models.py --stealth                     # stealth namespace only
+bin/eval-models.py --graded-only --models a,b    # score against ground truth
+bin/eval-models.py --free                        # survey free candidates
 ```
 
-Scoring puts structure compliance first (a verifier that cannot parse is
-unusable regardless of judgement), then agreement with the reference model on
-responses that did parse, then latency. Results land in
-`state/model-scores.json`; `VERIFY_MODEL=auto` reads the winner.
+Fixtures are hand-graded on fantasy CONSEQUENCE = player value x event
+magnitude, which is the distinction models get wrong: a season-ending injury
+to a WR5 and to a WR1 are both "season-ending" but are not the same fantasy
+event. Scoring reports exact match and mean absolute error against those
+grades, not agreement with another model - agreement only shows which models
+are similar, not which are right.
 
-A real run over 12 free candidates found exactly **one** usable:
-
-| model | schema | agreement | latency |
-|---|---|---|---|
-| `dots-studio/dots-3-note-preview:free` | 100% | 100% | 1.1s |
-| gemma-4 x2, nemotron x2 | 0% - HTTP 429 rate limited | | |
-| glm-5.2, gpt-oss-20b | 0% - HTTP 404 | | |
-
-Two Lyria **audio** models were also scored before a modality filter was added:
-they advertise `response_format`, so filtering on supported parameters alone
-lets music models into a text evaluation.
-
-### Stealth review
-
-`STEALTH_REVIEW=true` adds a free third opinion from whatever stealth model is
-published, resolved at runtime and re-checked every 6 hours because the
-namespace rotates without notice. It is strictly best-effort:
-
-- no stealth model published -> the feature disables itself
-- model withdrawn mid-season (404) -> rediscovery is forced, item skipped
-- model cannot hold the schema -> item skipped silently
-
-It is free, so failures cost nothing and must never degrade the alert or the
-paid second opinion.
-
-Needs unknown-retention models allowed at `openrouter.ai/settings/privacy`;
-without it every call returns `404 No endpoints available matching your
-guardrail restrictions`.
-
-### Reasoning is per-model, not global
-
-Models disagree in opposite directions. `deepseek-v4-flash` emits reasoning
-tokens by default, burning the whole budget and returning *no content*.
-`stealth/ox-alpha` rejects the request outright: `400 Reasoning is mandatory
-for this endpoint and cannot be disabled`. A single hardcoded setting breaks
-one or the other, so `notifier/openrouter.py` tries the preferred mode,
-downgrades on that specific 400, and caches the answer per model.
+Structure compliance is scored first and weighted hardest. A free model that
+returns prose 30% of the time is worse than useless: the failure is silent,
+the classifier falls back to severity 3, and the alert reads as if it were
+judged. A survey of 12 free candidates found exactly one usable; the rest
+404'd, 429'd, or could not parse. Two Lyria **audio** models were scored
+before a modality filter was added, because they advertise `response_format`.
 
 ## Measured findings
 

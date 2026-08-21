@@ -101,7 +101,7 @@ def ask(session, key, model, item, timeout=REQUEST_TIMEOUT):
 
 def evaluate(session, key, model, items, reference):
     schema_ok = 0
-    latencies, costs, agree, reasons = [], [], [], {}
+    latencies, costs, agree, reasons, exact, errors = [], [], [], {}, [], []
     for item in items:
         result = ask(session, key, model, item)
         latencies.append(result["latency"])
@@ -112,6 +112,9 @@ def evaluate(session, key, model, items, reference):
             baseline = expected if expected is not None else reference.get(item["guid"])
             if baseline is not None:
                 agree.append(abs(result["severity"] - baseline) <= 1)
+            if expected is not None:
+                exact.append(result["severity"] == expected)
+                errors.append(abs(result["severity"] - expected))
         else:
             reasons[result["reason"]] = reasons.get(result["reason"], 0) + 1
     total = len(items)
@@ -120,6 +123,8 @@ def evaluate(session, key, model, items, reference):
         "n": total,
         "schema_rate": schema_ok / total if total else 0.0,
         "agreement": (sum(agree) / len(agree)) if agree else None,
+        "exact_match": (sum(exact) / len(exact)) if exact else None,
+        "mean_abs_error": (sum(errors) / len(errors)) if errors else None,
         "median_latency": statistics.median(latencies) if latencies else None,
         "total_cost": sum(costs),
         "failures": reasons,
@@ -132,6 +137,8 @@ def main() -> int:
     parser.add_argument("--stealth", action="store_true")
     parser.add_argument("--models", default="")
     parser.add_argument("--limit", type=int, default=15, help="fixtures per model")
+    parser.add_argument("--graded-only", action="store_true",
+                        help="score only against hand-graded ground truth")
     args = parser.parse_args()
 
     load_dotenv(ROOT / ".env")
@@ -143,8 +150,16 @@ def main() -> int:
         print("no fixtures; run bin/capture-fixtures.py first")
         return 1
     items = json.loads(FIXTURES.read_text())
-    items = [i for i in items if i.get("headline")][: args.limit]
-    print(f"fixtures: {len(items)}")
+    items = [i for i in items if i.get("headline")]
+    # Hand-graded fixtures first: agreement with a reference model only shows
+    # which models are similar, not which are right.
+    graded = [i for i in items if i.get("expected_severity") is not None]
+    if args.graded_only:
+        items = graded
+    else:
+        items = graded + [i for i in items if i.get("expected_severity") is None]
+    items = items[: args.limit]
+    print(f"fixtures: {len(items)} ({sum(1 for i in items if i.get('expected_severity') is not None)} graded)")
 
     candidates = [m.strip() for m in args.models.split(",") if m.strip()]
     if args.free or args.stealth:
@@ -170,12 +185,15 @@ def main() -> int:
         row = evaluate(session, config.openrouter_api_key, model, items, reference)
         results.append(row)
         agree = f"{row['agreement']:.0%}" if row["agreement"] is not None else "n/a"
+        exact = f"{row['exact_match']:.0%}" if row["exact_match"] is not None else "n/a"
+        mae = f"{row['mean_abs_error']:.2f}" if row["mean_abs_error"] is not None else "n/a"
         lat = f"{row['median_latency']:.1f}s" if row["median_latency"] else "n/a"
-        print(f"  schema {row['schema_rate']:.0%}  agree {agree}  {lat}  "
-              f"${row['total_cost']:.5f}  fails={row['failures']}")
+        print(f"  schema {row['schema_rate']:.0%}  exact {exact}  within1 {agree}  "
+              f"MAE {mae}  {lat}  ${row['total_cost']:.5f}  fails={row['failures']}")
 
     usable = [r for r in results if r["schema_rate"] >= MIN_SCHEMA_RATE]
-    usable.sort(key=lambda r: (-(r["agreement"] or 0), r["median_latency"] or 999))
+    usable.sort(key=lambda r: (r["mean_abs_error"] if r["mean_abs_error"] is not None else 9,
+                               -(r["agreement"] or 0), r["median_latency"] or 999))
     best = usable[0]["model"] if usable else None
 
     SCORES.parent.mkdir(parents=True, exist_ok=True)

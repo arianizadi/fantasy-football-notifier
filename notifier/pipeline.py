@@ -1,4 +1,4 @@
-"""Poll loop: fetch -> dedupe -> plays -> classify -> tier -> notify -> verify.
+"""Poll loop: fetch -> dedupe -> plays -> classify -> tier -> notify.
 
 Every item is classified, not just ones touching your roster, so general NFL
 news still surfaces. Relevance is expressed through tiering and per-tier
@@ -28,7 +28,6 @@ from .plays import DepthCharts, LeaguePlays, plays_context_for_model
 from .roster import load_snapshot, snapshot_mtime
 from .sources import rotowire, sleeper
 from .sources.twitter import TwitterStream
-from .verify import VerifyJob, Verifier
 
 # X is the origin for most breaking news; RotoWire writes it up 1-5 minutes
 # later. Ordering by priority means the faster source claims the semantic
@@ -81,7 +80,6 @@ class Notifier:
         self.snapshot: RosterSnapshot = load_snapshot(config)
         self._snapshot_mtime = snapshot_mtime(config)
         self.poller = rotowire.FeedPoller()
-        self.verifier = Verifier(config)
         self._tweet_queue: queue.Queue = queue.Queue(maxsize=500)
         # Classification is ~2s of network wait, so a burst of items should
         # fan out rather than serialise. At $0.000025 a call this is free.
@@ -320,10 +318,6 @@ class Notifier:
                 continue
             self.seen.record_semantic(item.player_name, event_type)
             sent += 1
-            if message_id > 0:
-                self.verifier.submit(
-                    VerifyJob(item=item, first=alert.classification, message_id=message_id)
-                )
 
         if fresh:
             self.seen.save()
@@ -361,9 +355,7 @@ class Notifier:
             pollSeconds=self.config.poll_seconds,
             idlePollSeconds=self.config.poll_seconds_idle,
             model=self.config.openrouter_model,
-            verifyModel=self.config.verify_model if self.config.verify_enabled else None,
         )
-        self.verifier.start()
         if self.twitter is not None and self.twitter.sync_rules():
             self.twitter.start()
 
