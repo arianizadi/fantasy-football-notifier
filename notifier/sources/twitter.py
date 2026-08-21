@@ -92,8 +92,15 @@ class TwitterStream:
         backoff = BACKOFF_START
         while not self._stop.is_set():
             try:
-                self._consume()
-                backoff = BACKOFF_START  # clean disconnect; reset
+                delivered = self._consume()
+                # X drops long-lived connections routinely ("Response ended
+                # prematurely"). If tweets actually arrived, the connection was
+                # healthy, so reset the backoff instead of escalating toward
+                # 320s and going deaf during a news burst.
+                if delivered:
+                    backoff = BACKOFF_START
+                    continue
+                backoff = BACKOFF_START
             except requests.RequestException as error:
                 status = getattr(getattr(error, "response", None), "status_code", None)
                 if status == 402:
@@ -112,7 +119,9 @@ class TwitterStream:
             self._stop.wait(backoff)
             backoff = min(backoff * 2, BACKOFF_MAX)
 
-    def _consume(self) -> None:
+    def _consume(self) -> int:
+        """Read the stream until it closes. Returns tweets delivered."""
+        delivered = 0
         params = {
             "tweet.fields": "created_at,author_id,text",
             "expansions": "author_id",
@@ -125,7 +134,7 @@ class TwitterStream:
             structured_log(logging.INFO, "twitter.stream_connected")
             for raw in response.iter_lines():
                 if self._stop.is_set():
-                    return
+                    return delivered
                 if not raw:
                     continue  # keep-alive newline
                 try:
@@ -133,10 +142,12 @@ class TwitterStream:
                 except json.JSONDecodeError:
                     continue
                 for item in self._to_items(payload):
+                    delivered += 1
                     try:
                         self._queue.put_nowait(item)
                     except queue.Full:
                         structured_log(logging.WARNING, "twitter.queue_full")
+        return delivered
 
     def _to_items(self, payload: dict[str, Any]) -> list[NewsItem]:
         data = payload.get("data") or {}

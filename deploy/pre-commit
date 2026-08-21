@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Block commits containing live credentials.
+# A real Telegram bot token was nearly committed inside a test file; once in
+# git history a secret is effectively permanent, so this refuses up front.
+set -uo pipefail
+
+STAGED=$(git diff --cached --name-only --diff-filter=ACM)
+[ -z "$STAGED" ] && exit 0
+
+fail=0
+report() { echo "BLOCKED: $1" >&2; fail=1; }
+
+for file in $STAGED; do
+  [ -f "$file" ] || continue
+  case "$file" in .venv/*|*.lock) continue ;; esac
+
+  # Telegram bot token: <digits>:<35+ base64-ish chars>
+  grep -nE '[0-9]{6,12}:[A-Za-z0-9_-]{30,}' "$file" 2>/dev/null \
+    | grep -v '"1234567890:"' \
+    | grep -vq 'A" \* 35' && report "$file looks like a Telegram bot token"
+
+  # OpenRouter key
+  grep -nqE 'sk-or-[A-Za-z0-9-]{20,}' "$file" 2>/dev/null \
+    && report "$file looks like an OpenRouter API key"
+
+  # X bearer token
+  grep -nqE 'AAAAAAAAAAAAAAAAAAAAA[A-Za-z0-9%]{20,}' "$file" 2>/dev/null \
+    && report "$file looks like an X bearer token"
+
+  # ESPN cookies with an actual value
+  grep -nqE '(ESPN_S2|ESPN_SWID)=["'"'"']?[A-Za-z0-9%{][A-Za-z0-9%+/={-]{15,}' "$file" 2>/dev/null \
+    && report "$file looks like a populated ESPN cookie"
+done
+
+if git diff --cached --name-only | grep -qE '(^|/)\.env$'; then
+  report ".env must never be committed"
+fi
+
+[ "$fail" -eq 0 ] || { echo "" >&2; echo "Commit aborted. Use a fabricated value, or --no-verify if this is a false positive." >&2; exit 1; }
+exit 0

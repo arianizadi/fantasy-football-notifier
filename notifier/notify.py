@@ -79,7 +79,9 @@ def _context_block(context, leagues, severity: int) -> list[str]:
             segments.append(owner)
         if entry.search_rank and entry.search_rank < 99999:
             segments.append(f"#{entry.search_rank}")
-        marker = " <-- INJURED" if entry.is_subject else ""
+        # Must not start with "<": Telegram's HTML parser reads "<--" as an
+        # opening tag and rejects the whole message with a 400.
+        marker = "   [INJURED]" if entry.is_subject else ""
         lines.append("  " + " · ".join(segments) + marker)
 
     if context.adjacent:
@@ -174,13 +176,34 @@ def delete_message(session: requests.Session, config: Config, message_id: int) -
 
 
 def _post(session: requests.Session, config: Config, payload: dict) -> int | None:
-    """POST sendMessage; return the created message_id."""
+    """POST sendMessage; return the created message_id.
+
+    On failure this logs Telegram's own `description` and the offending text.
+    Without them a 400 is undiagnosable after the fact - a literal "<--" in a
+    message once broke every alert for a day and the logs only said
+    "400 Bad Request".
+    """
     try:
         response = session.post(
             f"{API_BASE}/bot{config.telegram_bot_token}/sendMessage",
             timeout=REQUEST_TIMEOUT,
             json={"chat_id": config.telegram_chat_id, "parse_mode": "HTML", **payload},
         )
+        if not response.ok:
+            description = ""
+            try:
+                description = str(response.json().get("description") or "")
+            except ValueError:
+                description = response.text[:200]
+            text = str(payload.get("text") or "")
+            structured_log(
+                logging.ERROR,
+                "notify.rejected",
+                httpStatus=response.status_code,
+                telegramError=description,
+                textLength=len(text),
+                textPreview=text[:400],
+            )
         response.raise_for_status()
         message_id = int(response.json()["result"]["message_id"])
         # Track it so expiry only ever deletes messages this bot created.

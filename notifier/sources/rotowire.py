@@ -22,7 +22,8 @@ from ..models import NewsItem
 
 FEED_URL = "https://www.rotowire.com/rss/news.php?sport=NFL"
 FEED_CAPACITY = 5
-REQUEST_TIMEOUT = 10
+# 10s produced 20 read timeouts in two days; the feed is often just slow.
+REQUEST_TIMEOUT = 20
 USER_AGENT = "fantasy-news-notifier/1.0 (personal fantasy league use)"
 
 # RotoWire titles are "Player Name: Headline text".

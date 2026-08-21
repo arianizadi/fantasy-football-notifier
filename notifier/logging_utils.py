@@ -51,7 +51,13 @@ def redact_log_text(value: str) -> str:
         flags=re.IGNORECASE,
     )
     # Telegram bot tokens contain a numeric bot id, a colon, and a long secret.
-    redacted = re.sub(r"\b\d{6,12}:[A-Za-z0-9_-]{30,}", "[REDACTED]", redacted)
+    # They also appear inside URLs as /bot<token>/, where a leading \b fails:
+    # there is no word boundary between the "t" of "bot" and the first digit.
+    # This leaked the live token into journald seven times before it was caught.
+    redacted = re.sub(r"(?:bot)?\d{6,12}:[A-Za-z0-9_-]{30,}", "[REDACTED]", redacted)
+    redacted = re.sub(
+        r"(api\.telegram\.org/)[^/\s]+", r"\1[REDACTED]", redacted, flags=re.IGNORECASE
+    )
     # OpenRouter keys are sk-or-v1-<hex>
     redacted = re.sub(r"\bsk-or-[A-Za-z0-9-]{10,}", "[REDACTED]", redacted)
     redacted = re.sub(
