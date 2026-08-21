@@ -20,7 +20,9 @@ from dataclasses import dataclass
 
 import requests
 
-from .classify import API_URL, _extract_json
+from .classify import _extract_json
+from .openrouter import chat
+from .stealth import StealthReviewer
 from .config import Config
 from .logging_utils import structured_log
 from .models import Classification, NewsItem
@@ -48,6 +50,13 @@ class Verifier:
 
     def __init__(self, config: Config) -> None:
         self.config = config
+        # Free, optional, and entirely self-disabling when no stealth model
+        # is published. Never allowed to affect the alert or the paid verifier.
+        self.stealth = (
+            StealthReviewer(config.openrouter_api_key)
+            if config.stealth_review_enabled
+            else None
+        )
         self._queue: queue.Queue[VerifyJob | None] = queue.Queue(maxsize=QUEUE_MAXSIZE)
         self._session = requests.Session()
         self._thread: threading.Thread | None = None
@@ -57,7 +66,14 @@ class Verifier:
             return
         self._thread = threading.Thread(target=self._run, name="verifier", daemon=True)
         self._thread.start()
-        structured_log(logging.INFO, "verify.started", model=self.config.verify_model)
+        stealth_model = self.stealth.model() if self.stealth is not None else None
+        structured_log(
+            logging.INFO,
+            "verify.started",
+            model=self.config.verify_model,
+            stealthModel=stealth_model,
+            stealthEnabled=bool(stealth_model),
+        )
 
     def submit(self, job: VerifyJob) -> None:
         if not self.config.verify_enabled or self._thread is None:
@@ -98,33 +114,51 @@ class Verifier:
             f"Other model said: severity {job.first.severity}/5, "
             f"event {job.first.event_type}, impact: {job.first.fantasy_impact}"
         )
-        response = self._session.post(
-            API_URL,
+        # chat() negotiates the reasoning policy per model: DeepSeek returns
+        # no content unless reasoning is disabled, while ox-alpha rejects the
+        # request outright if it is ("Reasoning is mandatory for this endpoint").
+        response = chat(
+            self._session,
+            self.config.openrouter_api_key,
+            self.config.verify_model,
+            [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=400,
             timeout=REQUEST_TIMEOUT,
-            headers={
-                "Authorization": f"Bearer {self.config.openrouter_api_key}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": self.config.verify_model,
-                "temperature": 0,
-                "max_tokens": 400,
-                "response_format": {"type": "json_object"},
-                # Same reasoning-token trap as the fast path; see classify.py.
-                "reasoning": {"enabled": False},
-                # Default routing sprays across ~6 providers and the tail
-                # reached 8.9s. Pinning by throughput held max at 1.5s --
-                # a 5.8x better worst case, which matters more than median
-                # for a breaking-news alert.
-                "provider": {"sort": "throughput"},
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-            },
         )
+        if response.status_code in (404, 400):
+            # A stealth model withdrawn at the end of its free window 404s.
+            # Verification is a nice-to-have; never let it break the alert path.
+            structured_log(
+                logging.WARNING,
+                "verify.model_unavailable",
+                model=self.config.verify_model,
+                httpStatus=response.status_code,
+                hint="Re-run bin/eval-models.py to pick a live model.",
+            )
+            return
         response.raise_for_status()
-        parsed = _extract_json(response.json()["choices"][0]["message"]["content"])
+
+        content = response.json()["choices"][0]["message"].get("content")
+        if not content:
+            structured_log(
+                logging.WARNING, "verify.empty_content", model=self.config.verify_model
+            )
+            return
+        try:
+            parsed = _extract_json(content)
+        except (ValueError, TypeError):
+            # Weaker free models routinely return prose. Skip rather than
+            # posting a reply built from a fallback that means nothing.
+            structured_log(
+                logging.WARNING,
+                "verify.unparseable",
+                model=self.config.verify_model,
+                preview=str(content)[:120],
+            )
+            return
 
         try:
             second = max(1, min(5, int(parsed.get("severity", job.first.severity))))
@@ -135,6 +169,27 @@ class Verifier:
 
         text = format_reply(job.first.severity, second, note)
 
+        # Best-effort third opinion. Any failure just omits the line.
+        stealth_severity = None
+        if self.stealth is not None:
+            try:
+                result = self.stealth.review(
+                    f"{job.item.player_name}: {job.item.headline}",
+                    job.item.body,
+                    job.first.severity,
+                )
+            except Exception as error:  # noqa: BLE001 - must never break delivery
+                structured_log(
+                    logging.DEBUG, "stealth.review_failed", error=str(error)
+                )
+                result = None
+            if result is not None:
+                stealth_severity, stealth_note = result
+                label = (self.stealth.model() or "stealth").split("/")[-1]
+                text += f"\n3rd ({html.escape(label, quote=False)}): {stealth_severity}/5"
+                if stealth_note:
+                    text += f" - {html.escape(stealth_note, quote=False)}"
+
         send_reply(self._session, self.config, text, job.message_id)
         structured_log(
             logging.INFO,
@@ -142,6 +197,7 @@ class Verifier:
             player=job.item.player_name,
             firstSeverity=job.first.severity,
             secondSeverity=second,
+            stealthSeverity=stealth_severity,
             gap=gap,
         )
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,6 +36,7 @@ class Config:
     verify_enabled: bool
     verify_model: str
     verify_min_severity: int
+    stealth_review_enabled: bool
     poll_seconds: int
     poll_seconds_idle: int
     min_severity: int
@@ -78,6 +80,30 @@ def optional_bool(name: str, default: bool) -> bool:
     raise NotifierError(f"{name} must be a boolean value")
 
 
+def scores_path(state_dir: Path) -> Path:
+    return state_dir / "model-scores.json"
+
+
+def resolve_verify_model(value: str, state_dir: Path) -> str:
+    """Resolve VERIFY_MODEL=auto to the best model bin/eval-models.py found.
+
+    Stealth models are withdrawn when their free window closes, so a pinned id
+    becomes a dead config. "auto" reads the last evaluation instead; if no
+    evaluation exists or none of the candidates were usable, it falls back to
+    the pinned default rather than silently disabling verification.
+    """
+    if value.lower() != "auto":
+        return value
+    path = scores_path(state_dir)
+    if not path.exists():
+        return DEFAULT_VERIFY_MODEL
+    try:
+        best = json.loads(path.read_text()).get("best")
+    except (json.JSONDecodeError, OSError):
+        return DEFAULT_VERIFY_MODEL
+    return str(best) if best else DEFAULT_VERIFY_MODEL
+
+
 def validate_model(value: str) -> str:
     # A bare "latest" alias can silently change classification behaviour
     # mid-season, so require an explicit provider/model slug.
@@ -119,8 +145,13 @@ def load_config() -> Config:
         ),
         twitter_bearer_token=os.environ.get("TWITTER_BEARER_TOKEN", "").strip(),
         verify_enabled=optional_bool("VERIFY_ENABLED", True),
-        verify_model=os.environ.get("VERIFY_MODEL", "").strip() or DEFAULT_VERIFY_MODEL,
+        verify_model=resolve_verify_model(
+            os.environ.get("VERIFY_MODEL", "").strip() or DEFAULT_VERIFY_MODEL, state_dir
+        ),
         verify_min_severity=optional_int("VERIFY_MIN_SEVERITY", 3, 1, 5),
+        # Free third opinion from whatever stealth model is live.
+        # Disables itself when none is published.
+        stealth_review_enabled=optional_bool("STEALTH_REVIEW", True),
         poll_seconds=optional_int("POLL_SECONDS", DEFAULT_POLL_SECONDS, 10, 900),
         poll_seconds_idle=optional_int(
             "POLL_SECONDS_IDLE", DEFAULT_POLL_SECONDS_IDLE, 10, 3600

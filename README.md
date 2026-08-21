@@ -78,6 +78,64 @@ ESPN, so each league gets its own verdict in the same alert.
 Depth charts are computed in plain code, never asked of the model — a
 hallucinated depth chart would produce confidently wrong waiver advice.
 
+## Model evaluation and stealth review
+
+Free models vary wildly in whether they can hold a JSON schema, and a model
+that returns prose 30% of the time is worse than a paid one: the failure is
+silent, the classifier falls back to severity 3, and the alert reads as if it
+were judged.
+
+So candidates are measured, not trusted:
+
+```bash
+bin/capture-fixtures.py --tweets 60 --rotowire   # store real items for replay
+bin/eval-models.py --free --limit 10             # score every free candidate
+bin/eval-models.py --stealth                     # stealth namespace only
+```
+
+Scoring puts structure compliance first (a verifier that cannot parse is
+unusable regardless of judgement), then agreement with the reference model on
+responses that did parse, then latency. Results land in
+`state/model-scores.json`; `VERIFY_MODEL=auto` reads the winner.
+
+A real run over 12 free candidates found exactly **one** usable:
+
+| model | schema | agreement | latency |
+|---|---|---|---|
+| `dots-studio/dots-3-note-preview:free` | 100% | 100% | 1.1s |
+| gemma-4 x2, nemotron x2 | 0% - HTTP 429 rate limited | | |
+| glm-5.2, gpt-oss-20b | 0% - HTTP 404 | | |
+
+Two Lyria **audio** models were also scored before a modality filter was added:
+they advertise `response_format`, so filtering on supported parameters alone
+lets music models into a text evaluation.
+
+### Stealth review
+
+`STEALTH_REVIEW=true` adds a free third opinion from whatever stealth model is
+published, resolved at runtime and re-checked every 6 hours because the
+namespace rotates without notice. It is strictly best-effort:
+
+- no stealth model published -> the feature disables itself
+- model withdrawn mid-season (404) -> rediscovery is forced, item skipped
+- model cannot hold the schema -> item skipped silently
+
+It is free, so failures cost nothing and must never degrade the alert or the
+paid second opinion.
+
+Needs unknown-retention models allowed at `openrouter.ai/settings/privacy`;
+without it every call returns `404 No endpoints available matching your
+guardrail restrictions`.
+
+### Reasoning is per-model, not global
+
+Models disagree in opposite directions. `deepseek-v4-flash` emits reasoning
+tokens by default, burning the whole budget and returning *no content*.
+`stealth/ox-alpha` rejects the request outright: `400 Reasoning is mandatory
+for this endpoint and cannot be disabled`. A single hardcoded setting breaks
+one or the other, so `notifier/openrouter.py` tries the preferred mode,
+downgrades on that specific 400, and caches the answer per model.
+
 ## Measured findings
 
 **Reasoning tokens must be disabled.** DeepSeek v4 emits them by default; on

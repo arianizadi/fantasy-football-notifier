@@ -144,8 +144,18 @@ def format_alert(alert: Alert) -> str:
     if context_lines:
         lines += [""] + context_lines
 
-    if item.body:
-        lines += ["", _escape(item.body[:280])]
+    # For tweets, headline is just body truncated, so printing both repeats the
+    # whole tweet. Only show the body when it actually adds something.
+    body = (item.body or "").strip()
+    headline = (item.headline or "").strip()
+    redundant = (
+        not body
+        or body == headline
+        or body.startswith(headline[:120])
+        or headline.startswith(body[:120])
+    )
+    if not redundant:
+        lines += ["", _escape(body[:280])]
 
     if item.url:
         lines += ["", f'<a href="{_escape(item.url)}">source</a>']
