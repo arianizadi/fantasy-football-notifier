@@ -53,8 +53,14 @@ def chat(
     json_mode: bool = True,
     timeout: int = DEFAULT_TIMEOUT,
     prefer_no_reasoning: bool = True,
+    reasoning_effort: str | None = None,
 ) -> requests.Response:
-    """POST a chat completion, adapting to the model's reasoning policy."""
+    """POST a chat completion, adapting to the model's reasoning policy.
+
+    reasoning_effort opts the caller INTO reasoning at a given level. Use it
+    for background work where quality matters more than latency; leave it None
+    on the alert path, where reasoning costs 60+ seconds.
+    """
 
     def build(disable_reasoning: bool) -> dict[str, Any]:
         body: dict[str, Any] = {
@@ -68,10 +74,16 @@ def chat(
             body["response_format"] = {"type": "json_object"}
         if disable_reasoning:
             body["reasoning"] = {"enabled": False}
+        elif reasoning_effort:
+            body["reasoning"] = {"effort": reasoning_effort}
         return body
 
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    disable = prefer_no_reasoning and not reasoning_is_required(model)
+    disable = (
+        prefer_no_reasoning
+        and not reasoning_effort
+        and not reasoning_is_required(model)
+    )
 
     response = session.post(API_URL, timeout=timeout, headers=headers, json=build(disable))
 

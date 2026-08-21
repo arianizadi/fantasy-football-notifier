@@ -26,10 +26,13 @@ from .model_registry import free_candidates
 from .openrouter import chat
 
 RECHECK_SECONDS = 6 * 60 * 60
-REQUEST_TIMEOUT = 60
-# Reasoning-mandatory models spend the completion budget thinking, so leave
-# room or the JSON truncates.
-MAX_TOKENS = 2000
+# Runs on a background thread and is never on the alert path, so latency does
+# not matter. Reasoning is turned all the way up and given a large completion
+# budget, because it is free and a better-considered third read is the entire
+# point of having one.
+REQUEST_TIMEOUT = 180
+MAX_TOKENS = 8000
+REASONING_EFFORT = "high"
 
 SYSTEM_PROMPT = """You rate NFL news severity for a fantasy football manager.
 Return ONLY JSON: {"severity":int,"note":str}
@@ -58,6 +61,10 @@ class StealthReviewer:
         found: str | None = None
         try:
             candidates = free_candidates(self._session, stealth_only=True)
+            # free_candidates already filters on price, but this is the one
+            # place a paid model could reach a billed request, so the invariant
+            # is asserted here rather than trusted from upstream.
+            candidates = [c for c in candidates if c.is_free]
             found = candidates[0].model_id if candidates else None
         except (requests.RequestException, ValueError) as error:
             structured_log(logging.WARNING, "stealth.discovery_failed", error=str(error))
@@ -98,6 +105,8 @@ class StealthReviewer:
                 ],
                 max_tokens=MAX_TOKENS,
                 timeout=REQUEST_TIMEOUT,
+                prefer_no_reasoning=False,
+                reasoning_effort=REASONING_EFFORT,
             )
         except requests.RequestException as error:
             structured_log(logging.DEBUG, "stealth.request_failed", model=model,
@@ -118,8 +127,26 @@ class StealthReviewer:
 
         from .classify import _extract_json
 
+        payload = response.json()
+        # Circuit breaker: stealth review exists because it is free. If a model
+        # ever bills us - repricing, a namespace change, a stale model list -
+        # disable it immediately rather than quietly accruing charges.
+        charged = (payload.get("usage") or {}).get("cost", 0) or 0
+        if charged > 0:
+            with self._lock:
+                self._model = None
+                self._checked_at = time.time() + RECHECK_SECONDS
+            structured_log(
+                logging.ERROR,
+                "stealth.unexpectedly_charged",
+                model=model,
+                cost=charged,
+                action="stealth review disabled",
+            )
+            return None
+
         try:
-            content = response.json()["choices"][0]["message"].get("content")
+            content = payload["choices"][0]["message"].get("content")
             parsed = _extract_json(content)
             severity = max(1, min(5, int(parsed["severity"])))
         except (KeyError, IndexError, TypeError, ValueError):
