@@ -50,7 +50,7 @@ CLASSIFY_WORKERS = 8
 # It raises the severity bar and restricts to players actually worth drafting,
 # using Sleeper's overall rank. It engages automatically whenever no rostered
 # players exist and disengages by itself after the draft.
-PRESEASON_MIN_SEVERITY = 4
+PRESEASON_MIN_SEVERITY = 3
 PRESEASON_MAX_RANK = 250
 
 ROSTER_STALE_HOURS = 36

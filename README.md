@@ -111,6 +111,7 @@ and retries after fifteen minutes.
 Preseason mode is active while no configured league has a roster for the user.
 The classifier is explicitly told that the league is pre-draft, and action text
 is draft advice rather than lineup instructions such as "activate" or "start."
+Players inside Sleeper's top 250 generate alerts at severity 3/5 and above.
 The notifier exits preseason mode as provider drafts complete and their rosters
 are refreshed.
 

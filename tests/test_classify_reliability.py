@@ -1,10 +1,11 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pytest
 import requests
 
 from notifier.classify import classify
-from notifier.models import NewsItem, RosterSnapshot
+from notifier.models import Classification, NewsItem, RosterSnapshot
 from notifier.pipeline import Notifier
 
 
@@ -93,6 +94,37 @@ def test_high_signal_model_outage_still_passes_preseason_gate(monkeypatch) -> No
     assert alert is not None
     assert alert.classification.severity == 4
     assert alert.classification.event_type == "injury"
+
+
+@pytest.mark.parametrize(
+    ("severity", "should_alert"),
+    [(2, False), (3, True)],
+)
+def test_preseason_gate_starts_at_three(monkeypatch, severity, should_alert) -> None:
+    notifier = Notifier.__new__(Notifier)
+    notifier.session = object()
+    notifier.config = _config()
+    notifier.snapshot = RosterSnapshot(generated_at=None)
+    notifier.depth = SimpleNamespace(team_context=Mock(return_value=None))
+    monkeypatch.setattr(
+        "notifier.pipeline.classify",
+        Mock(
+            return_value=Classification(
+                "usage",
+                severity,
+                "Role update",
+                False,
+                {"direction": "neutral"},
+            )
+        ),
+    )
+
+    alert = notifier._evaluate_preseason(
+        _item("Example Player role update"),
+        {"search_rank": 100},
+    )
+
+    assert (alert is not None) is should_alert
 
 
 def test_pup_activation_model_outage_keeps_return_above_preseason_gate(
