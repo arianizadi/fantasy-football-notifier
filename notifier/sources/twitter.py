@@ -48,6 +48,11 @@ class TwitterStream:
         self._names: PlayerNameIndex | None = None
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
+        self._last_connected_at = 0.0
+        self._last_item_at = 0.0
+        self._last_error_at = 0.0
+        self._last_error = ""
+        self._connected = False
 
     def set_player_index(self, player_index: dict[str, Any]) -> None:
         self._names = PlayerNameIndex(player_index)
@@ -87,6 +92,25 @@ class TwitterStream:
 
     def stop(self) -> None:
         self._stop.set()
+        self._session.close()
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2)
+
+    @property
+    def is_alive(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def health_snapshot(self) -> dict[str, object]:
+        """Thread-safe enough scalar snapshot for the Telegram /status command."""
+        return {
+            "alive": self.is_alive,
+            "connected": self._connected,
+            "last_connected_at": self._last_connected_at,
+            "last_item_at": self._last_item_at,
+            "last_error_at": self._last_error_at,
+            "last_error": self._last_error,
+        }
 
     def _run(self) -> None:
         backoff = BACKOFF_START
@@ -102,6 +126,9 @@ class TwitterStream:
                     continue
                 backoff = BACKOFF_START
             except requests.RequestException as error:
+                self._connected = False
+                self._last_error_at = time.time()
+                self._last_error = str(error)[:160]
                 status = getattr(getattr(error, "response", None), "status_code", None)
                 if status == 402:
                     # Out of credits: retrying just burns rate limit.
@@ -131,9 +158,13 @@ class TwitterStream:
             STREAM_URL, params=params, stream=True, timeout=(REQUEST_TIMEOUT, STREAM_READ_TIMEOUT)
         ) as response:
             response.raise_for_status()
+            self._connected = True
+            self._last_connected_at = time.time()
+            self._last_error = ""
             structured_log(logging.INFO, "twitter.stream_connected")
             for raw in response.iter_lines():
                 if self._stop.is_set():
+                    self._connected = False
                     return delivered
                 if not raw:
                     continue  # keep-alive newline
@@ -143,10 +174,12 @@ class TwitterStream:
                     continue
                 for item in self._to_items(payload):
                     delivered += 1
+                    self._last_item_at = time.time()
                     try:
                         self._queue.put_nowait(item)
                     except queue.Full:
                         structured_log(logging.WARNING, "twitter.queue_full")
+        self._connected = False
         return delivered
 
     def _to_items(self, payload: dict[str, Any]) -> list[NewsItem]:
@@ -158,10 +191,12 @@ class TwitterStream:
 
         # Log X's own delivery lag (tweet timestamp -> arrival on our socket).
         # created_at has second granularity, so treat this as +/-1s.
+        published_at = None
         created_raw = data.get("created_at")
         if created_raw:
             try:
                 created = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
+                published_at = created
                 lag = (datetime.now(timezone.utc) - created).total_seconds()
                 structured_log(
                     logging.INFO, "twitter.delivery_lag", lagSeconds=round(lag, 2)
@@ -188,7 +223,7 @@ class TwitterStream:
                     headline=text[:180],
                     body=text,
                     url=f"https://x.com/{handle}/status/{tweet_id}",
-                    published_at=None,
+                    published_at=published_at,
                 )
             )
         return items

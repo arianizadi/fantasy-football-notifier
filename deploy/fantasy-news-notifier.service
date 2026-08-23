@@ -5,9 +5,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=fantasy-notifier
-WorkingDirectory=/opt/fantasy-football-notifier
-ExecStart=/opt/fantasy-football-notifier/.venv/bin/python /opt/fantasy-football-notifier/bin/run-notifier.py
+User=arian
+WorkingDirectory=/home/arian/services/fantasy-news-notifier
+ExecStart=/home/arian/services/fantasy-news-notifier/.venv/bin/python /home/arian/services/fantasy-news-notifier/bin/run-notifier.py
 Restart=always
 RestartSec=15
 StandardOutput=journal
@@ -19,7 +19,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/opt/fantasy-football-notifier/state
+ReadWritePaths=/home/arian/services/fantasy-news-notifier/state
 
 [Install]
 WantedBy=multi-user.target

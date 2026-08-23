@@ -9,7 +9,8 @@ falls back to severity 3 and the alert reads as if it were judged.
 So structure compliance is scored first and weighted hardest. Agreement with
 the reference model is only measured on responses that parsed.
 
-Writes state/model-scores.json, which VERIFY_MODEL=auto reads.
+Writes state/model-scores.json for offline comparison. Production never
+auto-switches models from this file.
 
     bin/eval-models.py --free            # all free candidates
     bin/eval-models.py --stealth         # stealth namespace only
@@ -48,7 +49,7 @@ severity 1-5 by FANTASY CONSEQUENCE, not dramatic wording:
 1=noise 2=worth knowing 3=notable 4=major 5=season-defining
 fantasy_impact under 100 characters."""
 
-# A verifier that cannot hold the schema is unusable regardless of judgement.
+# A candidate that cannot hold the schema is unusable regardless of judgement.
 MIN_SCHEMA_RATE = 0.90
 
 
@@ -207,7 +208,7 @@ def main() -> int:
     }, indent=1))
 
     print(f"\nusable (schema >= {MIN_SCHEMA_RATE:.0%}): {[r['model'] for r in usable]}")
-    print(f"best: {best or 'NONE - keeping the configured verifier'}")
+    print(f"best: {best or 'NONE - no candidate met the schema floor'}")
     print(f"written: {SCORES}")
     return 0
 

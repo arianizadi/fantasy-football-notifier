@@ -9,6 +9,7 @@ tags Telegram accepts.
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 
 from notifier.logging_utils import redact_log_text
 from notifier.models import Alert, Classification, LeagueRef, NewsItem
@@ -54,9 +55,10 @@ def test_rendered_message_uses_only_telegram_supported_tags():
         assert tag.lower() in TELEGRAM_ALLOWED_TAGS, f"unsupported tag <{tag}> in message"
 
 
-def test_injured_marker_does_not_open_a_tag():
+def test_subject_marker_is_event_aware_and_does_not_invent_status():
     text = format_alert(_alert())
-    assert "[INJURED]" in text
+    assert "SUBJECT · INJURY" in text
+    assert "[INJURED]" not in text
     assert "<--" not in text
 
 
@@ -64,6 +66,29 @@ def test_untrusted_body_is_escaped():
     text = format_alert(_alert())
     assert "<in LA>" not in text
     assert "&lt;in LA&gt;" in text
+
+
+def test_source_url_cannot_inject_html_attributes():
+    alert = _alert()
+    malicious = replace(
+        alert.item,
+        url='https://example.test/report/" onclick="bad',
+    )
+
+    text = format_alert(replace(alert, item=malicious))
+
+    assert '" onclick="bad' not in text
+    assert "&quot; onclick=&quot;bad" in text
+
+
+def test_unsafe_source_url_scheme_is_not_linked():
+    alert = _alert()
+    text = format_alert(
+        replace(alert, item=replace(alert.item, url="javascript:alert(1)"))
+    )
+
+    assert "javascript:" not in text
+    assert "X source" in text
 
 
 def test_telegram_token_is_redacted_inside_urls():

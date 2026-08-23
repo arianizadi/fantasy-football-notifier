@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Replay reporter tweets from a past window and send any missed alerts.
 
-Needed when alerts were generated but never delivered - a Telegram rejection
-marks the item seen while the message is lost, so normal dedupe guarantees it
-is never retried. X's recent-search covers seven days, which is the recovery
-limit.
+Use this after the stream/provider was offline or for historical gaps that
+predate the durable delivery outbox. X's recent-search covers seven days,
+which is the recovery limit.
 
 Delivered alerts are labelled DELAYED so a two-day-old injury is not mistaken
 for breaking news. Costs one X read per tweet scanned.
@@ -21,6 +20,7 @@ import logging
 import os
 import queue
 import sys
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -31,7 +31,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from notifier.config import load_config  # noqa: E402
 from notifier.logging_utils import configure_logging, structured_log  # noqa: E402
-from notifier.notify import _post, format_alert  # noqa: E402
 from notifier.pipeline import Notifier  # noqa: E402
 from notifier.sources.reporters import ALL_REPORTERS  # noqa: E402
 from notifier.sources.twitter import TwitterStream  # noqa: E402
@@ -75,13 +74,17 @@ def main() -> int:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="ignore dedupe; use when a failed send already marked items seen",
+        help="ignore semantic dedupe for an intentional replay",
     )
     args = parser.parse_args()
 
     load_dotenv(Path(__file__).resolve().parent.parent / ".env")
     configure_logging()
-    config = load_config()
+    if not args.send:
+        # load_config itself honors dry-run purity and will not create the
+        # state directory. The CLI flag is authoritative over .env here.
+        os.environ["DRY_RUN"] = "true"
+    config = replace(load_config(), dry_run=not args.send)
 
     since = datetime.fromisoformat(args.since.replace("Z", "+00:00"))
     oldest = datetime.now(timezone.utc) - timedelta(days=SEARCH_WINDOW_DAYS)
@@ -115,8 +118,7 @@ def main() -> int:
                 continue
             event = alert.classification.event_type
             # Collapse repeats of the same event across reporters. --force
-            # bypasses this to recover items already marked seen by a failed
-            # delivery, which normal dedupe would otherwise suppress forever.
+            # bypasses persisted semantic dedupe for an intentional replay.
             run_key = notifier.seen.semantic_key(item.player_name, event)
             if run_key in seen_this_run:
                 continue
@@ -124,35 +126,34 @@ def main() -> int:
                 item.player_name, event
             ):
                 continue
-            seen_this_run.add(run_key)
-
             label = f"[{alert.classification.severity}/5] {item.player_name}"
             if not args.send:
                 # A dry run must not mutate state. Recording here once made the
                 # subsequent real run deliver nothing at all.
                 print(f"  WOULD SEND {label}: {item.headline[:70]}")
                 delivered += 1
+                seen_this_run.add(run_key)
                 break
 
-            notifier.seen.record_semantic(item.player_name, event)
-            notifier.seen.record(item)
-
-            text = (
-                "<b>DELAYED</b> - recovered after a delivery outage, "
-                f"posted {tweet.get('created_at', '')[:16].replace('T', ' ')}Z\n\n"
-                + format_alert(alert)
-            )
-            if _post(session, config, {"text": text,
-                                       "link_preview_options": {"is_disabled": True},
-                                       "disable_notification": True}) is not None:
+            alert = replace(alert, delivery_delayed=True)
+            with notifier._delivery_lock:
+                pending = notifier.outbox.add(alert)
+                sent = notifier._attempt_pending_locked(
+                    pending,
+                    force_semantic=args.force,
+                )
+            if sent:
                 delivered += 1
+                seen_this_run.add(run_key)
                 print(f"  SENT {label}")
+            else:
+                print(f"  QUEUED {label}: Telegram delivery will retry")
             break
 
-    if args.send:
-        notifier.seen.save()
     structured_log(logging.INFO, "backfill.complete", scanned=len(tweets), delivered=delivered)
     print(f"{'delivered' if args.send else 'would deliver'}: {delivered}")
+    notifier.close()
+    session.close()
     return 0
 
 

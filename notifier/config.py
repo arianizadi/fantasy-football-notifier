@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlparse
 
 from .logging_utils import NotifierError
 
@@ -36,10 +35,12 @@ class Config:
     min_severity: int
     min_severity_other: int
     adaptive_polling: bool
-    watch_trending: bool
-    trending_limit: int
     state_dir: Path
-    message_ttl_hours: int
+    telegram_controls_enabled: bool
+    player_thread_hours: int
+    daily_digest_enabled: bool
+    daily_digest_hour: int
+    daily_digest_timezone: str
     dry_run: bool
 
 
@@ -86,11 +87,13 @@ def validate_model(value: str) -> str:
 
 
 def load_config() -> Config:
+    dry_run = optional_bool("DRY_RUN", False)
     state_dir = Path(
         os.environ.get("NOTIFIER_STATE_DIR", "").strip()
         or Path(__file__).resolve().parent.parent / "state"
     )
-    state_dir.mkdir(parents=True, exist_ok=True)
+    if not dry_run:
+        state_dir.mkdir(parents=True, exist_ok=True)
 
     espn_team_raw = os.environ.get("ESPN_TEAM_ID", "").strip()
 
@@ -123,13 +126,21 @@ def load_config() -> Config:
             "MIN_SEVERITY_OTHER", DEFAULT_MIN_SEVERITY_OTHER, 1, 5
         ),
         adaptive_polling=optional_bool("ADAPTIVE_POLLING", True),
-        watch_trending=optional_bool("WATCH_TRENDING", True),
-        trending_limit=optional_int("TRENDING_LIMIT", 50, 5, 200),
         state_dir=state_dir,
-        # 0 disables expiry. Capped at 47h: Telegram refuses to let a bot
-        # delete anything older than 48h.
-        message_ttl_hours=optional_int("MESSAGE_TTL_HOURS", 24, 0, 47),
-        dry_run=optional_bool("DRY_RUN", False),
+        # getUpdates permits only one consumer. Keep controls opt-in so an
+        # alert token already used by OpenClaw or another bot process is not
+        # silently hijacked. A dedicated notifier bot may enable this.
+        telegram_controls_enabled=optional_bool("TELEGRAM_CONTROLS_ENABLED", False),
+        # Alerts for the same player reply to the previous alert while it is
+        # still inside the chat's retention window.
+        player_thread_hours=optional_int("PLAYER_THREAD_HOURS", 168, 1, 24 * 30),
+        daily_digest_enabled=optional_bool("DAILY_DIGEST_ENABLED", True),
+        daily_digest_hour=optional_int("DAILY_DIGEST_HOUR", 18, 0, 23),
+        daily_digest_timezone=(
+            os.environ.get("DAILY_DIGEST_TIMEZONE", "").strip()
+            or "America/Los_Angeles"
+        ),
+        dry_run=dry_run,
     )
 
     if not config.espn_enabled and not config.sleeper_username:
@@ -143,6 +154,16 @@ def load_config() -> Config:
         # Matches sync.py: raw ESPN payloads carry private member data.
         raise NotifierError("ESPN_DEBUG must be false; raw ESPN responses contain private data.")
 
+    try:
+        from zoneinfo import ZoneInfo
+
+        ZoneInfo(config.daily_digest_timezone)
+    except (KeyError, ValueError) as error:
+        raise NotifierError(
+            "DAILY_DIGEST_TIMEZONE must be a valid IANA timezone, "
+            "e.g. America/Los_Angeles"
+        ) from error
+
     return config
 
 
@@ -154,5 +175,5 @@ def seen_path(config: Config) -> Path:
     return config.state_dir / "seen-items.json"
 
 
-def history_path(config: Config) -> Path:
-    return config.state_dir / "sent-messages.json"
+def telegram_state_path(config: Config) -> Path:
+    return config.state_dir / "telegram-state.json"

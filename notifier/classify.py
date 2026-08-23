@@ -1,9 +1,8 @@
 """Classify a news item with DeepSeek V4 Flash via OpenRouter.
 
-Only items that already matched the roster or the trending watchlist reach
-this stage, so volume is roughly 10-40 calls a day rather than one per feed
-item. Classification failure is non-fatal: an unclassifiable item still
-alerts, because a missed injury costs more than an unlabelled one.
+Every draft-relevant or in-season feed item can reach this stage.
+Classification failure is non-fatal: an unclassifiable item still alerts,
+because a missed injury costs more than an unlabelled one.
 """
 
 from __future__ import annotations
@@ -11,16 +10,21 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 
 import requests
 
 from .config import Config
+from .health import HEALTH
 from .logging_utils import structured_log
 from .models import Classification, NewsItem
 
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
 REQUEST_TIMEOUT = 20
 MAX_BODY_CHARS = 600
+MAX_REQUEST_ATTEMPTS = 3
+RETRY_BACKOFF_SECONDS = 0.5
+MAX_RETRY_BACKOFF_SECONDS = 2.0
 
 EVENT_TYPES = (
     "injury",
@@ -40,13 +44,17 @@ SYSTEM_PROMPT = """You classify NFL news for a fantasy football manager.
 
 Return ONLY a JSON object with these keys:
   event_type: one of {event_types}
+  direction: one of positive, negative, mixed, neutral for this player's
+    fantasy outlook (not the emotional tone of the writing)
   severity: integer 1-5 for fantasy relevance
     1 = noise (preseason rest, routine veteran day off, minor note)
     2 = worth knowing (limited practice, small role change)
     3 = notable (questionable tag, timeshare shift, DNP Wednesday)
     4 = major (ruled out, multi-week injury, starter change, trade)
     5 = season-defining (IR, ACL/Achilles tear, suspension, released)
-  fantasy_impact: one sentence, max 140 chars, what the manager should DO
+  fantasy_impact: one factual sentence, max 140 chars, describing the likely
+    fantasy consequence only. Never give add/drop/start/sit/activate/draft
+    instructions; deterministic application code owns all roster advice.
   is_actionable: true if the manager should consider a lineup or waiver move
 
 Judge severity by fantasy consequence, not by how dramatic the wording is.
@@ -56,9 +64,11 @@ Preseason starters being rested is severity 1."""
 # Deterministic floor against the model under-rating unambiguous news.
 # A model that calls a torn ACL "severity 1" would otherwise be silently
 # dropped below the alert threshold and never second-guessed, because
-# verification only runs on alerts that were actually sent.
+# thresholding would otherwise silently drop important reports.
 HIGH_SIGNAL = re.compile(
-    r"\b(torn?\s+(acl|achilles|mcl|patell?a)|ruptured|"
+    r"\b((?:torn|tore)\s+(acl|achilles|mcl|patell?a)|"
+    r"activated\b[^.\n]{0,100}\b(?:from|off)\s+(?:the\s+)?(?:active/)?"
+    r"(?:pup|physically\s+unable\s+to\s+perform|injured\s+reserve|ir)|ruptured|"
     r"injured\s+reserve|placed\s+on\s+ir|out\s+for\s+the\s+season|"
     r"season[-\s]ending|suspended|released|waived|carted\s+off|"
     r"ruled\s+out|will\s+miss\s+\d+\s+(game|week))",
@@ -80,16 +90,59 @@ def _extract_json(text: str) -> dict:
     return json.loads(candidate)
 
 
-def _fallback(reason: str) -> Classification:
+def _has_high_signal(item: NewsItem) -> bool:
+    return bool(HIGH_SIGNAL.search(f"{item.headline} {item.body}"))
+
+
+def _fallback_event_type(item: NewsItem) -> str:
+    """Best-effort deterministic label when the model is unavailable."""
+    text = f"{item.headline} {item.body}".lower()
+    if re.search(r"\b(released|waived)\b", text):
+        return "release"
+    if "suspend" in text:
+        return "suspension"
+    if re.search(r"\b(activated|return(?:ed|s|ing)?|cleared)\b", text):
+        return "return"
+    if re.search(r"\b(ruled\s+out|inactive)\b", text):
+        return "inactive"
+    if _has_high_signal(item):
+        return "injury"
+    return "other"
+
+
+def _fallback(reason: str, item: NewsItem) -> Classification:
     # Severity 3 keeps an unclassified item above a default threshold of 2
     # so a model outage degrades into more alerts, never fewer.
-    return Classification(
-        event_type="other",
-        severity=3,
-        fantasy_impact="Could not classify automatically - check the link.",
-        is_actionable=True,
-        raw={"error": reason},
+    # High-signal news must retain the same deterministic floor used for a
+    # successful but under-rated model response. Otherwise preseason's 4+
+    # gate silently drops torn ACL/IR news precisely while the model is down.
+    high_signal = _has_high_signal(item)
+    event_type = _fallback_event_type(item)
+    direction = (
+        "positive"
+        if event_type == "return"
+        else "negative"
+        if event_type in {"injury", "inactive", "release", "suspension"}
+        else "neutral"
     )
+    HEALTH.mark("model", ok=False, detail=reason)
+    return Classification(
+        event_type=event_type,
+        severity=HIGH_SIGNAL_FLOOR if high_signal else 3,
+        fantasy_impact="Automatic classification unavailable; source requires review.",
+        is_actionable=True,
+        raw={
+            "error": reason,
+            "high_signal_floor": high_signal,
+            "direction": direction,
+        },
+    )
+
+
+def _retryable_request(error: requests.RequestException) -> bool:
+    response = getattr(error, "response", None)
+    status = getattr(response, "status_code", None)
+    return status is None or status in {408, 409, 425, 429} or status >= 500
 
 
 def classify(
@@ -109,49 +162,86 @@ def classify(
     if context:
         user_prompt += f"\n{context}"
 
-    try:
-        response = session.post(
-            API_URL,
-            timeout=REQUEST_TIMEOUT,
-            headers={
-                "Authorization": f"Bearer {config.openrouter_api_key}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "https://github.com/local/fantasy-football-notifier",
-                "X-Title": "fantasy-football-notifier",
-            },
-            json={
-                "model": config.openrouter_model,
-                "temperature": 0,
-                "max_tokens": 400,
-                "response_format": {"type": "json_object"},
-                # DeepSeek v4 emits reasoning tokens by default, which for this
-                # task burned 1500+ tokens, returned NO content at all, and took
-                # 66s per call. Disabling it is 37x faster and 11x cheaper with
-                # identical classifications. Measured, not assumed.
-                "reasoning": {"enabled": False},
-                # Default routing sprays across ~6 providers and the tail
-                # reached 8.9s. Pinning by throughput held max at 1.5s --
-                # a 5.8x better worst case, which matters more than median
-                # for a breaking-news alert.
-                "provider": {"sort": "throughput"},
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": SYSTEM_PROMPT.format(event_types=", ".join(EVENT_TYPES)),
-                    },
-                    {"role": "user", "content": user_prompt},
-                ],
-            },
+    parsed = None
+    failure_reason = "request_failed"
+    for attempt in range(1, MAX_REQUEST_ATTEMPTS + 1):
+        try:
+            response = session.post(
+                API_URL,
+                timeout=REQUEST_TIMEOUT,
+                headers={
+                    "Authorization": f"Bearer {config.openrouter_api_key}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://github.com/local/fantasy-football-notifier",
+                    "X-Title": "fantasy-football-notifier",
+                },
+                json={
+                    "model": config.openrouter_model,
+                    "temperature": 0,
+                    "max_tokens": 400,
+                    "response_format": {"type": "json_object"},
+                    # DeepSeek v4 emits reasoning tokens by default, which for this
+                    # task burned 1500+ tokens, returned NO content at all, and took
+                    # 66s per call. Disabling it is 37x faster and 11x cheaper with
+                    # identical classifications. Measured, not assumed.
+                    "reasoning": {"enabled": False},
+                    # Default routing sprays across ~6 providers and the tail
+                    # reached 8.9s. Pinning by throughput held max at 1.5s --
+                    # a 5.8x better worst case, which matters more than median
+                    # for a breaking-news alert.
+                    "provider": {"sort": "throughput"},
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": SYSTEM_PROMPT.format(
+                                event_types=", ".join(EVENT_TYPES)
+                            ),
+                        },
+                        {"role": "user", "content": user_prompt},
+                    ],
+                },
+            )
+            response.raise_for_status()
+            content = response.json()["choices"][0]["message"]["content"]
+            parsed = _extract_json(content)
+            break
+        except requests.RequestException as error:
+            failure_reason = "request_failed"
+            retrying = attempt < MAX_REQUEST_ATTEMPTS and _retryable_request(error)
+            structured_log(
+                logging.WARNING,
+                "classify.request_failed",
+                error=str(error),
+                attempt=attempt,
+                retrying=retrying,
+            )
+            if not retrying:
+                break
+        except (KeyError, IndexError, TypeError, ValueError) as error:
+            # A provider occasionally returns a successful HTTP response with
+            # empty content. Retry it just like a transient transport failure.
+            failure_reason = "unparseable_response"
+            retrying = attempt < MAX_REQUEST_ATTEMPTS
+            structured_log(
+                logging.WARNING,
+                "classify.unparseable_response",
+                error=str(error),
+                attempt=attempt,
+                retrying=retrying,
+            )
+            if not retrying:
+                break
+
+        delay = min(
+            RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)),
+            MAX_RETRY_BACKOFF_SECONDS,
         )
-        response.raise_for_status()
-        content = response.json()["choices"][0]["message"]["content"]
-        parsed = _extract_json(content)
-    except requests.RequestException as error:
-        structured_log(logging.WARNING, "classify.request_failed", error=str(error))
-        return _fallback("request_failed")
-    except (KeyError, IndexError, ValueError, json.JSONDecodeError) as error:
-        structured_log(logging.WARNING, "classify.unparseable_response", error=str(error))
-        return _fallback("unparseable_response")
+        time.sleep(delay)
+
+    if parsed is None:
+        return _fallback(failure_reason, item)
+
+    HEALTH.mark("model", ok=True, detail=config.openrouter_model)
 
     event_type = str(parsed.get("event_type") or "other").strip().lower()
     if event_type not in EVENT_TYPES:
@@ -162,7 +252,8 @@ def classify(
     except (TypeError, ValueError):
         severity = 3
 
-    if severity < HIGH_SIGNAL_FLOOR and HIGH_SIGNAL.search(f"{item.headline} {item.body}"):
+    high_signal = _has_high_signal(item)
+    if severity < HIGH_SIGNAL_FLOOR and high_signal:
         structured_log(
             logging.WARNING,
             "classify.severity_floor_applied",
@@ -172,6 +263,8 @@ def classify(
             headline=item.headline,
         )
         severity = HIGH_SIGNAL_FLOOR
+    if event_type == "other" and high_signal:
+        event_type = _fallback_event_type(item)
 
     return Classification(
         event_type=event_type,

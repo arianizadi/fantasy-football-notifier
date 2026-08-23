@@ -1,4 +1,4 @@
-"""Retry-safe expiry of Telegram messages created by this bot."""
+"""Disabled legacy expiry; Telegram's native chat TTL owns retention."""
 
 from __future__ import annotations
 
@@ -20,13 +20,11 @@ def expire_due_messages(
     ttl_seconds: int,
     delete: Callable[[int], bool],
 ) -> ExpiryResult:
-    """Delete due messages while retaining transient failures for a later retry."""
-    deletable, too_old = store.due(ttl_seconds)
-    deleted = [message_id for message_id in deletable if delete(message_id)]
-    failed = [message_id for message_id in deletable if message_id not in deleted]
+    """No-op compatibility shim.
 
-    # Successful deletions and messages beyond Telegram's deletion window are
-    # terminal. Failed requests remain tracked so the next cron run retries them.
-    store.forget(deleted + too_old)
-    store.save()
-    return ExpiryResult(deleted=deleted, failed=failed, too_old=too_old)
+    A bot-side timer races Telegram's chat-level seven-day timer and cannot
+    implement seven days anyway because the Bot API deletion window is only 48
+    hours. Keeping this callable but inert makes an old cron deployment safe.
+    """
+    del store, ttl_seconds, delete
+    return ExpiryResult(deleted=[], failed=[], too_old=[])

@@ -20,7 +20,7 @@ from .logging_utils import structured_log
 MODELS_URL = "https://openrouter.ai/api/v1/models"
 REQUEST_TIMEOUT = 25
 STEALTH_PREFIX = "stealth/"
-# Structured output is non-negotiable: the verifier must return parseable JSON.
+# Structured output is non-negotiable: a candidate classifier must return JSON.
 REQUIRED_PARAMS = {"response_format"}
 
 

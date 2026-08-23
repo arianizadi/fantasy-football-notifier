@@ -17,7 +17,8 @@ hallucinated depth chart would produce confidently wrong waiver advice.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from datetime import datetime
 from typing import Any
 
 from .matcher import compact_key
@@ -30,13 +31,44 @@ SKILL_POSITIONS = frozenset({"QB", "RB", "WR", "TE"})
 # handcuff this feature exists to surface (QB1 out -> claim QB2).
 MAX_USEFUL_SEARCH_RANK = 400
 MAX_BENEFICIARIES = 3
-# How much of the NFL depth chart to show for investigation. The recommendation
-# is only ever the mechanical next-man-up; the real beneficiary is often the
-# slot receiver or the TE absorbing targets, so the full chain plus the other
-# skill positions on that team go in the message for you to judge.
-MAX_DEPTH_SHOWN = 5
+# Keep the investigation block to the subject and nearby useful players. Five
+# deep names plus unrelated starters made the source data look more precise
+# than it is and buried the actual news subject.
+MAX_DEPTH_SHOWN = 3
 ADJACENT_POSITIONS = ("WR", "TE", "RB", "QB")
-BENCH_SLOTS = frozenset({"BE", "BN", "BENCH", "IR"})
+
+# Mechanical next-man-up recommendations are safe only when the event removes
+# or materially threatens a player. A return/signing/trade may affect a depth
+# chart, but direction cannot be inferred from event type alone and must never
+# turn into an automatic ADD of the old backup.
+BACKUP_MOVE_MIN_SEVERITY = {
+    "injury": 3,
+    "inactive": 3,
+    "suspension": 4,
+    "release": 4,
+}
+LINEUP_SUB_MIN_SEVERITY = {
+    "injury": 4,
+    "inactive": 3,
+    "suspension": 4,
+    "release": 4,
+}
+def normalized_event_type(event_type: str) -> str:
+    return (event_type or "other").strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def event_allows_backup_moves(event_type: str, severity: int) -> bool:
+    """Whether next-man-up waiver suggestions are valid for this event."""
+    event = normalized_event_type(event_type)
+    minimum = BACKUP_MOVE_MIN_SEVERITY.get(event)
+    return minimum is not None and severity >= minimum
+
+
+def event_allows_lineup_substitution(event_type: str, severity: int) -> bool:
+    """Whether an owned subject is unavailable enough to suggest a bench sub."""
+    event = normalized_event_type(event_type)
+    minimum = LINEUP_SUB_MIN_SEVERITY.get(event)
+    return minimum is not None and severity >= minimum
 
 
 @dataclass(frozen=True)
@@ -59,16 +91,21 @@ class DepthEntry:
     is_subject: bool
     # league_key -> ("free_agent" | "mine" | "rostered", fantasy_team)
     ownership: dict[str, tuple[str, str]] = field(default_factory=dict)
+    # Both fields are explicitly attributed to Sleeper by the formatter. They
+    # are not conclusions drawn from the news item or the language model.
+    sleeper_injury_status: str = ""
+    sleeper_status: str = ""
 
 
 @dataclass
 class TeamContext:
-    """Everything on the injured player's NFL team worth eyeballing."""
+    """Sleeper depth context around the news subject."""
 
     team: str
     subject_position: str
     same_position: list[DepthEntry] = field(default_factory=list)
     adjacent: list[DepthEntry] = field(default_factory=list)
+    player_index_refreshed_at: datetime | None = None
 
 
 @dataclass
@@ -89,15 +126,59 @@ class LeaguePlays:
     def has_action(self) -> bool:
         return bool(self.claimable or self.bench_options)
 
+    def for_event(self, event_type: str, severity: int) -> LeaguePlays:
+        """Copy containing only recommendations valid for this classified event."""
+        return replace(
+            self,
+            beneficiaries=(
+                self.beneficiaries
+                if event_allows_backup_moves(event_type, severity)
+                else []
+            ),
+            bench_options=(
+                self.bench_options
+                if event_allows_lineup_substitution(event_type, severity)
+                else []
+            ),
+        )
+
+    def has_action_for(self, event_type: str, severity: int) -> bool:
+        return self.for_event(event_type, severity).has_action
+
+
+def plays_for_event(
+    per_league: list[LeaguePlays], event_type: str, severity: int
+) -> list[LeaguePlays]:
+    """Apply the deterministic action policy to all league-specific plays.
+
+    The pipeline should call this immediately after classification and before
+    tier selection. That prevents a positive return from being mislabeled as
+    a waiver opportunity merely because the raw depth chart has a free backup.
+    """
+    return [plays.for_event(event_type, severity) for plays in per_league]
+
 
 class DepthCharts:
     """NFL depth charts joined against per-league roster ownership."""
 
-    def __init__(self, player_index: dict[str, Any], snapshot: RosterSnapshot) -> None:
+    def __init__(
+        self,
+        player_index: dict[str, Any],
+        snapshot: RosterSnapshot,
+        *,
+        player_index_refreshed_at: datetime | None = None,
+    ) -> None:
         self._by_key: dict[str, dict[str, Any]] = {}
         self._by_team_position: dict[tuple[str, str], list[dict[str, Any]]] = {}
+        self.player_index_refreshed_at = (
+            player_index_refreshed_at
+            if player_index_refreshed_at is not None
+            else getattr(player_index, "refreshed_at", None)
+        )
 
         for record in player_index.values():
+            if not isinstance(record, dict):
+                continue
             name = record.get("full_name") or ""
             if not name:
                 continue
@@ -105,11 +186,11 @@ class DepthCharts:
             existing = self._by_key.get(key)
             # Sleeper carries retired duplicates; prefer the active entry.
             if existing is None or (
-                record.get("status") == "Active" and existing.get("status") != "Active"
+                self._is_active(record) and not self._is_active(existing)
             ):
                 self._by_key[key] = record
             team, position = record.get("team") or "", record.get("position") or ""
-            if team and position in SKILL_POSITIONS and record.get("status") == "Active":
+            if team and position in SKILL_POSITIONS and self._is_active(record):
                 self._by_team_position.setdefault((team, position), []).append(record)
 
         for entries in self._by_team_position.values():
@@ -125,6 +206,10 @@ class DepthCharts:
                 "mine" if player.on_my_team else "rostered",
                 player.fantasy_team,
             )
+
+    @staticmethod
+    def _is_active(record: dict[str, Any]) -> bool:
+        return str(record.get("status") or "").strip().casefold() == "active"
 
     def lookup(self, *names: str) -> dict[str, Any] | None:
         for name in names:
@@ -154,26 +239,79 @@ class DepthCharts:
                 league.key: self._state(league.key, name)
                 for league in snapshot.drafted_leagues()
             },
+            sleeper_injury_status=str(record.get("injury_status") or ""),
+            sleeper_status=str(record.get("status") or ""),
         )
+
+    def _nearby_same_position(self, record: dict[str, Any]) -> list[dict[str, Any]]:
+        """Subject plus the nearest useful players in Sleeper's depth order."""
+        team = record.get("team") or ""
+        position = record.get("position") or ""
+        subject_key = compact_key(record.get("full_name") or "")
+        group = list(self._by_team_position.get((team, position), []))
+
+        # PUP/IR players are absent from Sleeper's active depth group. The
+        # subject still belongs in its own alert, with Sleeper's actual status
+        # displayed rather than a notifier-invented injury label.
+        if not any(compact_key(candidate.get("full_name") or "") == subject_key for candidate in group):
+            group.append(record)
+            group.sort(
+                key=lambda candidate: (
+                    candidate.get("depth_chart_order") is None,
+                    candidate.get("depth_chart_order") or 99,
+                )
+            )
+
+        subject_index = next(
+            (
+                index
+                for index, candidate in enumerate(group)
+                if compact_key(candidate.get("full_name") or "") == subject_key
+            ),
+            0,
+        )
+        selected: list[dict[str, Any]] = []
+        if subject_index > 0:
+            selected.append(group[subject_index - 1])
+        selected.append(group[subject_index])
+
+        following = group[subject_index + 1 :]
+        for index, candidate in enumerate(following):
+            rank = candidate.get("search_rank")
+            # Always retain the next two depth entries; deeper long shots are
+            # only useful when Sleeper's overall search rank supports them.
+            if index > 1 and rank is not None and rank > MAX_USEFUL_SEARCH_RANK:
+                continue
+            selected.append(candidate)
+            if len(selected) >= MAX_DEPTH_SHOWN:
+                break
+        return selected[:MAX_DEPTH_SHOWN]
 
     def team_context(
         self, record: dict[str, Any], snapshot: RosterSnapshot
     ) -> TeamContext | None:
-        """Full depth chart at the subject's position, plus other skill spots."""
+        """Subject-centered depth context plus top players at adjacent spots."""
         team = record.get("team") or ""
         position = record.get("position") or ""
         if not team or position not in SKILL_POSITIONS:
             return None
 
         subject_name = record.get("full_name") or ""
-        context = TeamContext(team=team, subject_position=position)
+        context = TeamContext(
+            team=team,
+            subject_position=position,
+            player_index_refreshed_at=self.player_index_refreshed_at,
+        )
 
-        for candidate in self._by_team_position.get((team, position), [])[:MAX_DEPTH_SHOWN]:
+        for candidate in self._nearby_same_position(record):
             context.same_position.append(
                 self._entry(
                     candidate,
                     snapshot,
-                    is_subject=candidate.get("full_name") == subject_name,
+                    is_subject=(
+                        compact_key(candidate.get("full_name") or "")
+                        == compact_key(subject_name)
+                    ),
                 )
             )
 
@@ -251,7 +389,7 @@ class DepthCharts:
                         continue
                     if compact_key(player.name) == compact_key(subject_name):
                         continue
-                    if player.lineup_slot.upper() in BENCH_SLOTS:
+                    if player.can_be_started_from_bench:
                         plays.bench_options.append(player.name)
                 plays.bench_options = plays.bench_options[:4]
 

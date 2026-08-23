@@ -18,9 +18,31 @@ BASE_URL = "https://api.sleeper.app/v1"
 REQUEST_TIMEOUT = 20
 
 # Sleeper returns starters as an ordered list; index maps to a lineup slot only
-# loosely, so starters are labelled ST and the rest BE.
+# loosely. Reserve/taxi/NFL-inactive state is encoded in the same field so it
+# survives the provider-neutral roster snapshot without a schema migration.
 STARTER_SLOT = "ST"
 BENCH_SLOT = "BE"
+RESERVE_SLOT = "RESERVE"
+TAXI_SLOT = "TAXI"
+NFL_INACTIVE_SLOT = "NFL_INACTIVE"
+
+
+def roster_slot(
+    player_id: str,
+    *,
+    starters: set[str],
+    reserve: set[str],
+    taxi: set[str],
+    nfl_status: str,
+) -> str:
+    """Return an availability-safe synthetic lineup slot for Sleeper."""
+    if player_id in reserve:
+        return RESERVE_SLOT
+    if player_id in taxi:
+        return TAXI_SLOT
+    if nfl_status and nfl_status.casefold() != "active":
+        return NFL_INACTIVE_SLOT
+    return STARTER_SLOT if player_id in starters else BENCH_SLOT
 
 
 def resolve_user_id(session: requests.Session, username: str) -> str:
@@ -77,6 +99,8 @@ def fetch_league_rosters(
         is_mine = owner_id == user_id
         fantasy_team = team_names.get(owner_id, f"Team {roster.get('roster_id')}")
         starters = {str(p) for p in (roster.get("starters") or []) if p}
+        reserve = {str(p) for p in (roster.get("reserve") or []) if p}
+        taxi = {str(p) for p in (roster.get("taxi") or []) if p}
         for player_id in roster.get("players") or []:
             record = player_index.get(str(player_id))
             if not record or not record.get("full_name"):
@@ -86,7 +110,13 @@ def fetch_league_rosters(
                     name=record["full_name"],
                     position=record.get("position") or "",
                     pro_team=record.get("team") or "",
-                    lineup_slot=STARTER_SLOT if str(player_id) in starters else BENCH_SLOT,
+                    lineup_slot=roster_slot(
+                        str(player_id),
+                        starters=starters,
+                        reserve=reserve,
+                        taxi=taxi,
+                        nfl_status=str(record.get("status") or ""),
+                    ),
                     on_my_team=is_mine,
                     fantasy_team=fantasy_team,
                     league_key=ref.key,

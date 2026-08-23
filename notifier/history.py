@@ -1,12 +1,8 @@
-"""Track message ids this bot sent, so they can be expired later.
+"""Legacy message-id history retained for state-file compatibility.
 
-Only ids recorded here are ever deleted. A blind id-range sweep also removes
-the user's own messages, and a private chat with no history left is treated as
-a new chat, forcing them to restart it.
-
-Telegram only permits a bot to delete a message for 48 hours after sending, so
-the TTL must stay under that. Anything that ages past the limit is dropped from
-tracking rather than retried forever.
+Telegram's native chat auto-delete timer now owns retention. The custom bot
+expiry path is intentionally disabled in :mod:`notifier.expiry`; this reader
+remains so an older state file does not break an upgrade or rollback.
 """
 
 from __future__ import annotations

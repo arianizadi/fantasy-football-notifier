@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Delete Telegram messages this bot sent once they pass MESSAGE_TTL_HOURS.
-
-Only ids recorded in state/sent-messages.json are touched, so the user's own
-messages are never removed. Telegram refuses deletion past 48 hours; anything
-that ages out is dropped from tracking instead of retried forever.
-"""
+"""Compatibility no-op; Telegram's native chat timer owns message retention."""
 
 from __future__ import annotations
 
@@ -12,42 +7,17 @@ import logging
 import sys
 from pathlib import Path
 
-import requests
-from dotenv import load_dotenv
-
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from notifier.config import load_config  # noqa: E402
-from notifier.expiry import expire_due_messages  # noqa: E402
 from notifier.logging_utils import configure_logging, structured_log  # noqa: E402
-from notifier.notify import delete_message, history  # noqa: E402
 
 
 def main() -> int:
-    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
     configure_logging()
-    config = load_config()
-
-    if config.message_ttl_hours <= 0:
-        structured_log(logging.INFO, "expire.disabled")
-        return 0
-
-    store = history(config)
-    session = requests.Session()
-    result = expire_due_messages(
-        store,
-        config.message_ttl_hours * 3600,
-        lambda message_id: delete_message(session, config, message_id),
-    )
-
     structured_log(
         logging.INFO,
-        "expire.complete",
-        ttlHours=config.message_ttl_hours,
-        deleted=len(result.deleted),
-        failed=len(result.failed),
-        pastWindow=len(result.too_old),
-        stillTracked=len(store),
+        "expire.disabled",
+        reason="Telegram native chat auto-delete owns retention",
     )
     return 0
 

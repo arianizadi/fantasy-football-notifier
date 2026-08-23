@@ -42,12 +42,14 @@ class LeagueRef:
 
     @property
     def short_label(self) -> str:
-        """Compact, scannable league tag for alert lines.
+        """A human label that does not collapse every league to its provider.
 
-        The provider name reads more consistently than an arbitrary league
-        name, whose first word may not be a useful notification label.
+        Uniqueness across a set of leagues is handled by the formatter, which
+        can see sibling leagues and append a provider/id only when necessary.
+        Keeping the real league name here prevents two Sleeper leagues from
+        both appearing as the indistinguishable ``SLEEPER``.
         """
-        return (self.provider or "LEAGUE").upper()
+        return self.name.strip() or (self.provider or "LEAGUE").upper()
 
 
 @dataclass(frozen=True)
@@ -59,6 +61,17 @@ class RosterPlayer:
     on_my_team: bool
     fantasy_team: str
     league_key: str
+
+    @property
+    def can_be_started_from_bench(self) -> bool:
+        """Whether this roster entry is a real, active bench alternative.
+
+        Provider adapters encode reserve/taxi/NFL-inactive state in
+        ``lineup_slot`` so it survives the existing roster snapshot format.
+        ESPN's IR slot and Sleeper reserve/taxi players must never be offered
+        as a player the manager can start now.
+        """
+        return self.lineup_slot.strip().upper() in {"BE", "BN", "BENCH"}
 
 
 @dataclass
@@ -108,3 +121,10 @@ class Alert:
     # Every league, not just ones with an action, so ownership tags in the
     # depth chart stay complete.
     all_leagues: list[LeagueRef] = field(default_factory=list)
+    # Every waiver candidate is rechecked against live league rosters. If that
+    # provider refresh fails, the alert remains useful as news but all ADD/FA
+    # claims are removed and the formatter explains the limitation.
+    availability_refresh_failed: bool = False
+    # Persisted retries are labelled so an older report is never presented as
+    # if it just broke. Claimable actions are revalidated before this is set.
+    delivery_delayed: bool = False
