@@ -11,7 +11,7 @@ import notifier.notify as notify_module
 import notifier.telegram_state as telegram_state_module
 from notifier.dedupe import semantic_event_type
 from notifier.models import Alert, Classification, NewsItem
-from notifier.notify import send_alert
+from notifier.notify import TELEGRAM_TEXT_LIMIT, _visible_units, send_alert
 from notifier.telegram_control import TelegramControl
 from notifier.telegram_state import TelegramState, alert_token
 
@@ -182,6 +182,32 @@ def test_same_event_corroboration_edits_existing_message_and_digest(tmp_path) ->
     assert first_token in persisted["feedbackTargets"]
     assert second_token in persisted["feedbackTargets"]
     assert not (tmp_path / "sent-messages.json").exists()
+
+
+def test_send_and_edit_payloads_stay_within_telegram_text_limit(tmp_path) -> None:
+    notify_module._TELEGRAM_STATES.clear()
+    config = _config(tmp_path)
+    session = Session()
+    oversized = "49ers activated George Kittle from active/PUP. " + ("🏈" * 5000)
+    first = _alert("tweet:long:1", headline=oversized, body=oversized)
+    updated_text = (
+        "49ers confirm George Kittle was activated and returned to practice. "
+        + ("🏈" * 5000)
+    )
+    updated = _alert(
+        "tweet:long:2",
+        headline=updated_text,
+        body=updated_text,
+    )
+
+    assert send_alert(session, config, first) == 100
+    assert send_alert(session, config, updated) == 100
+
+    assert session.urls[0].endswith("/sendMessage")
+    assert session.urls[1].endswith("/editMessageText")
+    for payload in session.payloads:
+        assert _visible_units(payload["text"]) <= TELEGRAM_TEXT_LIMIT
+        assert "Some details omitted to fit Telegram" in payload["text"]
 
 
 def test_watson_starter_burst_collapses_across_labels_and_wording(

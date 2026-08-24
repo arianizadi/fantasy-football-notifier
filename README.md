@@ -42,7 +42,7 @@ previously hurt.
 | Tier | Meaning |
 |---|---|
 | YOUR ROSTER | You own the affected player. |
-| WAIVER OPPORTUNITY | The event creates a claimable role in at least one drafted league. |
+| WAIVER WATCH | The event creates a claimable role in at least one drafted league. |
 | RIVAL ROSTER | A rival owns the affected player. |
 | LEAGUE NEWS | Relevant NFL news without a direct roster move. |
 | PRESEASON - DRAFT IMPACT | Draft advice while configured leagues remain undrafted. |
@@ -55,31 +55,35 @@ separately from the news classification.
 Example return alert:
 
 ```text
-[4/5] PRESEASON — RETURN - George Kittle
-The 49ers activated Kittle from active/PUP.
+🟠 [4/5] PRESEASON · George Kittle
+RETURN · The 49ers activated Kittle from active/PUP.
 
-Model summary: Kittle's expected availability improved.
+⚠️ NEXT STEP
+Return news improves availability. Confirm full practice and Week 1 status
+before changing draft value.
 
-Draft note: Return news improves availability; confirm full practice and Week 1
-status before adjusting draft value.
+👀 BACKUP WATCH
+Jake Tonges is next in Sleeper's TE depth order. No pickup is recommended from
+return news; an injury or inactive report will recheck availability.
 
-Backup watch: Jake Tonges is next in Sleeper's TE depth order. No pickup is
-recommended from return news; injury or inactive alerts recheck league
-availability.
+📋 SF TE DEPTH
+Sleeper · updated Aug 23 · 10:45 AM PT
+➡️ TE1 George Kittle · report subject
+↳ Sleeper #91 · Injury: Questionable
 
-SF TE DEPTH / BACKUP WATCH · SLEEPER
-  refreshed 2026-08-23 10:45 PT
-  TE1 George Kittle · Sleeper rank #91 · SUBJECT · RETURN
-  TE2 Jake Tonges · Sleeper rank #178
-  TE3 Luke Farrell · Sleeper rank #491
+• TE2 Jake Tonges
+↳ Sleeper #178
 
-X source
+• TE3 Luke Farrell
+↳ Sleeper #491
+
+🔗 X source
 ```
 
-Sleeper's `search_rank` is labelled as a Sleeper rank, not jersey number, ADP,
-or positional rank. Context timestamps say when the cached player data was
-refreshed. Reserve, taxi, IR, and NFL-inactive players are not offered as
-immediately startable replacements.
+The compact `Sleeper #91` label means Sleeper's `search_rank`; it is not a
+jersey number, ADP, or positional rank. Context timestamps say when the cached
+player data was refreshed. Reserve, taxi, IR, and NFL-inactive players are not
+offered as immediately startable replacements.
 
 ## League and roster data
 
@@ -138,19 +142,21 @@ low. When more than one is free, they are presented as alternatives instead of
 two commands to add both:
 
 ```text
-[4/5] WAIVER OPPORTUNITY — INJURY
+🟠 [4/5] WAIVER WATCH · Arizona Starter
+INJURY · Ruled out after leaving practice
 
-LEAGUE-SPECIFIC MOVES
-Sunday Crew: PICKUP OPTIONS — Michael Carter (Sleeper depth RB2 · named in report
-  · FantasyPros HALF waiver RB34 · ROS RB55) | Bam Knight (Sleeper depth RB3
-  · named in report · FantasyPros HALF waiver RB41 · ROS RB63)
-  Roster occupancy: Bench 5/5 full · IR 0/1 open (eligibility not checked)
-  FantasyPros rank lean: Michael Carter (ranking context only; role unconfirmed)
-  FantasyPros cached HALF rankings · provider updated 2026-08-23 10:00 PT;
-  may lag this breaking report and do not confirm role or workload.
+🎯 YOUR OPTIONS
+Sunday Crew
+Pickup options · choose one
+🟢 Michael Carter · Sleeper RB2
+↳ named in report · FantasyPros HALF waiver RB34 · ROS RB55
+🟢 Bam Knight · Sleeper RB3
+↳ named in report · FantasyPros HALF waiver RB41 · ROS RB63
+📦 Roster space · Bench 5/5 full · IR 0/1 open
+↳ IR eligibility is not checked.
+📊 FantasyPros lean · Michael Carter (role unconfirmed)
 
-Backup note: Pickup options are alternatives, not instructions to add both.
-Sleeper depth order does not confirm workload or touch share.
+Choose one option. Sleeper depth order does not confirm workload or touches.
 ```
 
 The alert path never calls the FantasyPros API. X remains the fast trigger,

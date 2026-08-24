@@ -9,6 +9,7 @@ import threading
 from collections import Counter
 from dataclasses import replace
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from zoneinfo import ZoneInfo
 from urllib.parse import urlsplit
 
@@ -28,17 +29,25 @@ from .telegram_state import (
 
 API_BASE = "https://api.telegram.org"
 REQUEST_TIMEOUT = 15
+TELEGRAM_TEXT_LIMIT = 4096
 _SEND_CONTEXT = threading.local()
-PACIFIC = ZoneInfo("America/Los_Angeles")
 
-# Plain text only. Severity leads as an explicit n/5 so the notification
-# preview is scannable without decoding symbols.
+# Severity always remains textual for accessibility. The colored dot is only
+# a visual anchor; Telegram does not support arbitrary text colors.
 TIER_LABEL = {
     "mine": "YOUR ROSTER",
-    "claimable": "WAIVER OPPORTUNITY",
+    "claimable": "WAIVER WATCH",
     "rival": "RIVAL ROSTER",
     "league": "LEAGUE NEWS",
     "preseason": "PRESEASON",
+}
+
+SEVERITY_ICON = {
+    1: "⚪",
+    2: "🔵",
+    3: "🟡",
+    4: "🟠",
+    5: "🔴",
 }
 
 EVENT_LABEL = {
@@ -56,7 +65,116 @@ EVENT_LABEL = {
 }
 
 def _escape(value: str) -> str:
-    return html.escape(value or "", quote=False)
+    # Some feeds occasionally send already-escaped HTML entities (for
+    # example, ``&amp;``). Normalize once before escaping so Telegram renders
+    # one ampersand instead of the literal characters "&amp;".
+    entity_values = {
+        "amp": "&",
+        "lt": "<",
+        "gt": ">",
+        "quot": '"',
+        "apos": "'",
+        "#39": "'",
+    }
+    normalized = re.sub(
+        r"&(?:amp|lt|gt|quot|apos|#39);",
+        lambda match: entity_values[match.group(0)[1:-1].casefold()],
+        value or "",
+        flags=re.IGNORECASE,
+    )
+    # Dynamic feed/provider fields are inline inside a layout we control.
+    # Collapsing their whitespace prevents upstream newlines from breaking a
+    # section boundary or opening an oversized partial HTML block.
+    normalized = " ".join(normalized.split())
+    return html.escape(normalized, quote=False)
+
+
+class _VisibleTextParser(HTMLParser):
+    """Extract the text Telegram counts after parsing HTML entities."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+
+    def handle_data(self, data: str) -> None:
+        self.parts.append(data)
+
+
+def _plain_html_text(markup: str) -> str:
+    parser = _VisibleTextParser()
+    parser.feed(markup)
+    parser.close()
+    return "".join(parser.parts)
+
+
+def _utf16_units(value: str) -> int:
+    """Telegram measures message length in UTF-16 code units."""
+    return len(value.encode("utf-16-le")) // 2
+
+
+def _visible_units(markup: str) -> int:
+    return _utf16_units(_plain_html_text(markup))
+
+
+def _clip_utf16(value: str, limit: int) -> str:
+    """Clip plain text without splitting a supplementary-plane character."""
+    if limit <= 0:
+        return ""
+    ellipsis_units = _utf16_units("…")
+    budget = max(0, limit - ellipsis_units)
+    used = 0
+    kept: list[str] = []
+    for character in value:
+        units = _utf16_units(character)
+        if used + units > budget:
+            break
+        kept.append(character)
+        used += units
+    clipped = "".join(kept).rstrip()
+    return clipped + ("…" if clipped != value else "")
+
+
+def _fit_telegram_limit(markup: str) -> str:
+    """Keep complete sections when possible and never send invalid HTML.
+
+    Telegram rejects sendMessage and editMessageText payloads over 4096
+    visible UTF-16 units. Alerts are ordered by usefulness, so retain complete
+    leading sections and replace an oversized tail with an explicit marker.
+    A pathological single block falls back to safely escaped clipped text.
+    """
+    if _visible_units(markup) <= TELEGRAM_TEXT_LIMIT:
+        return markup
+
+    suffix = "<i>… Some details omitted to fit Telegram.</i>"
+    separator = "\n\n"
+    content_budget = TELEGRAM_TEXT_LIMIT - _visible_units(separator + suffix)
+    kept: list[str] = []
+    for block in markup.split(separator):
+        candidate = separator.join([*kept, block])
+        if _visible_units(candidate) <= content_budget:
+            kept.append(block)
+            continue
+
+        prefix = separator.join(kept)
+        remaining = content_budget - _visible_units(prefix)
+        if kept:
+            remaining -= _visible_units(separator)
+        # Preserve a useful fragment only when there is room for more than a
+        # tiny orphaned label. It is plain escaped text, so tags stay balanced.
+        if remaining >= 80:
+            fragment = _clip_utf16(_plain_html_text(block), remaining)
+            if fragment:
+                kept.append(_escape(fragment))
+        elif not kept:
+            kept.append(_escape(_clip_utf16(_plain_html_text(block), content_budget)))
+        break
+
+    result = separator.join(kept) + separator + suffix
+    # Defensive assertion for future changes to the suffix or counter.
+    if _visible_units(result) > TELEGRAM_TEXT_LIMIT:
+        fallback = _clip_utf16(_plain_html_text(markup), content_budget)
+        result = _escape(fallback) + separator + suffix
+    return result
 
 
 MIN_SEVERITY_FOR_PLAYS = 3
@@ -92,23 +210,50 @@ def _league_labels(leagues) -> dict[str, str]:
     return labels
 
 
-def _own_tag(entry, leagues, labels: dict[str, str]) -> str:
-    """Per-league ownership without collapsing same-provider leagues."""
+def _ownership_labels(entry, leagues, labels: dict[str, str]) -> list[str]:
+    """Readable ownership lines, split by league when states differ."""
     states = []
     for league in leagues:
         state, team = entry.ownership.get(league.key, ("free_agent", ""))
         if state == "free_agent":
-            label = "FA"
+            label = "Available"
         elif state == "mine":
-            label = "YOU"
+            label = "Your roster"
         else:
-            label = (team or "taken")[:11]
+            owner = team or "another team"
+            if len(owner) > 16:
+                owner = owner[:15] + "…"
+            label = f"Owned by {owner}"
         states.append((labels.get(league.key, league.short_label), label))
 
+    if not states:
+        return []
     if len({label for _, label in states}) == 1:
         only = states[0][1]
-        return "FA all leagues" if only == "FA" and len(states) > 1 else only
-    return " ".join(f"{league_label}:{label}" for league_label, label in states)
+        if len(states) > 1:
+            if only == "Available":
+                return ["Available in all leagues"]
+            if only == "Your roster":
+                return ["Your roster in all leagues"]
+        return [only]
+    return [f"{league_label}: {label}" for league_label, label in states]
+
+
+def _ownership_icon(entry, leagues) -> str:
+    """Color anchor for ownership; the adjacent text carries the meaning."""
+    states = [
+        entry.ownership.get(league.key, ("free_agent", ""))[0]
+        for league in leagues
+    ]
+    if not states:
+        return "•"
+    if "mine" in states:
+        return "⭐"
+    if all(state == "free_agent" for state in states):
+        return "🟢"
+    if all(state == "rostered" for state in states):
+        return "🔒"
+    return "◐"
 
 
 def _freshness_label(value: datetime | None) -> str:
@@ -116,7 +261,9 @@ def _freshness_label(value: datetime | None) -> str:
         return ""
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
-    return value.astimezone(DISPLAY_TIMEZONE).strftime("%Y-%m-%d %H:%M PT")
+    local = value.astimezone(DISPLAY_TIMEZONE)
+    clock = local.strftime("%I:%M %p").lstrip("0")
+    return f"{local:%b} {local.day} · {clock} PT"
 
 
 def _event_label(event_type: str) -> str:
@@ -136,58 +283,59 @@ def _context_block(
     context,
     leagues,
     severity: int,
-    event_type: str,
     *,
     show_ownership: bool = True,
 ) -> list[str]:
-    """A source-attributed Sleeper view centered on the news subject."""
+    """A readable Sleeper view of only the affected position."""
     if context is None or severity < MIN_SEVERITY_FOR_CONTEXT:
         return []
 
     labels = _league_labels(leagues)
     lines = [
-        f"<b>{_escape(context.team)} {_escape(context.subject_position)} "
-        "DEPTH / BACKUP WATCH · SLEEPER</b>"
+        f"📋 <b>{_escape(context.team)} {_escape(context.subject_position)} DEPTH</b>"
     ]
     refreshed = _freshness_label(context.player_index_refreshed_at)
+    provenance = "Sleeper"
     if refreshed:
-        lines.append(f"  refreshed {_escape(refreshed)}")
+        provenance += f" · updated {refreshed}"
+    lines.append(f"<i>{_escape(provenance)}</i>")
     if not show_ownership:
-        lines.append("  league ownership hidden: live refresh failed")
+        lines.append("⚠️ Live league ownership unavailable.")
 
-    for entry in context.same_position:
+    for index, entry in enumerate(context.same_position):
         depth_slot = (
             f"{entry.position}{entry.depth_order}"
             if entry.depth_order is not None
             else entry.position
         )
-        segments = [f"{_escape(depth_slot)} {_escape(entry.name)}"]
-        owner = _own_tag(entry, leagues, labels) if show_ownership else ""
-        if owner:
-            segments.append(_escape(owner))
-        if entry.search_rank and entry.search_rank < 99999:
-            segments.append(f"Sleeper rank #{entry.search_rank}")
-        if entry.sleeper_injury_status:
-            segments.append(f"Sleeper injury: {_escape(entry.sleeper_injury_status)}")
-        if entry.sleeper_status and entry.sleeper_status.casefold() != "active":
-            segments.append(f"Sleeper status: {_escape(entry.sleeper_status)}")
+        icon = (
+            "➡️"
+            if entry.is_subject
+            else (_ownership_icon(entry, leagues) if show_ownership else "•")
+        )
+        first = f"{icon} <b>{_escape(depth_slot)} {_escape(entry.name)}</b>"
         if entry.is_subject:
-            # This marks why the row is highlighted without claiming an injury
-            # state Sleeper did not report.
-            segments.append(f"SUBJECT · {_escape(_event_label(event_type))}")
-        lines.append("  " + " · ".join(segments))
+            first += " · report subject"
+        lines.append(first)
 
-    if context.adjacent:
-        lines.append(f"<b>{_escape(context.team)} OTHER SLEEPER DEPTH LEADERS</b>")
-        for entry in context.adjacent:
-            owner = _own_tag(entry, leagues, labels) if show_ownership else ""
-            depth_slot = (
-                f"{entry.position}{entry.depth_order}"
-                if entry.depth_order is not None
-                else entry.position
-            )
-            suffix = f" · {_escape(owner)}" if owner else ""
-            lines.append(f"  {_escape(depth_slot)} {_escape(entry.name)}{suffix}")
+        ownership = (
+            _ownership_labels(entry, leagues, labels) if show_ownership else []
+        )
+        lines += [f"↳ {_escape(owner)}" for owner in ownership]
+
+        metadata: list[str] = []
+        # Sleeper uses 999 as an unranked placeholder; displaying it looks
+        # precise while adding no useful signal.
+        if entry.search_rank and entry.search_rank < 999:
+            metadata.append(f"Sleeper #{entry.search_rank}")
+        if entry.sleeper_injury_status:
+            metadata.append(f"Injury: {_escape(entry.sleeper_injury_status)}")
+        if entry.sleeper_status and entry.sleeper_status.casefold() != "active":
+            metadata.append(f"Status: {_escape(entry.sleeper_status)}")
+        if metadata:
+            lines.append("↳ " + " · ".join(metadata))
+        if index < len(context.same_position) - 1:
+            lines.append("")
     return lines
 
 
@@ -265,10 +413,10 @@ def _fantasypros_freshness(claimable) -> str:
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=timezone.utc)
         timestamps.append(parsed)
-    as_of = f" · provider updated {_freshness_label(min(timestamps))}" if timestamps else ""
+    as_of = f" · updated {_freshness_label(min(timestamps))}" if timestamps else ""
     return (
-        f"FantasyPros cached {scoring} rankings{as_of}; may lag this breaking "
-        "report and do not confirm role or workload."
+        f"FantasyPros {scoring} rankings{as_of}; may lag this report and do "
+        "not confirm the role."
     )
 
 
@@ -280,7 +428,7 @@ def _league_block(
     *,
     allow_adds: bool = True,
 ) -> list[str]:
-    """One tight line per league. Availability differs between leagues."""
+    """One readable action block per league. Availability differs by league."""
     if severity < MIN_SEVERITY_FOR_PLAYS:
         return []
     # Defense in depth: callers should filter before tier selection with
@@ -292,23 +440,25 @@ def _league_block(
         return []
 
     name = _escape(league_label)
-    parts: list[str] = []
-    options: list[str] = []
+    lines = [f"<b>{name}</b>"]
     for beneficiary in claimable[:2]:
         slot = f"{beneficiary.position}{beneficiary.depth_order or ''}"
-        detail = f"Sleeper depth {_escape(slot)}"
+        lines.append(
+            f"🟢 <b>{_escape(beneficiary.name)}</b> · Sleeper {_escape(slot)}"
+        )
+        details: list[str] = []
         if beneficiary.named_in_report:
-            detail += " · named in report"
+            details.append("named in report")
         fantasypros = _fantasypros_rank_detail(beneficiary)
         if fantasypros:
-            detail += f" · {fantasypros}"
-        options.append(f"<b>{_escape(beneficiary.name)}</b> ({detail})")
-    if options:
-        option_label = "PICKUP OPTIONS" if len(options) > 1 else "ADD OPTION"
-        parts.append(f"{option_label} — " + " | ".join(options))
+            details.append(fantasypros)
+        if details:
+            lines.append("↳ " + " · ".join(details))
+    if claimable:
+        option_label = "Pickup options · choose one" if len(claimable) > 1 else "Pickup option"
+        lines.insert(1, option_label)
     if plays.bench_options:
-        parts.append(f"START <b>{_escape(plays.bench_options[0])}</b>")
-    lines = [f"{name}: " + " | ".join(parts)]
+        lines.append(f"🔁 Start instead: <b>{_escape(plays.bench_options[0])}</b>")
 
     # Occupancy only: an open IR spot is not a claim that the injured player
     # is eligible for it, and the notifier never chooses a drop candidate.
@@ -334,20 +484,25 @@ def _league_block(
                     if plays.capacity.ir_used >= plays.capacity.ir_limit
                     else " open"
                 )
-                if plays.capacity.ir_used < plays.capacity.ir_limit:
-                    reserve += " (eligibility not checked)"
             capacity_parts.append(reserve)
         if capacity_parts:
-            lines.append("  Roster occupancy: " + " · ".join(capacity_parts))
+            lines.append("📦 Roster space · " + " · ".join(capacity_parts))
+            if (
+                plays.capacity.ir_used is not None
+                and plays.capacity.ir_limit is not None
+                and plays.capacity.ir_limit > 0
+                and plays.capacity.ir_used < plays.capacity.ir_limit
+            ):
+                lines.append("↳ IR eligibility is not checked.")
     lean = _fantasypros_lean(claimable[:2])
     if lean:
         lines.append(
-            f"  FantasyPros rank lean: <b>{_escape(lean)}</b> "
-            "(ranking context only; role unconfirmed)"
+            f"📊 FantasyPros lean · <b>{_escape(lean)}</b> "
+            "<i>(role unconfirmed)</i>"
         )
     freshness = _fantasypros_freshness(claimable[:2])
     if freshness:
-        lines.append("  " + _escape(freshness))
+        lines.append(f"<i>{_escape(freshness)}</i>")
     return lines
 
 
@@ -357,27 +512,27 @@ def _deterministic_note(alert: Alert) -> str:
     if alert.tier == "preseason":
         if event == "return":
             return (
-                "Draft note: Return news improves availability; confirm full practice "
-                "and Week 1 status before adjusting draft value."
+                "Return news improves availability. Confirm full practice and Week 1 "
+                "status before changing draft value."
             )
         if event == "signing":
-            return "Draft note: Recheck the official role and depth chart before adjusting draft value."
+            return "Recheck the official role and depth chart before changing draft value."
         if event in {"injury", "inactive", "suspension"}:
-            return "Draft note: Recheck official availability before drafting this player."
+            return "Recheck official availability before drafting this player."
         if event in {"trade", "release", "depth_chart", "usage"}:
-            return "Draft note: Reassess role and team context before changing your draft value."
+            return "Reassess the role and team context before changing draft value."
         if event == "practice_report":
-            return "Draft note: Wait for the next official practice or game-status update."
-        return "Draft note: Verify the report before changing your draft value."
+            return "Wait for the next official practice or game-status update."
+        return "Verify the report before changing draft value."
 
     if event == "return":
-        return "Lineup note: Confirm active status and expected workload before lineup lock."
+        return "Confirm active status and expected workload before lineup lock."
     if event == "signing":
-        return "Roster note: No automatic waiver move; confirm the player's official role first."
+        return "No automatic waiver move. Confirm the player's official role first."
     if event in {"trade", "depth_chart", "usage"}:
-        return "Roster note: Recheck the official role before making a lineup or waiver move."
+        return "Recheck the official role before making a lineup or waiver move."
     if event == "practice_report" and alert.classification.severity < 4:
-        return "Lineup note: Wait for the final game-status report before making a change."
+        return "Wait for the final game-status report before making a change."
     return ""
 
 
@@ -395,43 +550,72 @@ def _backup_watch_note(alert: Alert) -> str:
     immediate = backups[0]
     position = alert.context.subject_position or immediate.position or "position"
     return (
-        f"Backup watch: {immediate.name} is next in Sleeper's {position} depth order. "
-        "No pickup is recommended from return news; injury or inactive alerts "
-        "recheck league availability."
+        f"{immediate.name} is next in Sleeper's {position} depth order. No pickup "
+        "is recommended from return news; an injury or inactive report will "
+        "recheck availability."
     )
 
 
-def format_alert(alert: Alert) -> str:
-    """Scannable header, then everything needed to investigate.
+def _source_line(item) -> str:
+    """Linked provenance with a compact mobile-friendly timestamp."""
+    if not item.url:
+        return ""
+    source_name = {
+        "twitter": "X source",
+        "rotowire": "RotoWire source",
+    }.get(item.source.casefold(), f"{item.source or 'news'} source")
+    raw_url = item.url.strip()
+    parsed = urlsplit(raw_url)
+    if parsed.scheme.lower() in {"http", "https"} and parsed.netloc:
+        source = (
+            f'<a href="{html.escape(raw_url, quote=True)}">'
+            f"{_escape(source_name)}</a>"
+        )
+    else:
+        # Telegram accepts only safe URL schemes in HTML links. Keep the
+        # provenance label even when an upstream URL is malformed.
+        source = _escape(source_name)
+    if item.published_at is not None:
+        published = item.published_at
+        if published.tzinfo is None:
+            published = published.replace(tzinfo=timezone.utc)
+        source += f" · {_escape(_freshness_label(published))}"
+    return source
 
-    Line one carries severity + tier + player because Telegram previews it.
-    Below that: an optional non-prescriptive model summary, deterministic
-    moves per league, and source-attributed Sleeper depth context.
-    """
+
+def format_alert(alert: Alert) -> str:
+    """Render a scan-first mobile alert with decision-relevant sections."""
     item, classification = alert.item, alert.classification
     tier = TIER_LABEL.get(alert.tier, "NEWS")
     event = _event_label(classification.event_type)
+    severity_icon = SEVERITY_ICON.get(classification.severity, "⚪")
 
-    head = f"<b>[{classification.severity}/5] {tier} — {event}</b>"
+    head = f"{severity_icon} <b>[{classification.severity}/5] {tier}"
     if item.player_name:
-        head += f" - <b>{_escape(item.player_name)}</b>"
+        head += f" · {_escape(item.player_name)}"
+    head += "</b>"
 
-    lines = [head, _escape(item.headline)]
+    lines = [head, f"<b>{_escape(event)}</b> · {_escape(item.headline)}"]
+    warning_lines: list[str] = []
     if alert.delivery_delayed:
-        lines += ["", "Delivery note: delayed after a Telegram retry; availability was rechecked."]
+        warning_lines.append(
+            "Delayed after a Telegram retry; league availability was rechecked."
+        )
 
     if not item.subject_confident:
-        lines += [
-            "",
+        warning_lines.append(
             "Player attribution is unclear in this report; automatic "
-            "pickup and lineup moves are withheld.",
-        ]
+            "pickup and lineup moves are withheld."
+        )
 
     if alert.availability_refresh_failed:
-        lines += [
-            "",
-            "League availability refresh failed; no ADD or free-agent recommendation is shown.",
-        ]
+        warning_lines.append(
+            "League availability refresh failed; no ADD or free-agent "
+            "recommendation is shown."
+        )
+    if warning_lines:
+        lines += ["", "⚠️ <b>CHECK FIRST</b>"]
+        lines += [f"• {_escape(warning)}" for warning in warning_lines]
 
     context_successors = (
         [entry for entry in alert.context.same_position if not entry.is_subject]
@@ -449,12 +633,6 @@ def format_alert(alert: Alert) -> str:
         if has_multiple_successors or not item.subject_confident
         else _safe_model_summary(classification.fantasy_impact)
     )
-    if model_summary:
-        lines += ["", f"Model summary: {_escape(model_summary)}"]
-
-    deterministic_note = _deterministic_note(alert)
-    if deterministic_note:
-        lines += ["", _escape(deterministic_note)]
 
     action_lines: list[str] = []
     # Build labels against every drafted league, not only leagues with an
@@ -467,13 +645,18 @@ def format_alert(alert: Alert) -> str:
     )
     labels = _league_labels(label_scope)
     for plays in alert.per_league:
-        action_lines += _league_block(
+        block = _league_block(
             plays,
             classification.severity,
             classification.event_type,
             labels.get(plays.league.key, plays.league.short_label),
             allow_adds=not alert.availability_refresh_failed,
         )
+        if not block:
+            continue
+        if action_lines:
+            action_lines.append("")
+        action_lines += block
     has_multiple_claimable = not alert.availability_refresh_failed and any(
         len(plays.claimable) > 1 for plays in alert.per_league
     )
@@ -481,35 +664,33 @@ def format_alert(alert: Alert) -> str:
         plays.claimable for plays in alert.per_league
     )
     if action_lines:
-        lines += ["", "<b>LEAGUE-SPECIFIC MOVES</b>"] + action_lines
+        lines += ["", "🎯 <b>YOUR OPTIONS</b>"] + action_lines
         if has_multiple_claimable:
             lines += [
                 "",
-                "Backup note: Pickup options are alternatives, not instructions to add both. "
-                "Sleeper depth order does not confirm workload or touch share.",
+                "<i>Choose one option. Sleeper depth order does not confirm "
+                "workload or touches.</i>",
             ]
         elif has_any_claimable and has_multiple_successors:
             lines += [
                 "",
-                "Backup note: Sleeper depth order does not confirm workload or touch share.",
+                "<i>Sleeper depth order does not confirm workload or touches.</i>",
             ]
+
+    deterministic_note = _deterministic_note(alert)
+    if deterministic_note:
+        lines += ["", "⚠️ <b>NEXT STEP</b>", _escape(deterministic_note)]
+
+    if model_summary:
+        lines += ["", "💡 <b>WHY IT MATTERS</b>", _escape(model_summary)]
 
     backup_watch_note = _backup_watch_note(alert)
     if backup_watch_note:
-        lines += ["", _escape(backup_watch_note)]
+        lines += ["", "👀 <b>BACKUP WATCH</b>", _escape(backup_watch_note)]
 
-    context_lines = _context_block(
-        alert.context,
-        alert.all_leagues,
-        classification.severity,
-        classification.event_type,
-        show_ownership=not alert.availability_refresh_failed,
-    )
-    if context_lines:
-        lines += [""] + context_lines
-
-    # For tweets, headline is just body truncated, so printing both repeats the
-    # whole tweet. Only show the body when it actually adds something.
+    # For tweets, headline is normally the full post, so printing both would
+    # repeat it. RotoWire-style headline/body pairs get a visually separate
+    # source report before the mechanical depth chart.
     body = (item.body or "").strip()
     headline = (item.headline or "").strip()
     redundant = (
@@ -518,33 +699,27 @@ def format_alert(alert: Alert) -> str:
         or body.startswith(headline[:120])
         or headline.startswith(body[:120])
     )
+    source_line = _source_line(item)
+    source_rendered = False
     if not redundant:
-        lines += ["", _escape(body[:280])]
+        lines += ["", "📰 <b>REPORT</b>", f"<blockquote>{_escape(body[:280])}</blockquote>"]
+        if source_line:
+            lines.append(source_line)
+            source_rendered = True
 
-    if item.url:
-        source_name = {
-            "twitter": "X source",
-            "rotowire": "RotoWire source",
-        }.get(item.source.casefold(), f"{item.source or 'news'} source")
-        raw_url = item.url.strip()
-        parsed = urlsplit(raw_url)
-        if parsed.scheme.lower() in {"http", "https"} and parsed.netloc:
-            source_line = (
-                f'<a href="{html.escape(raw_url, quote=True)}">'
-                f"{_escape(source_name)}</a>"
-            )
-        else:
-            # Telegram accepts only safe URL schemes in HTML links. Keep the
-            # provenance label even when an upstream URL is malformed.
-            source_line = _escape(source_name)
-        if item.published_at is not None:
-            published = item.published_at
-            if published.tzinfo is None:
-                published = published.replace(tzinfo=timezone.utc)
-            source_line += f" · reported {published.astimezone(PACIFIC):%Y-%m-%d %H:%M PT}"
-        lines += ["", source_line]
+    context_lines = _context_block(
+        alert.context,
+        alert.all_leagues,
+        classification.severity,
+        show_ownership=not alert.availability_refresh_failed,
+    )
+    if context_lines:
+        lines += [""] + context_lines
 
-    return "\n".join(lines)
+    if source_line and not source_rendered:
+        lines += ["", f"🔗 {source_line}"]
+
+    return _fit_telegram_limit("\n".join(lines).strip())
 
 
 _TELEGRAM_STATES: dict[str, TelegramState] = {}

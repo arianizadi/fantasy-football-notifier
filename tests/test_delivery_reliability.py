@@ -1622,11 +1622,11 @@ def test_ambiguous_multi_player_report_never_triggers_roster_moves(monkeypatch) 
     assert all(not plays.has_action for plays in alert.per_league)
     rendered = format_alert(alert)
     assert "automatic pickup and lineup moves are withheld" in rendered
-    assert "— UPDATE" in rendered
-    assert "— INJURY" not in rendered
+    assert "<b>UPDATE</b>" in rendered
+    assert "<b>INJURY</b>" not in rendered
     assert "Backup Player will take over" not in rendered
-    assert "ADD OPTION" not in rendered
-    assert "START" not in rendered
+    assert "Pickup option" not in rendered
+    assert "Start instead" not in rendered
 
 
 def test_ambiguous_league_commentary_requires_severity_four() -> None:
@@ -1697,8 +1697,8 @@ def test_non_transaction_release_fails_closed_through_fallback_pipeline(monkeypa
     assert all(not league_plays.has_action for league_plays in alert.per_league)
     rendered = format_alert(alert)
     assert "automatic pickup and lineup moves are withheld" in rendered
-    assert "ADD OPTION" not in rendered
-    assert "START" not in rendered
+    assert "Pickup option" not in rendered
+    assert "Start instead" not in rendered
 
 
 def test_outbox_retries_preserve_chronological_order_across_sources(tmp_path) -> None:

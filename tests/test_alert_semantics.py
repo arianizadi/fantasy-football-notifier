@@ -140,19 +140,22 @@ def test_kittle_preseason_return_golden_message() -> None:
     )
 
     text = format_alert(alert)
-    assert "[4/5] PRESEASON — RETURN" in text
-    assert "Draft note: Return news improves availability" in text
-    assert "Backup watch: Jake Tonges is next" in text
+    assert text.startswith("🟠 <b>[4/5] PRESEASON · George Kittle</b>")
+    assert "<b>RETURN</b>" in text
+    assert "⚠️ <b>NEXT STEP</b>" in text
+    assert "Return news improves availability" in text
+    assert "👀 <b>BACKUP WATCH</b>" in text
+    assert "Jake Tonges is next" in text
     assert "No pickup is recommended from return news" in text
     assert "Activate Kittle" not in text
     assert "ADD " not in text
     assert "[INJURED]" not in text
-    assert "SUBJECT · RETURN" in text
-    assert "Sleeper injury: Questionable" in text
-    assert "Sleeper rank #91" in text
-    assert "refreshed 2026-08-23 10:45 PT" in text
-    assert "SF TE DEPTH / BACKUP WATCH · SLEEPER" in text
-    assert "SF OTHER SLEEPER DEPTH LEADERS" in text
+    assert "report subject" in text
+    assert "Injury: Questionable" in text
+    assert "Sleeper #91" in text
+    assert "Sleeper · updated Aug 23 · 10:45 AM PT" in text
+    assert "📋 <b>SF TE DEPTH</b>" in text
+    assert "OTHER SLEEPER DEPTH LEADERS" not in text
     assert "other starters" not in text.lower()
     assert "George Kittle" in text
     assert "Jake Tonges" in text
@@ -197,9 +200,10 @@ def test_kittle_return_shows_available_backups_without_recommending_them() -> No
         )
     )
 
-    assert "TE2 Jake Tonges · FA" in text
-    assert "TE3 Luke Farrell · FA" in text
-    assert "Backup watch: Jake Tonges is next" in text
+    assert "<b>TE2 Jake Tonges</b>\n↳ Available" in text
+    assert "<b>TE3 Luke Farrell</b>\n↳ Available" in text
+    assert "👀 <b>BACKUP WATCH</b>" in text
+    assert "Jake Tonges is next" in text
     assert "No pickup is recommended from return news" in text
     assert "ADD " not in text
 
@@ -255,10 +259,11 @@ def test_major_injury_retains_deterministic_add_and_start_moves() -> None:
         per_league=[raw],
     )
     text = format_alert(alert)
-    assert "Model summary:" not in text
-    assert "LEAGUE-SPECIFIC MOVES" in text
-    assert "Sunday Crew: ADD OPTION — <b>Jake Tonges</b> (Sleeper depth TE2)" in text
-    assert "START <b>Sam LaPorta</b>" in text
+    assert "WHY IT MATTERS" not in text
+    assert "🎯 <b>YOUR OPTIONS</b>" in text
+    assert "<b>Sunday Crew</b>" in text
+    assert "Pickup option\n🟢 <b>Jake Tonges</b> · Sleeper TE2" in text
+    assert "Start instead: <b>Sam LaPorta</b>" in text
 
 
 def test_unsettled_backfield_shows_two_alternatives_and_roster_capacity() -> None:
@@ -350,13 +355,14 @@ def test_unsettled_backfield_shows_two_alternatives_and_roster_capacity() -> Non
         )
     )
 
-    assert "PICKUP OPTIONS —" in text
-    assert "Michael Carter</b> (Sleeper depth RB3 · named in report)" in text
-    assert "Bam Knight</b> (Sleeper depth RB4 · named in report)" in text
+    assert "Pickup options · choose one" in text
+    assert "🟢 <b>Michael Carter</b> · Sleeper RB3\n↳ named in report" in text
+    assert "🟢 <b>Bam Knight</b> · Sleeper RB4\n↳ named in report" in text
     assert "ADD <b>" not in text
-    assert "Roster occupancy: Bench 5/5 full · IR 0/1 open" in text
-    assert "alternatives, not instructions to add both" in text
-    assert "Sleeper depth order does not confirm workload or touch share" in text
+    assert "Roster space · Bench 5/5 full · IR 0/1 open" in text
+    assert "IR eligibility is not checked" in text
+    assert "Choose one option" in text
+    assert "Sleeper depth order does not confirm workload or touches" in text
     assert "expected to lead" not in text
     assert "Deep Longshot" not in text
 
@@ -447,7 +453,7 @@ def test_one_free_successor_does_not_say_to_add_both() -> None:
 
     text = format_alert(alert)
 
-    assert "ADD OPTION — <b>Free Option</b>" in text
+    assert "Pickup option\n🟢 <b>Free Option</b>" in text
     assert "Rostered Option</b>" not in text
     assert "not instructions to add both" not in text
     assert "Sleeper depth order does not confirm workload" in text
@@ -474,7 +480,7 @@ def test_bench_start_without_free_successor_has_no_pickup_disclaimer() -> None:
 
     text = format_alert(alert)
 
-    assert "START <b>Bench RB</b>" in text
+    assert "Start instead: <b>Bench RB</b>" in text
     assert "Backup note:" not in text
 
 
@@ -491,10 +497,8 @@ def test_non_prescriptive_model_summary_can_still_be_shown() -> None:
         tier="preseason",
     )
     text = format_alert(alert)
-    assert (
-        "Model summary: Kittle projects for his usual high-end TE role once fully cleared."
-        in text
-    )
+    assert "💡 <b>WHY IT MATTERS</b>" in text
+    assert "Kittle projects for his usual high-end TE role once fully cleared." in text
 
 
 def test_moderate_injury_can_surface_backup_without_forcing_lineup_change() -> None:
@@ -544,8 +548,8 @@ def test_duplicate_league_names_are_disambiguated_by_provider_and_id() -> None:
         all_leagues=leagues,
     )
     text = format_alert(alert)
-    assert "Weekend (SLEEPER 1111):" in text
-    assert "Weekend:" not in text
+    assert "<b>Weekend (SLEEPER 1111)</b>" in text
+    assert "<b>Weekend</b>" not in text
 
 
 def test_fantasypros_context_is_attributed_and_keeps_both_pickup_options() -> None:
@@ -594,11 +598,11 @@ def test_fantasypros_context_is_attributed_and_keeps_both_pickup_options() -> No
 
     text = format_alert(alert)
 
-    assert "PICKUP OPTIONS" in text
+    assert "Pickup options · choose one" in text
     assert "Michael Carter" in text and "Bam Knight" in text
     assert "FantasyPros HALF waiver RB34 · ROS RB55" in text
-    assert "FantasyPros rank lean: <b>Michael Carter</b>" in text
-    assert "may lag this breaking report" in text
+    assert "FantasyPros lean · <b>Michael Carter</b>" in text
+    assert "may lag this report" in text
     assert "role unconfirmed" in text
 
 
@@ -637,7 +641,7 @@ def test_fantasypros_conflicting_ros_rank_does_not_create_a_lean() -> None:
         per_league=[plays],
     )
 
-    assert "FantasyPros rank lean" not in format_alert(alert)
+    assert "FantasyPros lean" not in format_alert(alert)
 
 
 def test_inactive_subject_remains_in_source_attributed_context() -> None:
@@ -660,5 +664,5 @@ def test_inactive_subject_remains_in_source_attributed_context() -> None:
             context=context,
         )
     )
-    assert "Sleeper status: PUP" in text
-    assert "SUBJECT · RETURN" in text
+    assert "Status: PUP" in text
+    assert "report subject" in text
