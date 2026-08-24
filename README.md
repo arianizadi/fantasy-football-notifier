@@ -150,8 +150,8 @@ The alert path never calls the FantasyPros API. X remains the fast trigger,
 Sleeper generates the nearest depth options, and a just-in-time ESPN/Sleeper
 roster refresh determines whether each option is actually free. The background
 cache downloads four bulk datasets—WAIVER and ROS for the two configured
-scoring formats—every six hours. With one PPR and one half-PPR league that is
-16 requests per day regardless of tweet volume. A persistent rolling-24-hour
+scoring formats—every two hours. With one PPR and one half-PPR league that is
+48 requests per day regardless of tweet volume. A persistent rolling-24-hour
 cap defaults to 425, leaving headroom below the account's stated 500-request
 plan. Requests are globally spaced by at least one second and reserved in the
 ledger before network I/O, so restarts cannot forget quota use. Repeated failed
@@ -162,7 +162,9 @@ FantasyPros freshness uses the provider's `last_updated_ts`, not local fetch
 time. Data older than `FANTASYPROS_MAX_AGE_HOURS` is omitted. A missing key,
 quota exhaustion, stale response, malformed payload, timeout, or provider
 outage leaves the existing Sleeper-based alert unchanged and can never delay
-or suppress it. Displayed rankings are explicitly attributed to FantasyPros.
+or suppress it. A valid response that is empty or falls back to a different
+ranking family is marked unavailable and never relabeled as WAIVER or ROS.
+Displayed rankings are explicitly attributed to FantasyPros.
 
 Bench and IR limits are read separately from each league's provider settings;
 the current ESPN and Sleeper leagues can therefore both show `5` bench and `1`

@@ -18,7 +18,11 @@ from notifier.sources.fantasypros import (
     FantasyProsSignal,
 )
 from notifier.models import LeagueRef
-from notifier.pipeline import Notifier, _fantasypros_retry_delay
+from notifier.pipeline import (
+    Notifier,
+    _fantasypros_failure_delay,
+    _fantasypros_retry_delay,
+)
 from notifier.plays import Beneficiary, LeaguePlays
 
 
@@ -90,24 +94,33 @@ class FakeSession:
             return FakeResponse({"message": "not available"}, status_code=500)
 
         params = kwargs["params"]
-        ranking_type = params["type"]
+        provider_ranking_type = params["type"]
+        ranking_type = (
+            "WAIVER"
+            if provider_ranking_type in {"WW", "WAIVER"}
+            else provider_ranking_type
+        )
         scoring = params["scoring"]
         type_offset = 0 if ranking_type == "WAIVER" else 100
         scoring_offset = 0 if scoring == "PPR" else 10
-        default_players = self.players or [
-            {
-                "player_id": 101,
-                "player_name": "DJ Moore",
-                "player_team_id": "CHI",
-                "player_position_id": "WR",
-                "player_positions": "WR",
-                "rank_ecr": 7 + type_offset + scoring_offset + self.rank_offset,
-                "pos_rank": f"WR{3 + scoring_offset}",
-                "tier": 2,
-                "player_owned_espn": 73.5,
-                "player_owned_yahoo": 75.0,
-            }
-        ]
+        default_players = (
+            self.players
+            if self.players is not None
+            else [
+                {
+                    "player_id": 101,
+                    "player_name": "DJ Moore",
+                    "player_team_id": "CHI",
+                    "player_position_id": "WR",
+                    "player_positions": "WR",
+                    "rank_ecr": 7 + type_offset + scoring_offset + self.rank_offset,
+                    "pos_rank": f"WR{3 + scoring_offset}",
+                    "tier": 2,
+                    "player_owned_espn": 73.5,
+                    "player_owned_yahoo": 75.0,
+                }
+            ]
+        )
         players = self.players_by_type.get(ranking_type, default_players)
         payload = {
             "sport": "NFL",
@@ -115,7 +128,7 @@ class FakeSession:
             "scoring": scoring,
             "position_id": params["position"],
             "ranking_type_name": self.ranking_type_overrides.get(
-                ranking_type, ranking_type
+                ranking_type, provider_ranking_type
             ),
             "last_updated_ts": int(self.clock() - self.source_age),
             "players": players,
@@ -157,9 +170,9 @@ def test_refresh_fetches_four_bulk_snapshots_with_pacing_and_safe_cache(
 
     assert len(session.calls) == 4
     assert [call["params"] for call in session.calls] == [
-        {"position": "ALL", "scoring": "PPR", "type": "WAIVER"},
+        {"position": "ALL", "scoring": "PPR", "type": "WW"},
         {"position": "ALL", "scoring": "PPR", "type": "ROS"},
-        {"position": "ALL", "scoring": "HALF", "type": "WAIVER"},
+        {"position": "ALL", "scoring": "HALF", "type": "WW"},
         {"position": "ALL", "scoring": "HALF", "type": "ROS"},
     ]
     starts = [call["started"] for call in session.calls]
@@ -261,7 +274,7 @@ def test_missing_provider_timestamp_never_uses_fetch_time_as_freshness(
     ) is None
 
 
-@pytest.mark.parametrize("reported_type", ["ROS", "Rest of Season", None])
+@pytest.mark.parametrize("reported_type", ["Rest of Season", None])
 def test_response_ranking_type_must_match_the_requested_dataset(
     tmp_path: Path,
     reported_type: str | None,
@@ -279,6 +292,139 @@ def test_response_ranking_type_must_match_the_requested_dataset(
     assert cache.status().last_error == "invalid_response"
 
 
+@pytest.mark.parametrize("reported_type", ["ROS", "draft"])
+def test_known_provider_fallback_does_not_block_valid_sibling_dataset(
+    tmp_path: Path,
+    reported_type: str,
+) -> None:
+    clock = FakeClock()
+    session = FakeSession(
+        clock,
+        ranking_type_overrides={"WAIVER": reported_type},
+    )
+    cache = _client(tmp_path, clock, session)
+
+    assert cache.refresh(("PPR",), force=True) is False
+    assert len(session.calls) == 2
+    assert cache.status().datasets_cached == ("PPR:ROS",)
+    assert cache.status().last_error == "partial_dataset_unavailable"
+
+    on_disk = json.loads((tmp_path / CACHE_FILENAME).read_text(encoding="utf-8"))
+    assert set(on_disk["datasets"]) == {"PPR:ROS"}
+
+
+def test_current_empty_waiver_envelope_is_unavailable_and_never_cached(
+    tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    session = FakeSession(
+        clock,
+        players=[],
+        ranking_type_overrides={"WAIVER": "waiver"},
+        response_overrides={"last_updated_ts": None},
+    )
+    cache = _client(tmp_path, clock, session)
+
+    assert cache.refresh(("PPR",), force=True) is False
+    assert len(session.calls) == 2
+    assert cache.status().datasets_cached == ()
+    assert cache.status().last_error == "dataset_unavailable"
+
+
+def test_unpublished_waivers_allow_all_four_bulk_probes_and_cache_both_ros(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    clock = FakeClock()
+    session = FakeSession(clock, players_by_type={"WAIVER": []})
+    cache = _client(tmp_path, clock, session)
+
+    with caplog.at_level(logging.WARNING, logger="fantasy-news-notifier"):
+        assert cache.refresh(force=True) is False
+
+    assert len(session.calls) == 4
+    assert cache.status().datasets_cached == ("HALF:ROS", "PPR:ROS")
+    assert cache.status().last_error == "partial_dataset_unavailable"
+    assert '"event":"fantasypros.refresh_incomplete"' in caplog.text
+    assert '"reason":"partial_dataset_unavailable"' in caplog.text
+    assert '"unavailableCount":2' in caplog.text
+    assert "fp-test-secret-value" not in caplog.text
+
+
+def test_partial_refresh_updates_valid_dataset_and_preserves_old_unavailable_one(
+    tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    first = _client(tmp_path, clock, FakeSession(clock))
+    assert first.refresh(("PPR",), force=True) is True
+
+    second_session = FakeSession(
+        clock,
+        rank_offset=900,
+        players_by_type={"WAIVER": []},
+    )
+    second = _client(tmp_path, clock, second_session)
+
+    assert second.refresh(("PPR",), force=True) is False
+    assert second.status().last_error == "partial_dataset_unavailable"
+    assert second.status().datasets_cached == ("PPR:ROS", "PPR:WAIVER")
+
+    waiver = second.lookup("DJ Moore", scoring="PPR", ranking_type="WAIVER")
+    ros = second.lookup("DJ Moore", scoring="PPR", ranking_type="ROS")
+    assert waiver is not None and waiver.rank == 7
+    assert ros is not None and ros.rank == 1007
+
+    on_disk = json.loads((tmp_path / CACHE_FILENAME).read_text(encoding="utf-8"))
+    assert on_disk["datasets"]["PPR:WAIVER"]["players"][0]["rank"] == 7
+    assert on_disk["datasets"]["PPR:ROS"]["players"][0]["rank"] == 1007
+
+
+def test_hard_failure_after_unavailable_dataset_aborts_without_partial_commit(
+    tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    session = FakeSession(
+        clock,
+        fail_on_call=2,
+        players_by_type={"WAIVER": []},
+    )
+    cache = _client(tmp_path, clock, session)
+
+    assert cache.refresh(("PPR",), force=True) is False
+    assert len(session.calls) == 2
+    assert cache.status().datasets_cached == ()
+    assert cache.status().last_error == "request_failed"
+
+
+@pytest.mark.parametrize("reported_type", ["WW", "WAIVER", "ww", "waiver"])
+def test_documented_waiver_type_aliases_map_to_the_internal_dataset(
+    tmp_path: Path,
+    reported_type: str,
+) -> None:
+    clock = FakeClock()
+    session = FakeSession(
+        clock,
+        ranking_type_overrides={"WAIVER": reported_type},
+    )
+    cache = _client(tmp_path, clock, session)
+
+    assert cache.refresh(("PPR",), force=True) is True
+    assert cache.status().last_error == ""
+    assert cache.status().datasets_cached == ("PPR:ROS", "PPR:WAIVER")
+    assert session.calls[0]["params"]["type"] == "WW"
+
+
+def test_integer_year_is_accepted_only_when_it_matches_requested_season(
+    tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    session = FakeSession(clock, response_overrides={"year": 2026})
+    cache = _client(tmp_path, clock, session)
+
+    assert cache.refresh(("PPR",), force=True) is True
+    assert cache.status().datasets_cached == ("PPR:ROS", "PPR:WAIVER")
+
+
 @pytest.mark.parametrize(
     ("field", "mismatched_value"),
     [
@@ -286,7 +432,6 @@ def test_response_ranking_type_must_match_the_requested_dataset(
         ("year", "2025"),
         ("scoring", "HALF"),
         ("position_id", "RB"),
-        ("ranking_type_name", "ROS"),
     ],
 )
 def test_response_identity_mismatch_is_never_cached(
@@ -415,18 +560,32 @@ def test_concurrent_refreshes_collapse_to_one_bulk_batch(tmp_path: Path) -> None
     assert cache.request_usage() == 4
 
 
-def test_six_hour_bulk_schedule_uses_sixteen_requests_per_day(tmp_path: Path) -> None:
+def test_two_hour_bulk_schedule_uses_forty_eight_requests_per_day(
+    tmp_path: Path,
+) -> None:
     clock = FakeClock()
     session = FakeSession(clock)
     cache = _client(tmp_path, clock, session)
 
-    for cycle in range(4):
+    for cycle in range(12):
         if cycle:
-            clock.advance(6 * 60 * 60)
+            clock.advance(2 * 60 * 60)
         assert cache.refresh() is True
 
-    assert len(session.calls) == 16
-    assert cache.request_usage() == 16
+    assert len(session.calls) == 48
+    assert cache.request_usage() == 48
+
+
+@pytest.mark.parametrize(
+    "reason",
+    ["dataset_unavailable", "partial_dataset_unavailable"],
+)
+def test_unpublished_dataset_retries_on_healthy_two_hour_cadence(reason: str) -> None:
+    assert _fantasypros_failure_delay(reason, 5, 2 * 60 * 60) == 2 * 60 * 60
+
+
+def test_hard_fantasypros_failure_keeps_exponential_backoff() -> None:
+    assert _fantasypros_failure_delay("request_failed", 3, 2 * 60 * 60) == 60 * 60
 
 
 def test_failed_refresh_backoff_is_bounded_and_deterministic() -> None:

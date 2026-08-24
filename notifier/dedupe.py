@@ -213,9 +213,16 @@ def event_facts_equivalent(
 
 
 def _fact_signature_is_meaningfully_new(previous: str, current: str) -> bool:
-    """Fail open for newly observed condition detail in legacy/raw state."""
+    """Detect changed facts only when legacy state recorded a prior fact.
+
+    A missing signature means the seen file predates fact tracking; it does
+    not prove that the currently parsed condition is new. Treating it as new
+    replays every unchanged injury report once during an upgrade. Modern
+    revision-aware entries bypass this fallback, while legacy entries can
+    still pass through on a recorded status escalation.
+    """
     if not previous:
-        return current != "unspecified"
+        return False
     return previous != current
 
 
@@ -228,7 +235,10 @@ def _status_rank(status: str) -> int:
 
 def _status_is_meaningfully_new(previous: str, current: str) -> bool:
     """Allow definitive worsening and a later clearance through early dedupe."""
-    if not current or current == previous:
+    # An absent previous value is legacy schema uncertainty, not evidence of
+    # a status transition. This prevents a one-time replay of exact reports
+    # from state files that predate status tracking entirely.
+    if not previous or not current or current == previous:
         return False
     if current == "cleared" and _status_rank(previous) >= _status_rank("limited"):
         return True

@@ -53,6 +53,7 @@ def main() -> int:
 
         if args.prime:
             items, _ = rotowire.fetch(notifier.session)
+            items = [notifier._normalize_source_subject(item) for item in items]
             if config.dry_run:
                 structured_log(
                     logging.INFO,

@@ -1,3 +1,4 @@
+import json
 import queue
 import threading
 import time
@@ -115,6 +116,20 @@ def test_failed_send_stays_in_durable_outbox_and_dedupe_is_unmodified(
     )
     assert len(notifier.outbox) == 1
     assert len(DeliveryOutbox(tmp_path)) == 1
+
+
+def test_pending_raw_revision_survives_subject_attribution_upgrade(tmp_path) -> None:
+    raw = replace(
+        _item(guid="rotowire:beneficiary", source="rotowire"),
+        player_name="Mike Washington",
+        headline="Sees extra work after Jeanty injury",
+        body="Ashton Jeanty left practice, creating extra work for Washington.",
+    )
+    corrected = replace(raw, player_name="Ashton Jeanty")
+    outbox = DeliveryOutbox(tmp_path)
+    outbox.add(_alert(raw, event_type="injury"))
+
+    assert outbox.contains_item(corrected) is True
 
 
 def test_pending_alert_replays_after_failure_then_finalizes_dedupe(
@@ -726,6 +741,66 @@ def test_early_dedupe_allows_generic_body_revision_for_same_guid(tmp_path) -> No
 
     reloaded = SeenStore(tmp_path / "seen.json")
     assert reloaded.is_new(changed) is True
+
+
+def test_legacy_seen_upgrade_suppresses_exact_report_and_allows_escalation(
+    tmp_path,
+) -> None:
+    path = tmp_path / "seen.json"
+    store = SeenStore(path)
+    initial = replace(
+        _item(headline="Example Player injury update"),
+        body="Example Player is questionable with an ankle injury.",
+    )
+    escalated = replace(
+        initial,
+        body="Example Player has been ruled out with an ankle injury.",
+    )
+    store.record(initial)
+    assert store.save()
+
+    # Reproduce the production schema from before raw revision and condition
+    # signature tracking were added. Status maps already existed in that
+    # schema and remain sufficient to prove a real availability escalation.
+    payload = json.loads(path.read_text())
+    for field in (
+        "guidFactSignatures",
+        "fingerprintFactSignatures",
+        "reportRevisions",
+        "revisionAwareGuids",
+        "revisionAwareFingerprints",
+    ):
+        payload.pop(field)
+    path.write_text(json.dumps(payload))
+
+    upgraded = SeenStore(path)
+    assert upgraded.is_new(initial) is False
+    assert upgraded.is_new(escalated) is True
+
+
+def test_legacy_seen_without_status_metadata_does_not_replay_exact_report(
+    tmp_path,
+) -> None:
+    path = tmp_path / "seen.json"
+    report = replace(
+        _item(headline="Example Player injury update"),
+        body="Example Player has been ruled out with an ankle injury.",
+    )
+    current = SeenStore(path)
+    current.record(report)
+    assert current.save()
+    payload = json.loads(path.read_text())
+    path.write_text(
+        json.dumps(
+            {
+                "guids": payload["guids"],
+                "fingerprints": payload["fingerprints"],
+                "semantic": {},
+            }
+        )
+    )
+
+    assert SeenStore(path).is_new(report) is False
 
 
 def test_x_dispatcher_consumes_without_waiting_for_rss_poll(tmp_path) -> None:

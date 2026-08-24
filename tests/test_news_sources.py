@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import queue
+from dataclasses import replace
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
-from notifier.sources.rotowire import parse_feed
+from notifier.models import LeagueRef, NewsItem, RosterPlayer, RosterSnapshot
+from notifier.pipeline import _depth_report_text
+from notifier.plays import DepthCharts
+from notifier.sources.rotowire import parse_feed, reattribute_beneficiary_report
 from notifier.sources.reporters import PlayerNameIndex
 from notifier.sources.twitter import TwitterStream
 
@@ -27,6 +31,113 @@ def test_rotowire_feed_preserves_source_time_and_cleans_markup() -> None:
     assert item.body == "Kittle returned."
     assert item.published_at == datetime(2026, 8, 23, 17, 30, tzinfo=timezone.utc)
     assert item.url == "https://www.rotowire.com/football/player.php?id=1"
+
+
+def _raiders_running_backs() -> dict[str, dict[str, object]]:
+    return {
+        "1": {
+            "full_name": "Ashton Jeanty",
+            "position": "RB",
+            "team": "LV",
+            "depth_chart_order": 1,
+            "status": "Active",
+        },
+        "2": {
+            "full_name": "Mike Washington",
+            "position": "RB",
+            "team": "LV",
+            "depth_chart_order": 2,
+            "status": "Active",
+        },
+        "3": {
+            "full_name": "Dylan Laube",
+            "position": "RB",
+            "team": "LV",
+            "depth_chart_order": 4,
+            "status": "Active",
+        },
+    }
+
+
+def test_rotowire_beneficiary_article_is_centered_on_injured_starter() -> None:
+    item = parse_feed(
+        """
+        <rss><channel><item>
+          <title>Mike Washington: Sees extra work after Jeanty injury</title>
+          <guid>washington-1</guid>
+          <description>Washington took most of the carries after Ashton Jeanty
+          (knee) left Sunday's practice, Sam Warren of The Athletic reports.</description>
+          <link>https://www.rotowire.com/football/player/mike-washington-999</link>
+        </item></channel></rss>
+        """
+    )[0]
+
+    normalized = reattribute_beneficiary_report(item, _raiders_running_backs())
+
+    assert normalized.player_name == "Ashton Jeanty"
+    assert normalized.headline == "Sees extra work after Jeanty injury"
+    assert normalized.body == item.body
+    assert normalized.guid == item.guid
+
+    league = LeagueRef("sleeper", "1", "Test League", "Mine")
+    snapshot = RosterSnapshot(
+        generated_at=None,
+        leagues=[league],
+        players=[
+            RosterPlayer(
+                "Ashton Jeanty",
+                "RB",
+                "LV",
+                "RB",
+                True,
+                "Mine",
+                league.key,
+            )
+        ],
+    )
+    charts = DepthCharts(_raiders_running_backs(), snapshot)
+    record, plays = charts.build(
+        subject_names=(normalized.player_name,),
+        snapshot=snapshot,
+        report_text=_depth_report_text(normalized),
+    )
+    assert record is not None
+    assert record["full_name"] == "Ashton Jeanty"
+    mike = next(
+        candidate
+        for candidate in plays[0].beneficiaries
+        if candidate.name == "Mike Washington"
+    )
+    assert mike.named_in_report is True
+    context = charts.team_context(record, snapshot)
+    assert context is not None
+    assert next(entry for entry in context.same_position if entry.is_subject).name == (
+        "Ashton Jeanty"
+    )
+
+
+def test_rotowire_does_not_guess_from_surname_only_or_unrelated_injury() -> None:
+    base = NewsItem(
+        source="rotowire",
+        guid="rotowire:washington-2",
+        player_name="Mike Washington",
+        headline="Sees extra work after Jeanty injury",
+        body="Washington took most of the carries after Jeanty left practice.",
+        url="https://www.rotowire.com/football/player/mike-washington-999",
+        published_at=None,
+    )
+    unrelated = replace(
+        base,
+        guid="rotowire:washington-3",
+        headline="Handles extra work after morning practice",
+        body=(
+            "Washington took most of the carries. Ashton Jeanty (knee) left "
+            "Sunday's practice in a separate drill."
+        ),
+    )
+
+    assert reattribute_beneficiary_report(base, _raiders_running_backs()) == base
+    assert reattribute_beneficiary_report(unrelated, _raiders_running_backs()) == unrelated
 
 
 def test_twitter_payload_keeps_created_at_and_player_match() -> None:

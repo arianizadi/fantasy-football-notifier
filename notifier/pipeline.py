@@ -67,6 +67,9 @@ JIT_ROSTER_REFRESH_MIN_SECONDS = 60
 FANTASYPROS_RETRY_BASE_SECONDS = 15 * 60
 FANTASYPROS_RETRY_MAX_SECONDS = 6 * 60 * 60
 FANTASYPROS_ENRICHMENT_ERROR_LOG_SECONDS = 5 * 60
+FANTASYPROS_UNAVAILABLE_ERRORS = frozenset(
+    {"dataset_unavailable", "partial_dataset_unavailable"}
+)
 
 
 def _next_player_index_refresh_at(player_index: dict, now: float) -> float:
@@ -88,6 +91,32 @@ def _fantasypros_retry_delay(consecutive_failures: int) -> float:
             FANTASYPROS_RETRY_MAX_SECONDS,
         )
     )
+
+
+def _fantasypros_failure_delay(
+    error: str,
+    consecutive_failures: int,
+    healthy_refresh_seconds: float,
+) -> float:
+    """Keep unpublished datasets on cadence; back off hard failures."""
+    if error in FANTASYPROS_UNAVAILABLE_ERRORS:
+        return float(healthy_refresh_seconds)
+    return _fantasypros_retry_delay(consecutive_failures)
+
+
+def _depth_report_text(item: NewsItem) -> str:
+    """Factual report text plus RotoWire's URL-attributed article player.
+
+    RotoWire removes ``Player:`` from the parsed headline. When a backup's
+    article is re-centered on an injured starter, the source URL still proves
+    which backup the article discussed. Add that name only to the depth-chart
+    mention check; mutating the stored headline/body would create a false new
+    report revision during deployment.
+    """
+    values = [item.headline, item.body]
+    if item.source == "rotowire":
+        values.insert(0, name_from_rotowire_url(item.url))
+    return " ".join(value for value in values if value)
 
 
 # A newer delivered clearance/return makes an older queued absence report
@@ -255,7 +284,7 @@ class Notifier:
             int(getattr(config, "espn_year", datetime.now(timezone.utc).year)),
             app_daily_cap=int(getattr(config, "fantasypros_request_limit", 425)),
             refresh_seconds=(
-                int(getattr(config, "fantasypros_refresh_hours", 6)) * 3600
+                int(getattr(config, "fantasypros_refresh_hours", 2)) * 3600
             ),
             max_stale_seconds=(
                 int(getattr(config, "fantasypros_max_age_hours", 12)) * 3600
@@ -519,8 +548,20 @@ class Notifier:
             HEALTH.mark("fantasypros", ok=refreshed and complete, detail=detail)
 
             if not refreshed:
-                consecutive_failures += 1
-                wait_seconds = _fantasypros_retry_delay(consecutive_failures)
+                if status.last_error in FANTASYPROS_UNAVAILABLE_ERRORS:
+                    # The endpoint is healthy; the seasonal ranking family is
+                    # simply unpublished. Reprobe all due siblings on the
+                    # configured healthy cadence instead of degrading to the
+                    # six-hour hard-failure backoff.
+                    consecutive_failures = 0
+                else:
+                    consecutive_failures += 1
+                wait_seconds = _fantasypros_failure_delay(
+                    status.last_error,
+                    consecutive_failures,
+                    int(getattr(self.config, "fantasypros_refresh_hours", 2))
+                    * 3600,
+                )
             else:
                 consecutive_failures = 0
                 wait_seconds = self.fantasypros.seconds_until_refresh(
@@ -674,7 +715,7 @@ class Notifier:
             record, per_league = depth.build(
                 subject_names=names,
                 snapshot=snapshot,
-                report_text=f"{item.headline} {item.body}",
+                report_text=_depth_report_text(item),
             )
 
         if preseason:
@@ -735,7 +776,7 @@ class Notifier:
                     record, refreshed_plays = depth.build(
                         subject_names=names,
                         snapshot=snapshot,
-                        report_text=f"{item.headline} {item.body}",
+                        report_text=_depth_report_text(item),
                     )
                     per_league = plays_for_event(
                         refreshed_plays,
@@ -893,6 +934,22 @@ class Notifier:
             self._inflight_items[item] = time.time()
         self._journal_received(item)
         return True
+
+    def _normalize_source_subject(self, item: NewsItem) -> NewsItem:
+        """Apply source-specific deterministic subject attribution."""
+        if item.source != "rotowire":
+            return item
+        with self._state_lock:
+            player_index = getattr(self, "_player_index", {})
+        normalized = rotowire.reattribute_beneficiary_report(item, player_index)
+        if normalized.player_name != item.player_name:
+            structured_log(
+                logging.INFO,
+                "rotowire.subject_reattributed",
+                articlePlayer=item.player_name,
+                absenceSubject=normalized.player_name,
+            )
+        return normalized
 
     def _release_item(self, item: NewsItem) -> None:
         with self._state_lock:
@@ -1111,7 +1168,7 @@ class Notifier:
         record, per_league = depth.build(
             subject_names=names,
             snapshot=snapshot,
-            report_text=f"{alert.item.headline} {alert.item.body}",
+            report_text=_depth_report_text(alert.item),
         )
         per_league = plays_for_event(
             per_league,
@@ -1293,7 +1350,8 @@ class Notifier:
             return 0
 
     def _process_items(self, items: list[NewsItem], pool: ThreadPoolExecutor) -> int:
-        claimed = [item for item in items if self._claim_item(item)]
+        normalized = [self._normalize_source_subject(item) for item in items]
+        claimed = [item for item in normalized if self._claim_item(item)]
         sent = 0
         # Complete all higher-priority source work before a lower-priority
         # source can claim its semantic slot. Within one source, send each
@@ -1366,6 +1424,11 @@ class Notifier:
         modified = False
         try:
             items, feed_was_full, modified = self.poller.fetch(self.session)
+            # Subject normalization must precede the first seen check.  Seen
+            # state is recorded from the normalized item, so checking the raw
+            # RotoWire title on later polls would otherwise make one unchanged
+            # report look perpetually new.
+            items = [self._normalize_source_subject(item) for item in items]
             HEALTH.mark(
                 "rotowire",
                 ok=True,
@@ -1627,13 +1690,6 @@ class Notifier:
                 "preseason.mode_active",
                 minSeverity=PRESEASON_MIN_SEVERITY,
                 maxRank=PRESEASON_MAX_RANK,
-            )
-            send_plain(
-                self.session,
-                self.config,
-                "<b>Preseason mode.</b> Until your leagues draft you will only "
-                f"get severity {PRESEASON_MIN_SEVERITY}+ news about draft-relevant "
-                "players. Switches to full roster alerts automatically after a draft.",
             )
 
         self.check_roster_freshness()

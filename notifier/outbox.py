@@ -66,19 +66,11 @@ def _delivery_id(alert: Alert) -> str:
 
 def _same_item_revision(left: NewsItem, right: NewsItem) -> bool:
     """Whether two observations contain the same provider-owned report text."""
-    return (
-        left.source,
-        left.guid,
-        left.player_name,
-        left.headline,
-        left.body,
-    ) == (
-        right.source,
-        right.guid,
-        right.player_name,
-        right.headline,
-        right.body,
-    )
+    # ``player_name`` is local subject attribution and may improve after a
+    # deploy without the provider changing its report. Delivery identity uses
+    # the same raw revision definition so a pending pre-upgrade alert cannot be
+    # evaluated or queued twice under its corrected subject.
+    return report_revision_identity(left) == report_revision_identity(right)
 
 
 def _league(payload: dict[str, Any]) -> LeagueRef:

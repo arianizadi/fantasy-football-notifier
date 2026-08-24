@@ -49,7 +49,9 @@ ABSENCE_CUE = re.compile(
     r"(?:entered|has\s+entered|had\s+entered|is\s+in|remains\s+in|placed\s+in|"
     r"was\s+placed\s+in|"
     r"has\s+been\s+placed\s+in)\s+(?:the\s+)?concussion\s+protocol|"
-    r"carted\s+off|exited|left\s+(?:the\s+)?(?:game|practice)|"
+    r"carted\s+off|exited|left\s+(?:(?:the|today['’]?s|"
+    r"monday['’]?s|tuesday['’]?s|wednesday['’]?s|thursday['’]?s|"
+    r"friday['’]?s|saturday['’]?s|sunday['’]?s)\s+)?(?:game|practice)|"
     r"sprain(?:ed)?|fractur(?:e|ed)|concussion|tear|tore|torn|ruptured|"
     r"suspended|released|waived|cut)\b",
     re.IGNORECASE,

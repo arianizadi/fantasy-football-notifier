@@ -38,7 +38,7 @@ CACHE_VERSION = 1
 
 PROVIDER_DAILY_LIMIT = 500
 DEFAULT_APP_DAILY_CAP = 425
-DEFAULT_REFRESH_SECONDS = 6 * 60 * 60
+DEFAULT_REFRESH_SECONDS = 2 * 60 * 60
 DEFAULT_MAX_STALE_SECONDS = 12 * 60 * 60
 MIN_REQUEST_INTERVAL_SECONDS = 1.05
 ROLLING_WINDOW_SECONDS = 24 * 60 * 60
@@ -48,6 +48,41 @@ SUPPORTED_SCORING = ("PPR", "HALF", "STD")
 DEFAULT_SCORING = ("PPR", "HALF")
 RANKING_TYPES = ("WAIVER", "ROS")
 SOURCE_NAME = "FantasyPros consensus rankings"
+
+# FantasyPros' v2 OpenAPI exposes both ``WW`` and ``WAIVER`` for waiver-wire
+# consensus rankings.  ``WW`` is the provider's longstanding request/response
+# code; keep the clearer ``WAIVER`` label inside our cache and public API.
+_PROVIDER_RANKING_TYPE = {
+    "WAIVER": "WW",
+    "ROS": "ROS",
+}
+_RESPONSE_RANKING_TYPES = {
+    "WAIVER": frozenset({"WW", "WAIVER"}),
+    "ROS": frozenset({"ROS"}),
+}
+_KNOWN_PROVIDER_RANKING_TYPES = frozenset(
+    {
+        "WW",
+        "WAIVER",
+        "ROS",
+        "DRAFT",
+        "PRESEASON",
+        "SLEEPERS",
+        "ADP",
+        "BEST",
+        "PROSPECT",
+        "PRO",
+        "DEVY",
+        "ROOKIES",
+        "DYNADP",
+        "RKADP",
+        "BESTADP",
+        "DYNASTY",
+        "PRE",
+        "DRAFTERS",
+        "MOCK",
+    }
+)
 
 _TEAM_ALIASES = {
     "JAC": "JAX",
@@ -143,6 +178,10 @@ class _RefreshFailure(RuntimeError):
     def __init__(self, code: str) -> None:
         super().__init__(code)
         self.code = code
+
+
+class _DatasetUnavailable(ValueError):
+    """The provider returned a valid envelope but not the requested dataset."""
 
 
 def _dataset_key(scoring: str, ranking_type: str) -> str:
@@ -494,6 +533,7 @@ class FantasyProsCache:
     def _fetch_dataset(self, scoring: str, ranking_type: str) -> dict[str, Any]:
         self._reserve_request()
         url = f"{BASE_URL}/{CONSENSUS_PATH.format(season=self._season)}"
+        provider_ranking_type = _PROVIDER_RANKING_TYPE[ranking_type]
         # Read the key only after the durable request reservation.  It is used
         # exclusively as an HTTP header and is never copied into state/errors.
         with self._state_lock:
@@ -505,7 +545,7 @@ class FantasyProsCache:
                 params={
                     "position": "ALL",
                     "scoring": scoring,
-                    "type": ranking_type,
+                    "type": provider_ranking_type,
                 },
                 timeout=self._request_timeout,
             )
@@ -522,6 +562,8 @@ class FantasyProsCache:
 
         try:
             return self._parse_dataset(payload, scoring, ranking_type)
+        except _DatasetUnavailable:
+            raise _RefreshFailure("dataset_unavailable") from None
         except (TypeError, ValueError, OverflowError):
             raise _RefreshFailure("invalid_response") from None
 
@@ -534,22 +576,50 @@ class FantasyProsCache:
         if not isinstance(payload, dict):
             raise ValueError("invalid response root")
         # These fields are the official identity of an NFL rankings response.
-        # Do not normalize, infer, or default any of them from the request: an
-        # incomplete or mismatched response must never be cached under the
-        # requested dataset key.
-        expected_identity = {
+        # Compare their semantic scalar values, but never infer or default a
+        # missing field from the request: a mismatched response must not be
+        # cached under the requested dataset key.
+        text_identity = {
             "sport": "NFL",
-            "year": str(self._season),
             "scoring": scoring,
             "position_id": "ALL",
-            "ranking_type_name": ranking_type,
         }
-        for field, expected in expected_identity.items():
-            if field not in payload or payload[field] != expected:
+        for field, expected in text_identity.items():
+            if field not in payload:
+                raise ValueError(f"missing {field}")
+            reported = str(payload[field] or "").strip().upper()
+            if reported != expected:
                 raise ValueError(f"unexpected {field}")
+
+        # The OpenAPI models ``year`` as a string, while other FantasyPros v2
+        # endpoints and historical examples sometimes emit the same scalar as
+        # an integer. Numeric equivalence is unambiguous; missing, fractional,
+        # boolean, and mismatched seasons still fail closed.
+        if _optional_int(payload.get("year"), positive=True) != self._season:
+            raise ValueError("unexpected year")
+
+        if "ranking_type_name" not in payload:
+            raise ValueError("missing ranking_type_name")
+        reported_ranking_type = str(
+            payload.get("ranking_type_name") or ""
+        ).strip().upper()
+        if reported_ranking_type not in _RESPONSE_RANKING_TYPES[ranking_type]:
+            if reported_ranking_type in _KNOWN_PROVIDER_RANKING_TYPES:
+                # The live API can fall back to another valid ranking family
+                # when the requested seasonal dataset is not published yet.
+                # Recognize that state, but never relabel (for example) DRAFT
+                # rows as ROS evidence.
+                raise _DatasetUnavailable("requested ranking dataset unavailable")
+            raise ValueError("unexpected ranking_type_name")
         raw_players = payload.get("players")
         if not isinstance(raw_players, list):
             raise ValueError("missing players")
+        if not raw_players:
+            # The current API represents an unpublished waiver dataset as a
+            # successful, correctly identified envelope with an empty array.
+            # That is not cacheable ranking evidence, but it is also not a
+            # malformed transport response.
+            raise _DatasetUnavailable("requested ranking dataset is empty")
 
         players: list[dict[str, Any]] = []
         seen: set[tuple[Any, ...]] = set()
@@ -658,7 +728,14 @@ class FantasyProsCache:
         *,
         force: bool = False,
     ) -> bool:
-        """Refresh due bulk snapshots; preserve all old datasets on failure."""
+        """Refresh due snapshots, isolating known unpublished datasets.
+
+        A valid provider envelope can explicitly report that one requested
+        ranking family is not published.  That outcome is isolated to its
+        dataset so the remaining bulk probes can still yield useful evidence.
+        Transport, budget, persistence, and malformed-response failures remain
+        batch-fatal: any snapshots collected before them are discarded.
+        """
         requested = {_normalize_scoring(value) for value in scoring_formats}
         normalized = tuple(
             scoring
@@ -683,20 +760,53 @@ class FantasyProsCache:
                     return True
 
                 pending: dict[str, dict[str, Any]] = {}
+                unavailable: list[str] = []
                 for key in due_keys:
                     scoring, ranking_type = key.split(":", 1)
-                    pending[key] = self._fetch_dataset(scoring, ranking_type)
+                    try:
+                        pending[key] = self._fetch_dataset(scoring, ranking_type)
+                    except _RefreshFailure as error:
+                        if error.code != "dataset_unavailable":
+                            raise
+                        # Dataset keys are selected from fixed internal enums,
+                        # so they are safe to expose in operational logs.
+                        unavailable.append(key)
 
+                result = (
+                    "partial_dataset_unavailable"
+                    if pending and unavailable
+                    else "dataset_unavailable"
+                    if unavailable
+                    else ""
+                )
                 with self._state_lock:
                     if self._closed:
                         raise _RefreshFailure("closed")
-                    committed = {**self._datasets, **pending}
-                    try:
-                        self._write_state_locked(datasets=committed)
-                    except OSError:
-                        raise _RefreshFailure("cache_write_failed") from None
-                    self._datasets = committed
-                    self._last_error = ""
+                    if pending:
+                        # Publish one cache generation only after every
+                        # non-fatal probe finishes. Existing snapshots for an
+                        # unavailable key remain untouched.
+                        committed = {**self._datasets, **pending}
+                        try:
+                            self._write_state_locked(datasets=committed)
+                        except OSError:
+                            raise _RefreshFailure("cache_write_failed") from None
+                        self._datasets = committed
+                    self._last_error = result
+
+                if unavailable:
+                    structured_log(
+                        logging.WARNING,
+                        "fantasypros.refresh_incomplete",
+                        reason=result,
+                        datasetCount=len(pending),
+                        unavailableCount=len(unavailable),
+                        unavailableDatasets=tuple(unavailable),
+                        requestUsage=self.request_usage(),
+                        requestCap=self._app_daily_cap,
+                    )
+                    return False
+
                 structured_log(
                     logging.INFO,
                     "fantasypros.cache_refreshed",
