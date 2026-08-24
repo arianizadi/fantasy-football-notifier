@@ -27,6 +27,11 @@ for file in $STAGED; do
   grep -nqE 'AAAAAAAAAAAAAAAAAAAAA[A-Za-z0-9%]{20,}' "$file" 2>/dev/null \
     && report "$file looks like an X bearer token"
 
+  # FantasyPros keys do not have a distinctive prefix. Catch populated
+  # assignments without flagging unrelated 40-character hashes and fixtures.
+  grep -nqE 'FANTASYPROS_API_KEY[[:space:]]*=[[:space:]]*"?[A-Za-z0-9]{24,}' "$file" 2>/dev/null \
+    && report "$file looks like a populated FantasyPros API key"
+
   # ESPN cookies with an actual value
   grep -nqE '(ESPN_S2|ESPN_SWID)=["'"'"']?[A-Za-z0-9%{][A-Za-z0-9%+/={-]{15,}' "$file" 2>/dev/null \
     && report "$file looks like a populated ESPN cookie"

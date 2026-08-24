@@ -13,6 +13,9 @@ DEFAULT_POLL_SECONDS = 15
 DEFAULT_POLL_SECONDS_IDLE = 60
 DEFAULT_MIN_SEVERITY = 2
 DEFAULT_MIN_SEVERITY_OTHER = 3
+DEFAULT_FANTASYPROS_REQUEST_LIMIT = 425
+DEFAULT_FANTASYPROS_REFRESH_HOURS = 6
+DEFAULT_FANTASYPROS_MAX_AGE_HOURS = 12
 
 
 @dataclass(frozen=True)
@@ -30,6 +33,10 @@ class Config:
     sleeper_username: str
     sleeper_league_ids: tuple[str, ...]
     twitter_bearer_token: str
+    fantasypros_api_key: str
+    fantasypros_request_limit: int
+    fantasypros_refresh_hours: int
+    fantasypros_max_age_hours: int
     poll_seconds: int
     poll_seconds_idle: int
     min_severity: int
@@ -117,6 +124,27 @@ def load_config() -> Config:
             if entry.strip()
         ),
         twitter_bearer_token=os.environ.get("TWITTER_BEARER_TOKEN", "").strip(),
+        # FantasyPros is optional cached context. It is never required for the
+        # breaking-news or live league-availability paths.
+        fantasypros_api_key=os.environ.get("FANTASYPROS_API_KEY", "").strip(),
+        fantasypros_request_limit=optional_int(
+            "FANTASYPROS_REQUEST_LIMIT",
+            DEFAULT_FANTASYPROS_REQUEST_LIMIT,
+            1,
+            450,
+        ),
+        fantasypros_refresh_hours=optional_int(
+            "FANTASYPROS_REFRESH_HOURS",
+            DEFAULT_FANTASYPROS_REFRESH_HOURS,
+            1,
+            24,
+        ),
+        fantasypros_max_age_hours=optional_int(
+            "FANTASYPROS_MAX_AGE_HOURS",
+            DEFAULT_FANTASYPROS_MAX_AGE_HOURS,
+            1,
+            72,
+        ),
         poll_seconds=optional_int("POLL_SECONDS", DEFAULT_POLL_SECONDS, 10, 900),
         poll_seconds_idle=optional_int(
             "POLL_SECONDS_IDLE", DEFAULT_POLL_SECONDS_IDLE, 10, 3600

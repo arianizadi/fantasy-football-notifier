@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from notifier.sources.rotowire import parse_feed
+from notifier.sources.reporters import PlayerNameIndex
 from notifier.sources.twitter import TwitterStream
 
 
@@ -48,3 +49,284 @@ def test_twitter_payload_keeps_created_at_and_player_match() -> None:
     assert item.published_at == datetime(2026, 8, 23, 17, 30, tzinfo=timezone.utc)
     assert item.url == "https://x.com/Reporter/status/42"
     stream._session.close()
+
+
+def test_multi_player_injury_post_becomes_one_starter_centered_report() -> None:
+    stream = TwitterStream("fake", queue.Queue())
+    stream._names = SimpleNamespace(
+        find=lambda _text: ["Arizona Starter", "Michael Carter", "Bam Knight"]
+    )
+    text = (
+        "Arizona Starter was ruled out. Michael Carter and Bam Knight could "
+        "split the available work."
+    )
+    payload = {
+        "data": {"id": "43", "author_id": "7", "text": text},
+        "includes": {"users": [{"id": "7", "username": "Reporter"}]},
+    }
+
+    items = stream._to_items(payload)
+
+    assert len(items) == 1
+    assert items[0].player_name == "Arizona Starter"
+    assert items[0].subject_confident is True
+    stream._session.close()
+
+
+def test_ambiguous_multi_player_post_is_one_fail_closed_report() -> None:
+    stream = TwitterStream("fake", queue.Queue())
+    stream._names = SimpleNamespace(find=lambda _text: ["Michael Carter", "Bam Knight"])
+    payload = {
+        "data": {
+            "id": "44",
+            "author_id": "7",
+            "text": "Michael Carter and Bam Knight are both backfield options.",
+        },
+        "includes": {"users": [{"id": "7", "username": "Reporter"}]},
+    }
+
+    items = stream._to_items(payload)
+
+    assert len(items) == 1
+    assert items[0].subject_confident is False
+    stream._session.close()
+
+
+def test_two_players_ruled_out_together_remains_ambiguous() -> None:
+    stream = TwitterStream("fake", queue.Queue())
+    stream._names = SimpleNamespace(find=lambda _text: ["Player Alpha", "Player Beta"])
+    payload = {
+        "data": {
+            "id": "45",
+            "author_id": "7",
+            "text": "Player Alpha and Player Beta were ruled out.",
+        },
+        "includes": {"users": [{"id": "7", "username": "Reporter"}]},
+    }
+
+    item = stream._to_items(payload)[0]
+
+    assert item.subject_confident is False
+    stream._session.close()
+
+
+def test_single_matched_replacement_does_not_become_injured_subject() -> None:
+    stream = TwitterStream("fake", queue.Queue())
+    stream._names = SimpleNamespace(find=lambda _text: ["Jordan Mason"])
+    payload = {
+        "data": {
+            "id": "46",
+            "author_id": "7",
+            "text": "CMC ruled out; Jordan Mason is expected to handle the backfield.",
+        },
+        "includes": {"users": [{"id": "7", "username": "Reporter"}]},
+    }
+
+    item = stream._to_items(payload)[0]
+
+    assert item.player_name == "Jordan Mason"
+    assert item.subject_confident is False
+    stream._session.close()
+
+
+def test_replacement_language_cannot_inherit_unmatched_players_absence() -> None:
+    stream = TwitterStream("fake", queue.Queue())
+    stream._names = SimpleNamespace(find=lambda _text: ["Jordan Mason"])
+    reports = [
+        "Jordan Mason will start with CMC ruled out.",
+        "Jordan Mason benefits with CMC injured.",
+        "Jordan Mason is the pickup after CMC was ruled out.",
+        "Jordan Mason will start because CMC is doubtful.",
+    ]
+
+    for index, report in enumerate(reports, start=50):
+        item = stream._to_items(
+            {
+                "data": {"id": str(index), "author_id": "7", "text": report},
+                "includes": {"users": [{"id": "7", "username": "Reporter"}]},
+            }
+        )[0]
+        assert item.subject_confident is False
+    stream._session.close()
+
+
+def test_direct_prefix_injury_headlines_remain_confident() -> None:
+    stream = TwitterStream("fake", queue.Queue())
+    stream._names = SimpleNamespace(find=lambda _text: ["Jordan Mason"])
+    reports = [
+        "Torn ACL for Jordan Mason.",
+        "Concussion for Jordan Mason.",
+        "High ankle sprain for Jordan Mason.",
+    ]
+
+    for index, report in enumerate(reports, start=60):
+        item = stream._to_items(
+            {
+                "data": {"id": str(index), "author_id": "7", "text": report},
+                "includes": {"users": [{"id": "7", "username": "Reporter"}]},
+            }
+        )[0]
+        assert item.player_name == "Jordan Mason"
+        assert item.subject_confident is True
+    stream._session.close()
+
+
+def test_replacements_after_absence_cue_do_not_make_subject_ambiguous() -> None:
+    stream = TwitterStream("fake", queue.Queue())
+    stream._names = SimpleNamespace(
+        find=lambda text: [
+            name
+            for name in ["James Conner", "Michael Carter", "Bam Knight"]
+            if name in text
+        ]
+    )
+    reports = [
+        "James Conner ruled out and Michael Carter will start.",
+        (
+            "James Conner was ruled out, while Michael Carter and Bam Knight "
+            "could split work."
+        ),
+        (
+            "James Conner (ankle) was ruled out; Michael Carter and Bam Knight "
+            "could split work."
+        ),
+    ]
+
+    for index, report in enumerate(reports, start=70):
+        item = stream._to_items(
+            {
+                "data": {"id": str(index), "author_id": "7", "text": report},
+                "includes": {"users": [{"id": "7", "username": "Reporter"}]},
+            }
+        )[0]
+        assert item.player_name == "James Conner"
+        assert item.subject_confident is True
+    stream._session.close()
+
+
+def test_direct_status_variants_remain_confident() -> None:
+    stream = TwitterStream("fake", queue.Queue())
+    stream._names = SimpleNamespace(find=lambda _text: ["Jordan Mason"])
+    reports = [
+        "Jordan Mason (ankle) ruled out.",
+        "Jordan Mason — ankle — ruled out.",
+        "Jordan Mason, who was ruled out.",
+        "Jordan Mason entered concussion protocol.",
+        "Jordan Mason has entered concussion protocol.",
+        "Jordan Mason is a game-time decision.",
+    ]
+
+    for index, report in enumerate(reports, start=80):
+        item = stream._to_items(
+            {
+                "data": {"id": str(index), "author_id": "7", "text": report},
+                "includes": {"users": [{"id": "7", "username": "Reporter"}]},
+            }
+        )[0]
+        assert item.subject_confident is True
+    stream._session.close()
+
+
+def test_non_roster_release_language_fails_closed() -> None:
+    stream = TwitterStream("fake", queue.Queue())
+    stream._names = SimpleNamespace(find=lambda _text: ["Jordan Mason"])
+    reports = [
+        "Jordan Mason released a statement about CMC.",
+        "Jordan Mason waived goodbye to CMC.",
+        "Jordan Mason was released from the hospital.",
+        "The 49ers released Jordan Mason injury update.",
+        "The 49ers released Jordan Mason highlight video.",
+        "Jordan Mason was released from concussion protocol by the 49ers.",
+        "The 49ers released Jordan Mason from concussion protocol.",
+        "Jordan Mason was released by the 49ers medical staff.",
+        "The 49ers released Jordan Mason after he cleared concussion protocol.",
+    ]
+
+    for index, report in enumerate(reports, start=90):
+        item = stream._to_items(
+            {
+                "data": {"id": str(index), "author_id": "7", "text": report},
+                "includes": {"users": [{"id": "7", "username": "Reporter"}]},
+            }
+        )[0]
+        assert item.subject_confident is False
+    stream._session.close()
+
+
+def test_explicit_team_release_language_remains_confident() -> None:
+    stream = TwitterStream("fake", queue.Queue())
+    stream._names = SimpleNamespace(find=lambda _text: ["Jordan Mason"])
+    reports = [
+        "The 49ers released Jordan Mason.",
+        "Jordan Mason was released by the 49ers.",
+        "SF waived Jordan Mason from the roster.",
+        "The 49ers cut Jordan Mason.",
+        "Jordan Mason was suspended four games by the NFL.",
+    ]
+
+    for index, report in enumerate(reports, start=100):
+        item = stream._to_items(
+            {
+                "data": {"id": str(index), "author_id": "7", "text": report},
+                "includes": {"users": [{"id": "7", "username": "Reporter"}]},
+            }
+        )[0]
+        assert item.subject_confident is True
+    stream._session.close()
+
+
+def test_worked_out_does_not_override_named_injured_subject() -> None:
+    stream = TwitterStream("fake", queue.Queue())
+    stream._names = SimpleNamespace(
+        find=lambda _text: ["James Conner", "Michael Carter", "Bam Knight"]
+    )
+    payload = {
+        "data": {
+            "id": "47",
+            "author_id": "7",
+            "text": (
+                "James Conner suffered a high ankle sprain. Michael Carter "
+                "worked out with Bam Knight."
+            ),
+        },
+        "includes": {"users": [{"id": "7", "username": "Reporter"}]},
+    }
+
+    item = stream._to_items(payload)[0]
+
+    assert item.player_name == "James Conner"
+    assert item.subject_confident is True
+    stream._session.close()
+
+
+def test_direct_single_player_ruled_out_remains_confident() -> None:
+    stream = TwitterStream("fake", queue.Queue())
+    stream._names = SimpleNamespace(find=lambda _text: ["Jordan Mason"])
+    payload = {
+        "data": {
+            "id": "48",
+            "author_id": "7",
+            "text": "Jordan Mason was ruled out for Sunday.",
+        },
+        "includes": {"users": [{"id": "7", "username": "Reporter"}]},
+    }
+
+    item = stream._to_items(payload)[0]
+
+    assert item.subject_confident is True
+    stream._session.close()
+
+
+def test_player_index_does_not_join_a_name_across_sentences() -> None:
+    index = PlayerNameIndex(
+        {
+            "1": {
+                "full_name": "Will Shipley",
+                "team": "PHI",
+                "position": "RB",
+            }
+        }
+    )
+
+    assert index.find("Will Shipley practiced.") == ["Will Shipley"]
+    assert index.find("The team will. Shipley practiced.") == []

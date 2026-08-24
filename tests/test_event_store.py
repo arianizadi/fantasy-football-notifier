@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import sqlite3
 from datetime import datetime, timezone
 
 from notifier.event_store import EventStore
-from notifier.models import Classification, NewsItem
+from notifier.models import Classification, NewsItem, report_revision_identity
 
 
 def _item(guid: str = "twitter:42:George Kittle") -> NewsItem:
@@ -30,7 +31,7 @@ def test_event_journal_preserves_raw_report_and_structured_labels(tmp_path) -> N
     )
 
     store.record_classification(item, classification, tier="preseason")
-    store.mark_outcome(item.guid, "delivered", message_id=501)
+    store.mark_outcome(item, "delivered", message_id=501)
     row = store.get(item.guid)
 
     assert row is not None
@@ -54,14 +55,14 @@ def test_event_journal_search_feedback_and_embedding_slot(tmp_path) -> None:
 
     assert store.record_feedback(token, "useful") is True
     assert store.record_feedback(token, "invalid") is False
-    assert store.store_embedding(item.guid, "future-provider/model", b"vector") is True
+    assert store.store_embedding(item, "future-provider/model", b"vector") is True
     assert store.recent_for_player("Kittle")[0]["feedback"] == "useful"
     assert store.search("active PUP")[0]["guid"] == item.guid
     assert store.get(item.guid)["embedding_model"] == "future-provider/model"
     store.close()
 
 
-def test_event_journal_upsert_does_not_duplicate_guid(tmp_path) -> None:
+def test_event_journal_upsert_does_not_duplicate_exact_revision(tmp_path) -> None:
     store = EventStore(tmp_path)
     item = _item()
     store.record_received(item)
@@ -71,7 +72,7 @@ def test_event_journal_upsert_does_not_duplicate_guid(tmp_path) -> None:
     store.close()
 
 
-def test_changed_raw_report_replaces_the_same_fts_row(tmp_path) -> None:
+def test_changed_raw_report_with_reused_guid_preserves_both_fts_rows(tmp_path) -> None:
     store = EventStore(tmp_path)
     item = _item()
     store.record_received(item)
@@ -87,11 +88,177 @@ def test_changed_raw_report_replaces_the_same_fts_row(tmp_path) -> None:
 
     store.record_received(updated)
 
-    assert store.search("active PUP") == []
+    assert store.search("active PUP")[0]["body"] == item.body
     assert store.search("team drills")[0]["guid"] == item.guid
     assert store._connection.execute(
         "SELECT COUNT(*) FROM news_events_fts"
-    ).fetchone()[0] == 1
+    ).fetchone()[0] == 2
+    assert store.count() == 2
+    store.close()
+
+
+def test_reused_guid_status_revisions_keep_rows_and_feedback_isolated(tmp_path) -> None:
+    store = EventStore(tmp_path)
+    questionable = NewsItem(
+        source="rotowire",
+        guid="rotowire:kittle-status",
+        player_name="George Kittle",
+        headline="George Kittle injury update",
+        body="Kittle is questionable for Sunday with an ankle injury.",
+        url="https://example.test/kittle",
+        published_at=None,
+    )
+    ruled_out = NewsItem(
+        source=questionable.source,
+        guid=questionable.guid,
+        player_name=questionable.player_name,
+        headline=questionable.headline,
+        body="Kittle has been ruled out for Sunday with an ankle injury.",
+        url=questionable.url,
+        published_at=None,
+    )
+    store.record_classification(
+        questionable,
+        Classification("injury", 3, "Availability uncertain.", True, {}),
+    )
+    store.mark_outcome(questionable, "delivered", message_id=41)
+    store.record_classification(
+        ruled_out,
+        Classification("inactive", 5, "Unavailable for Sunday.", True, {}),
+    )
+    store.mark_outcome(ruled_out, "delivered", message_id=42)
+
+    first = store.get(questionable)
+    second = store.get(ruled_out)
+    assert first is not None and second is not None
+    assert first["id"] != second["id"]
+    assert first["report_id"] != second["report_id"]
+    assert first["alert_token"] != second["alert_token"]
+    assert first["body"] == questionable.body
+    assert first["event_type"] == "injury"
+    assert first["telegram_message_id"] == 41
+    assert second["body"] == ruled_out.body
+    assert second["event_type"] == "inactive"
+    assert second["telegram_message_id"] == 42
+    assert store.record_feedback(first["alert_token"], "useful") is True
+    assert store.record_feedback(second["alert_token"], "wrong") is True
+    assert store.get(questionable)["feedback"] == "useful"
+    assert store.get(ruled_out)["feedback"] == "wrong"
+    assert store.count() == 2
+    store.close()
+
+
+def test_reused_guid_condition_revision_keeps_ankle_and_concussion_rows(tmp_path) -> None:
+    store = EventStore(tmp_path)
+    ankle = NewsItem(
+        source="rotowire",
+        guid="rotowire:kittle-condition",
+        player_name="George Kittle",
+        headline="George Kittle left practice",
+        body="Kittle left practice with an ankle injury.",
+        url="https://example.test/kittle-condition",
+        published_at=None,
+    )
+    concussion = NewsItem(
+        source=ankle.source,
+        guid=ankle.guid,
+        player_name=ankle.player_name,
+        headline=ankle.headline,
+        body="Kittle left practice and is being evaluated for a concussion.",
+        url=ankle.url,
+        published_at=None,
+    )
+
+    store.record_received(ankle)
+    store.record_received(concussion)
+
+    rows = store.recent_for_player("Kittle")
+    assert {row["body"] for row in rows} == {ankle.body, concussion.body}
+    assert len({row["report_id"] for row in rows}) == 2
+    assert len({row["alert_token"] for row in rows}) == 2
+    store.close()
+
+
+def test_legacy_guid_unique_schema_migrates_without_breaking_old_feedback(
+    tmp_path,
+) -> None:
+    item = _item()
+    database = tmp_path / "news-events.sqlite3"
+    connection = sqlite3.connect(database)
+    connection.execute(
+        """
+        CREATE TABLE news_events (
+            id INTEGER PRIMARY KEY,
+            guid TEXT NOT NULL UNIQUE,
+            alert_token TEXT NOT NULL UNIQUE,
+            source TEXT NOT NULL,
+            player_name TEXT NOT NULL DEFAULT '',
+            headline TEXT NOT NULL DEFAULT '',
+            body TEXT NOT NULL DEFAULT '',
+            url TEXT NOT NULL DEFAULT '',
+            published_at TEXT,
+            received_at TEXT NOT NULL,
+            event_type TEXT,
+            direction TEXT,
+            severity INTEGER,
+            summary TEXT,
+            is_actionable INTEGER,
+            tier TEXT,
+            outcome TEXT NOT NULL DEFAULT 'received',
+            telegram_message_id INTEGER,
+            feedback TEXT,
+            feedback_at TEXT,
+            embedding_model TEXT,
+            embedding BLOB,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO news_events(
+            guid, alert_token, source, player_name, headline, body, url,
+            published_at, received_at, outcome, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'delivered', ?)
+        """,
+        (
+            item.guid,
+            "legacy-guid-token",
+            item.source,
+            item.player_name,
+            item.headline,
+            item.body,
+            item.url,
+            item.published_at.isoformat(),
+            "2026-08-23T17:31:00+00:00",
+            "2026-08-23T17:31:00+00:00",
+        ),
+    )
+    connection.commit()
+    connection.close()
+
+    store = EventStore(tmp_path)
+    row = store.get(item)
+    assert row is not None
+    assert row["report_id"] == report_revision_identity(item)
+    assert row["alert_token"] == report_revision_identity(item)[:16]
+    assert row["legacy_alert_token"] == "legacy-guid-token"
+    assert store.record_feedback("legacy-guid-token", "useful") is True
+    assert store.get(item)["feedback"] == "useful"
+
+    store.record_received(item)
+    changed = NewsItem(
+        source=item.source,
+        guid=item.guid,
+        player_name=item.player_name,
+        headline=item.headline,
+        body="Kittle returned to team drills.",
+        url=item.url,
+        published_at=item.published_at,
+    )
+    store.record_received(changed)
+    assert store.count() == 2
+    assert store.get(changed)["alert_token"] != store.get(item)["alert_token"]
     store.close()
 
 

@@ -40,7 +40,7 @@ def test_player_reply_chain_and_feedback_survive_restart(tmp_path) -> None:
 
     assert state.previous_message_id("George Kittle") is None
     token = state.record_sent(alert, 321)
-    assert token == alert_token(alert.item.guid)
+    assert token == alert_token(alert.item)
     assert state.previous_message_id("Kittle") is None  # exact player key only
     assert state.previous_message_id("George Kittle") == 321
     assert state.record_feedback(token, "useful") is True

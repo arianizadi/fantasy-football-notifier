@@ -14,13 +14,19 @@ import os
 import threading
 import time
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .dedupe import fingerprint
 from .logging_utils import structured_log
-from .models import Alert, Classification, LeagueRef, NewsItem
+from .models import (
+    Alert,
+    Classification,
+    LeagueRef,
+    NewsItem,
+    RosterCapacity,
+    report_revision_identity,
+)
 from .plays import Beneficiary, DepthEntry, LeaguePlays, TeamContext
 
 OUTBOX_FILENAME = "pending-alerts.json"
@@ -34,14 +40,45 @@ class PendingDelivery:
     delivery_id: str
     alert: Alert
     queued_at: float
+    observed_at: float = 0.0
     attempts: int = 0
     next_attempt_at: float = 0.0
     last_error: str = ""
 
 
 def _delivery_id(alert: Alert) -> str:
-    value = f"{alert.item.guid}|{alert.item.player_name}|{alert.classification.event_type}"
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
+    # Feed GUIDs are usually immutable, but some providers reuse one while
+    # replacing the body with a materially newer status or diagnosis. Include
+    # the raw revision so that update can coexist with an older failed send.
+    # Length-prefix the remaining field instead of joining user/provider text
+    # with a delimiter: both headlines and bodies can legitimately contain
+    # that delimiter, making a plain concatenation ambiguous.
+    digest = hashlib.sha256()
+    for value in (
+        report_revision_identity(alert.item),
+        alert.classification.event_type,
+    ):
+        encoded = value.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, byteorder="big"))
+        digest.update(encoded)
+    return digest.hexdigest()[:32]
+
+
+def _same_item_revision(left: NewsItem, right: NewsItem) -> bool:
+    """Whether two observations contain the same provider-owned report text."""
+    return (
+        left.source,
+        left.guid,
+        left.player_name,
+        left.headline,
+        left.body,
+    ) == (
+        right.source,
+        right.guid,
+        right.player_name,
+        right.headline,
+        right.body,
+    )
 
 
 def _league(payload: dict[str, Any]) -> LeagueRef:
@@ -58,6 +95,7 @@ def _news_item(payload: dict[str, Any]) -> NewsItem:
         body=str(payload.get("body") or ""),
         url=str(payload.get("url") or ""),
         published_at=datetime.fromisoformat(published) if published else None,
+        subject_confident=bool(payload.get("subject_confident", True)),
     )
 
 
@@ -71,6 +109,14 @@ def _classification(payload: dict[str, Any]) -> Classification:
     )
 
 
+def _optional_rank(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
 def _beneficiary(payload: dict[str, Any]) -> Beneficiary:
     return Beneficiary(
         name=str(payload.get("name") or ""),
@@ -78,6 +124,18 @@ def _beneficiary(payload: dict[str, Any]) -> Beneficiary:
         depth_order=payload.get("depth_order"),
         state=str(payload.get("state") or "free_agent"),
         fantasy_team=str(payload.get("fantasy_team") or ""),
+        named_in_report=bool(payload.get("named_in_report", False)),
+        pro_team=str(payload.get("pro_team") or ""),
+        fantasypros_waiver_rank=_optional_rank(
+            payload.get("fantasypros_waiver_rank")
+        ),
+        fantasypros_waiver_pos_rank=str(
+            payload.get("fantasypros_waiver_pos_rank") or ""
+        ),
+        fantasypros_ros_rank=_optional_rank(payload.get("fantasypros_ros_rank")),
+        fantasypros_ros_pos_rank=str(payload.get("fantasypros_ros_pos_rank") or ""),
+        fantasypros_scoring=str(payload.get("fantasypros_scoring") or ""),
+        fantasypros_updated_at=str(payload.get("fantasypros_updated_at") or ""),
     )
 
 
@@ -100,12 +158,25 @@ def _depth_entry(payload: dict[str, Any]) -> DepthEntry:
 
 
 def _league_plays(payload: dict[str, Any]) -> LeaguePlays:
+    raw_capacity = payload.get("capacity")
+    capacity = (
+        RosterCapacity(
+            bench_used=raw_capacity.get("bench_used"),
+            bench_limit=raw_capacity.get("bench_limit"),
+            ir_used=raw_capacity.get("ir_used"),
+            ir_limit=raw_capacity.get("ir_limit"),
+        )
+        if isinstance(raw_capacity, dict)
+        else None
+    )
     return LeaguePlays(
         league=_league(payload["league"]),
         subject_state=str(payload.get("subject_state") or "free_agent"),
         subject_owner=str(payload.get("subject_owner") or ""),
         beneficiaries=[_beneficiary(value) for value in payload.get("beneficiaries", [])],
         bench_options=[str(value) for value in payload.get("bench_options", [])],
+        capacity=capacity,
+        scoring_format=str(payload.get("scoring_format") or ""),
     )
 
 
@@ -182,6 +253,9 @@ class DeliveryOutbox:
                     delivery_id=str(value["delivery_id"]),
                     alert=_alert_from_dict(value["alert"]),
                     queued_at=float(value.get("queued_at", 0)),
+                    observed_at=float(
+                        value.get("observed_at", value.get("queued_at", 0))
+                    ),
                     attempts=int(value.get("attempts", 0)),
                     next_attempt_at=float(value.get("next_attempt_at", 0)),
                     last_error=str(value.get("last_error") or ""),
@@ -199,6 +273,7 @@ class DeliveryOutbox:
                     "delivery_id": delivery.delivery_id,
                     "alert": _alert_to_dict(delivery.alert),
                     "queued_at": delivery.queued_at,
+                    "observed_at": delivery.observed_at,
                     "attempts": delivery.attempts,
                     "next_attempt_at": delivery.next_attempt_at,
                     "last_error": delivery.last_error,
@@ -214,17 +289,38 @@ class DeliveryOutbox:
             structured_log(logging.ERROR, "outbox.write_failed", error=str(error))
             raise
 
-    def add(self, alert: Alert) -> PendingDelivery:
+    def add(
+        self,
+        alert: Alert,
+        *,
+        observed_at: float | None = None,
+    ) -> PendingDelivery:
         """Persist an alert before its first Telegram attempt."""
         with self._lock:
             delivery_id = _delivery_id(alert)
             existing = self._pending.get(delivery_id)
             if existing is not None:
                 return existing
+            # Compatibility with pending entries written before delivery IDs
+            # included the raw revision. Never duplicate the literal report.
+            existing = next(
+                (
+                    value
+                    for value in self._pending.values()
+                    if _same_item_revision(value.alert.item, alert.item)
+                    and value.alert.classification.event_type
+                    == alert.classification.event_type
+                ),
+                None,
+            )
+            if existing is not None:
+                return existing
+            queued_at = time.time()
             delivery = PendingDelivery(
                 delivery_id=delivery_id,
                 alert=alert,
-                queued_at=time.time(),
+                queued_at=queued_at,
+                observed_at=queued_at if observed_at is None else observed_at,
             )
             self._pending[delivery_id] = delivery
             if len(self._pending) > MAX_TRACKED:
@@ -244,22 +340,60 @@ class DeliveryOutbox:
         with self._lock:
             stamp = time.time() if now is None else now
             ready = [value for value in self._pending.values() if value.next_attempt_at <= stamp]
-            return sorted(
-                ready,
-                key=lambda value: (
+
+            def chronology(
+                value: PendingDelivery,
+            ) -> tuple[float, float, float, int, str]:
+                published = value.alert.item.published_at
+                if published is not None:
+                    if published.tzinfo is None:
+                        published = published.replace(tzinfo=timezone.utc)
+                    report_time = published.timestamp()
+                else:
+                    report_time = value.observed_at or value.queued_at
+                return (
+                    report_time,
+                    value.observed_at or value.queued_at,
                     value.queued_at,
                     SOURCE_PRIORITY.get(value.alert.item.source, 9),
-                ),
+                    value.delivery_id,
+                )
+
+            return sorted(
+                ready,
+                key=chronology,
             )
 
     def contains_item(self, item: NewsItem) -> bool:
+        """True only when this exact raw report revision is already pending.
+
+        A shared headline is not sufficient: the body may now say ``ruled
+        out``, identify a different condition, or add a recovery timetable.
+        Those observations must reach classification before semantic dedupe.
+        """
         with self._lock:
-            digest = fingerprint(item)
             return any(
-                value.alert.item.guid == item.guid
-                or fingerprint(value.alert.item) == digest
+                _same_item_revision(value.alert.item, item)
                 for value in self._pending.values()
             )
+
+    def pending_for_player(self, player_name: str) -> list[PendingDelivery]:
+        """Return a chronological snapshot used for serialized event dedupe."""
+        wanted = player_name.strip().casefold()
+        if not wanted:
+            return []
+        with self._lock:
+            matches = [
+                value
+                for value in self._pending.values()
+                if value.alert.item.player_name.strip().casefold() == wanted
+            ]
+            return sorted(matches, key=lambda value: value.queued_at)
+
+    def get(self, delivery_id: str) -> PendingDelivery | None:
+        """Refetch live membership after iterating an earlier due snapshot."""
+        with self._lock:
+            return self._pending.get(delivery_id)
 
     def mark_failed(
         self,

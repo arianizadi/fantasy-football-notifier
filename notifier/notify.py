@@ -7,6 +7,7 @@ import logging
 import re
 import threading
 from collections import Counter
+from dataclasses import replace
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from urllib.parse import urlsplit
@@ -18,7 +19,12 @@ from .health import HEALTH
 from .logging_utils import structured_log
 from .models import Alert
 from .plays import LeaguePlays, normalized_event_type
-from .telegram_state import TelegramState, feedback_markup
+from .telegram_state import (
+    TelegramState,
+    alert_token,
+    feedback_markup,
+    feedback_markup_for_token,
+)
 
 API_BASE = "https://api.telegram.org"
 REQUEST_TIMEOUT = 15
@@ -185,6 +191,87 @@ def _context_block(
     return lines
 
 
+def _fantasypros_rank_detail(beneficiary) -> str:
+    """Compact, explicitly attributed secondary ranking context."""
+    if not beneficiary.fantasypros_scoring:
+        return ""
+    ranks: list[str] = []
+    if beneficiary.fantasypros_waiver_rank is not None:
+        value = (
+            beneficiary.fantasypros_waiver_pos_rank
+            or f"#{beneficiary.fantasypros_waiver_rank}"
+        )
+        ranks.append(f"waiver {value}")
+    if beneficiary.fantasypros_ros_rank is not None:
+        value = (
+            beneficiary.fantasypros_ros_pos_rank
+            or f"#{beneficiary.fantasypros_ros_rank}"
+        )
+        ranks.append(f"ROS {value}")
+    if not ranks:
+        return ""
+    return (
+        f"FantasyPros {_escape(beneficiary.fantasypros_scoring)} "
+        + " · ".join(_escape(value) for value in ranks)
+    )
+
+
+def _fantasypros_lean(claimable) -> str:
+    """A conservative ranking lean that never changes candidate order."""
+    ranked = [
+        candidate
+        for candidate in claimable
+        if candidate.fantasypros_waiver_rank is not None
+    ]
+    if len(ranked) < 2:
+        return ""
+    ranked.sort(key=lambda candidate: candidate.fantasypros_waiver_rank)
+    best, runner_up = ranked[:2]
+    if runner_up.fantasypros_waiver_rank - best.fantasypros_waiver_rank < 5:
+        return ""
+    # Do not call it a lean when rest-of-season consensus points the other way.
+    if (
+        best.fantasypros_ros_rank is not None
+        and runner_up.fantasypros_ros_rank is not None
+        and best.fantasypros_ros_rank > runner_up.fantasypros_ros_rank
+    ):
+        return ""
+    return best.name
+
+
+def _fantasypros_freshness(claimable) -> str:
+    enriched = [
+        candidate
+        for candidate in claimable
+        if candidate.fantasypros_scoring
+        and (
+            candidate.fantasypros_waiver_rank is not None
+            or candidate.fantasypros_ros_rank is not None
+        )
+    ]
+    if not enriched:
+        return ""
+    scoring = "/".join(
+        dict.fromkeys(candidate.fantasypros_scoring for candidate in enriched)
+    )
+    timestamps: list[datetime] = []
+    for candidate in enriched:
+        if not candidate.fantasypros_updated_at:
+            continue
+        try:
+            parsed = datetime.fromisoformat(candidate.fantasypros_updated_at)
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        timestamps.append(parsed)
+    as_of = f" · provider updated {_freshness_label(min(timestamps))}" if timestamps else ""
+    return (
+        f"FantasyPros cached {scoring} rankings{as_of}; may lag this breaking "
+        "report and do not confirm role or workload."
+    )
+
+
 def _league_block(
     plays: LeaguePlays,
     severity: int,
@@ -206,12 +293,62 @@ def _league_block(
 
     name = _escape(league_label)
     parts: list[str] = []
+    options: list[str] = []
     for beneficiary in claimable[:2]:
         slot = f"{beneficiary.position}{beneficiary.depth_order or ''}"
-        parts.append(f"ADD <b>{_escape(beneficiary.name)}</b> ({_escape(slot)})")
+        detail = f"Sleeper depth {_escape(slot)}"
+        if beneficiary.named_in_report:
+            detail += " · named in report"
+        fantasypros = _fantasypros_rank_detail(beneficiary)
+        if fantasypros:
+            detail += f" · {fantasypros}"
+        options.append(f"<b>{_escape(beneficiary.name)}</b> ({detail})")
+    if options:
+        option_label = "PICKUP OPTIONS" if len(options) > 1 else "ADD OPTION"
+        parts.append(f"{option_label} — " + " | ".join(options))
     if plays.bench_options:
         parts.append(f"START <b>{_escape(plays.bench_options[0])}</b>")
-    return [f"{name}: " + " | ".join(parts)]
+    lines = [f"{name}: " + " | ".join(parts)]
+
+    # Occupancy only: an open IR spot is not a claim that the injured player
+    # is eligible for it, and the notifier never chooses a drop candidate.
+    if claimable and allow_adds and plays.capacity is not None:
+        capacity_parts: list[str] = []
+        if (
+            plays.capacity.bench_used is not None
+            and plays.capacity.bench_limit is not None
+        ):
+            bench = f"Bench {plays.capacity.bench_used}/{plays.capacity.bench_limit}"
+            if plays.capacity.bench_limit > 0:
+                bench += (
+                    " full"
+                    if plays.capacity.bench_used >= plays.capacity.bench_limit
+                    else " open"
+                )
+            capacity_parts.append(bench)
+        if plays.capacity.ir_used is not None and plays.capacity.ir_limit is not None:
+            reserve = f"IR {plays.capacity.ir_used}/{plays.capacity.ir_limit}"
+            if plays.capacity.ir_limit > 0:
+                reserve += (
+                    " full"
+                    if plays.capacity.ir_used >= plays.capacity.ir_limit
+                    else " open"
+                )
+                if plays.capacity.ir_used < plays.capacity.ir_limit:
+                    reserve += " (eligibility not checked)"
+            capacity_parts.append(reserve)
+        if capacity_parts:
+            lines.append("  Roster occupancy: " + " · ".join(capacity_parts))
+    lean = _fantasypros_lean(claimable[:2])
+    if lean:
+        lines.append(
+            f"  FantasyPros rank lean: <b>{_escape(lean)}</b> "
+            "(ranking context only; role unconfirmed)"
+        )
+    freshness = _fantasypros_freshness(claimable[:2])
+    if freshness:
+        lines.append("  " + _escape(freshness))
+    return lines
 
 
 def _deterministic_note(alert: Alert) -> str:
@@ -283,13 +420,35 @@ def format_alert(alert: Alert) -> str:
     if alert.delivery_delayed:
         lines += ["", "Delivery note: delayed after a Telegram retry; availability was rechecked."]
 
+    if not item.subject_confident:
+        lines += [
+            "",
+            "Player attribution is unclear in this report; automatic "
+            "pickup and lineup moves are withheld.",
+        ]
+
     if alert.availability_refresh_failed:
         lines += [
             "",
             "League availability refresh failed; no ADD or free-agent recommendation is shown.",
         ]
 
-    model_summary = _safe_model_summary(classification.fantasy_impact)
+    context_successors = (
+        [entry for entry in alert.context.same_position if not entry.is_subject]
+        if alert.context is not None
+        else []
+    )
+    has_multiple_successors = len(context_successors) > 1 or any(
+        len(plays.beneficiaries) > 1 for plays in alert.per_league
+    )
+    # A prose model summary can accidentally turn a depth-listing signal into
+    # a workload prediction. When several successors exist, the deterministic
+    # option block and source report are safer and more useful.
+    model_summary = (
+        ""
+        if has_multiple_successors or not item.subject_confident
+        else _safe_model_summary(classification.fantasy_impact)
+    )
     if model_summary:
         lines += ["", f"Model summary: {_escape(model_summary)}"]
 
@@ -315,8 +474,25 @@ def format_alert(alert: Alert) -> str:
             labels.get(plays.league.key, plays.league.short_label),
             allow_adds=not alert.availability_refresh_failed,
         )
+    has_multiple_claimable = not alert.availability_refresh_failed and any(
+        len(plays.claimable) > 1 for plays in alert.per_league
+    )
+    has_any_claimable = not alert.availability_refresh_failed and any(
+        plays.claimable for plays in alert.per_league
+    )
     if action_lines:
         lines += ["", "<b>LEAGUE-SPECIFIC MOVES</b>"] + action_lines
+        if has_multiple_claimable:
+            lines += [
+                "",
+                "Backup note: Pickup options are alternatives, not instructions to add both. "
+                "Sleeper depth order does not confirm workload or touch share.",
+            ]
+        elif has_any_claimable and has_multiple_successors:
+            lines += [
+                "",
+                "Backup note: Sleeper depth order does not confirm workload or touch share.",
+            ]
 
     backup_watch_note = _backup_watch_note(alert)
     if backup_watch_note:
@@ -393,6 +569,12 @@ def retry_after_seconds() -> int:
     return int(getattr(_SEND_CONTEXT, "retry_after", 0) or 0)
 
 
+def _safe_error(error: object, token: str) -> str:
+    """Never let a requests exception echo the bot token into logs or health."""
+    rendered = str(error)
+    return rendered.replace(token, "[redacted]") if token else rendered
+
+
 def _post(session: requests.Session, config: Config, payload: dict) -> int | None:
     """POST sendMessage; return the created message_id.
 
@@ -416,6 +598,7 @@ def _post(session: requests.Session, config: Config, payload: dict) -> int | Non
                 description = str(response_payload.get("description") or "")
             except ValueError:
                 description = response.text[:200]
+            description = _safe_error(description, config.telegram_bot_token)
             if response.status_code == 429:
                 try:
                     _SEND_CONTEXT.retry_after = max(
@@ -438,9 +621,67 @@ def _post(session: requests.Session, config: Config, payload: dict) -> int | Non
         HEALTH.mark("telegram", ok=True, detail=f"message {message_id}")
         return message_id
     except (requests.RequestException, KeyError, ValueError, TypeError) as error:
-        HEALTH.mark("telegram", ok=False, detail=str(error))
-        structured_log(logging.ERROR, "notify.send_failed", error=str(error))
+        safe_error = _safe_error(error, config.telegram_bot_token)
+        HEALTH.mark("telegram", ok=False, detail=safe_error)
+        structured_log(logging.ERROR, "notify.send_failed", error=safe_error)
         return None
+
+
+def _edit(
+    session: requests.Session,
+    config: Config,
+    message_id: int,
+    payload: dict,
+) -> bool:
+    """Edit an existing Telegram message, returning False for safe fallback."""
+    try:
+        response = session.post(
+            f"{API_BASE}/bot{config.telegram_bot_token}/editMessageText",
+            timeout=REQUEST_TIMEOUT,
+            json={
+                "chat_id": config.telegram_chat_id,
+                "message_id": int(message_id),
+                "parse_mode": "HTML",
+                **payload,
+            },
+        )
+        if not response.ok:
+            try:
+                description = str(response.json().get("description") or "")
+            except ValueError:
+                description = response.text[:200]
+            # The prior attempt may have reached Telegram and then failed to
+            # persist local state. Repeating that exact edit is idempotent;
+            # commit the requested message state instead of falling back to a
+            # duplicate sendMessage.
+            if (
+                response.status_code == 400
+                and "message is not modified" in description.casefold()
+            ):
+                HEALTH.mark("telegram", ok=True, detail=f"message {message_id} unchanged")
+                structured_log(
+                    logging.INFO,
+                    "notify.edit_already_applied",
+                    messageId=message_id,
+                )
+                return True
+            structured_log(
+                logging.WARNING,
+                "notify.edit_rejected",
+                httpStatus=response.status_code,
+                telegramError=_safe_error(description, config.telegram_bot_token),
+            )
+        response.raise_for_status()
+        result = response.json().get("result")
+        if not isinstance(result, dict) or int(result.get("message_id")) != int(message_id):
+            raise ValueError("Telegram edit response did not identify the requested message")
+        HEALTH.mark("telegram", ok=True, detail=f"message {message_id} edited")
+        return True
+    except (requests.RequestException, KeyError, ValueError, TypeError) as error:
+        safe_error = _safe_error(error, config.telegram_bot_token)
+        HEALTH.mark("telegram", ok=False, detail=safe_error)
+        structured_log(logging.WARNING, "notify.edit_failed", error=safe_error)
+        return False
 
 
 def send_alert(session: requests.Session, config: Config, alert: Alert) -> int | None:
@@ -459,14 +700,72 @@ def send_alert(session: requests.Session, config: Config, alert: Alert) -> int |
         return -1
 
     state = telegram_state(config)
-    payload = {
+    payload: dict = {
         "text": text,
         "link_preview_options": {"is_disabled": True},
         # Severity 1-2 lands silently; 3+ buzzes the phone.
         "disable_notification": alert.classification.severity <= 2,
     }
-    if bool(getattr(config, "telegram_controls_enabled", False)):
-        payload["reply_markup"] = feedback_markup(alert.item.guid)
+    controls_enabled = bool(getattr(config, "telegram_controls_enabled", False))
+    if controls_enabled:
+        payload["reply_markup"] = feedback_markup(alert.item)
+
+    edit_target = state.coalescing_target(alert)
+    if edit_target is not None:
+        # A lower-urgency corroboration may improve the facts but must never
+        # visually downgrade the original alert's severity.
+        display_alert = alert
+        if alert.classification.severity < edit_target.severity:
+            display_alert = replace(
+                alert,
+                classification=replace(
+                    alert.classification,
+                    severity=edit_target.severity,
+                ),
+            )
+        edit_payload = {
+            "text": format_alert(display_alert),
+            "link_preview_options": {"is_disabled": True},
+        }
+        current_token = alert_token(alert.item)
+        if controls_enabled:
+            edit_payload["reply_markup"] = feedback_markup_for_token(
+                current_token,
+                selected=state.feedback_verdict(current_token),
+            )
+        if _edit(session, config, edit_target.message_id, edit_payload):
+            try:
+                state_recorded = state.record_edited(
+                    display_alert,
+                    edit_target.message_id,
+                    edit_target.token,
+                )
+            except Exception as error:  # noqa: BLE001 - retain outbox and retry
+                state_recorded = False
+                structured_log(
+                    logging.ERROR,
+                    "notify.edit_state_failed",
+                    errorType=type(error).__name__,
+                )
+            if not state_recorded:
+                structured_log(
+                    logging.ERROR,
+                    "notify.edit_not_committed",
+                    player=alert.item.player_name,
+                    eventType=alert.classification.event_type,
+                    messageId=edit_target.message_id,
+                )
+                return None
+            structured_log(
+                logging.INFO,
+                "notify.edited",
+                player=alert.item.player_name,
+                tier=alert.tier,
+                severity=alert.classification.severity,
+                eventType=alert.classification.event_type,
+            )
+            return edit_target.message_id
+
     previous = state.previous_message_id(alert.item.player_name)
     if previous is not None:
         # Reply to the most recent alert, not the oldest root. This rolling

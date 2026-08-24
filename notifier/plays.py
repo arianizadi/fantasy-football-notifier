@@ -21,8 +21,8 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any
 
-from .matcher import compact_key
-from .models import LeagueRef, RosterSnapshot
+from .matcher import compact_key, player_name_in_text
+from .models import LeagueRef, RosterCapacity, RosterSnapshot
 
 SKILL_POSITIONS = frozenset({"QB", "RB", "WR", "TE"})
 # Sleeper overall rank. Applied only to DEEPER candidates: the immediate next
@@ -78,6 +78,17 @@ class Beneficiary:
     depth_order: int | None
     state: str  # "free_agent" | "mine" | "rostered"
     fantasy_team: str = ""
+    named_in_report: bool = False
+    pro_team: str = ""
+    # Cached, scoring-specific FantasyPros consensus context. These fields can
+    # rank/corroborate Sleeper-generated options but never establish a role or
+    # live league availability.
+    fantasypros_waiver_rank: int | None = None
+    fantasypros_waiver_pos_rank: str = ""
+    fantasypros_ros_rank: int | None = None
+    fantasypros_ros_pos_rank: str = ""
+    fantasypros_scoring: str = ""
+    fantasypros_updated_at: str = ""
 
 
 @dataclass(frozen=True)
@@ -117,6 +128,8 @@ class LeaguePlays:
     subject_owner: str
     beneficiaries: list[Beneficiary] = field(default_factory=list)
     bench_options: list[str] = field(default_factory=list)
+    capacity: RosterCapacity | None = None
+    scoring_format: str = ""
 
     @property
     def claimable(self) -> list[Beneficiary]:
@@ -327,7 +340,11 @@ class DepthCharts:
         return context
 
     def build(
-        self, *, subject_names: tuple[str, ...], snapshot: RosterSnapshot
+        self,
+        *,
+        subject_names: tuple[str, ...],
+        snapshot: RosterSnapshot,
+        report_text: str = "",
     ) -> tuple[dict[str, Any] | None, list[LeaguePlays]]:
         record = self.lookup(*subject_names)
         if record is None:
@@ -342,19 +359,24 @@ class DepthCharts:
         # `position` not `depth_chart_position`: a RWR going down promotes the
         # next WR regardless of which side he lines up on.
         candidates: list[dict[str, Any]] = []
-        if team and position in SKILL_POSITIONS:
+        if team and position in SKILL_POSITIONS and order is not None:
+            successors: list[dict[str, Any]] = []
             for candidate in self._by_team_position.get((team, position), []):
                 if candidate.get("full_name") == subject_name:
                     continue
                 candidate_order = candidate.get("depth_chart_order")
-                if order is not None and (candidate_order is None or candidate_order <= order):
+                if candidate_order is None or candidate_order <= order:
                     continue
-                is_next_man_up = (
-                    order is not None and candidate_order == order + 1
-                ) or (order is None and not candidates)
+                successors.append(candidate)
+
+            for successor_index, candidate in enumerate(successors):
                 rank = candidate.get("search_rank")
+                # Sleeper order values sometimes contain gaps, and search_rank
+                # describes search relevance rather than expected workload.
+                # Always retain the nearest two sorted successors so an
+                # unsettled backfield can surface both plausible options.
                 if (
-                    not is_next_man_up
+                    successor_index >= 2
                     and rank is not None
                     and rank > MAX_USEFUL_SEARCH_RANK
                 ):
@@ -368,7 +390,13 @@ class DepthCharts:
         # a free agent. Activate each league only after its own roster is present.
         for league in snapshot.drafted_leagues():
             state, owner = self._state(league.key, subject_name)
-            plays = LeaguePlays(league=league, subject_state=state, subject_owner=owner)
+            plays = LeaguePlays(
+                league=league,
+                subject_state=state,
+                subject_owner=owner,
+                capacity=snapshot.capacities.get(league.key),
+                scoring_format=snapshot.scoring_formats.get(league.key, ""),
+            )
 
             for candidate in candidates:
                 name = candidate.get("full_name") or ""
@@ -380,6 +408,11 @@ class DepthCharts:
                         depth_order=candidate.get("depth_chart_order"),
                         state=cand_state,
                         fantasy_team=cand_owner,
+                        named_in_report=(
+                            bool(report_text)
+                            and player_name_in_text(name, report_text)
+                        ),
+                        pro_team=str(candidate.get("team") or ""),
                     )
                 )
 
@@ -403,4 +436,8 @@ def plays_context_for_model(per_league: list[LeaguePlays]) -> str:
     if not per_league or not per_league[0].beneficiaries:
         return ""
     names = [f"{b.name} (depth {b.depth_order})" for b in per_league[0].beneficiaries]
-    return "Next up on the NFL depth chart: " + ", ".join(names)
+    return (
+        "Sleeper lists these players after the subject: "
+        + ", ".join(names)
+        + ". This order does not confirm a starter, workload, or touch share."
+    )

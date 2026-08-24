@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -18,9 +19,29 @@ class NewsItem:
     body: str
     url: str
     published_at: datetime | None
+    # X posts can name an injured starter and several possible replacements.
+    # Mechanical roster moves are allowed only when deterministic source
+    # parsing confidently attributes the report to this subject.
+    subject_confident: bool = True
 
     def fingerprint_text(self) -> str:
         return f"{self.player_name}|{self.headline}"
+
+
+def report_revision_identity(item: NewsItem) -> str:
+    """Return a stable identity for one exact upstream report revision.
+
+    Some feeds reuse a source GUID while changing the headline or body.  A
+    GUID therefore identifies the upstream object, not necessarily the exact
+    text the user saw.  Length-prefixing the raw identity fields avoids
+    separator ambiguity while keeping true byte-for-byte duplicates stable.
+    """
+    digest = hashlib.sha256()
+    for value in (item.source, item.guid, item.headline, item.body):
+        encoded = (value or "").encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, byteorder="big"))
+        digest.update(encoded)
+    return digest.hexdigest()
 
 
 @dataclass(frozen=True)
@@ -74,11 +95,31 @@ class RosterPlayer:
         return self.lineup_slot.strip().upper() in {"BE", "BN", "BENCH"}
 
 
+@dataclass(frozen=True)
+class RosterCapacity:
+    """Current occupancy and configured limits for one fantasy roster.
+
+    The values are provider facts, not inferred from player injury status.
+    ``None`` means the provider did not return enough information to make a
+    trustworthy claim, so formatters should omit that value.
+    """
+
+    bench_used: int | None = None
+    bench_limit: int | None = None
+    ir_used: int | None = None
+    ir_limit: int | None = None
+
+
 @dataclass
 class RosterSnapshot:
     generated_at: datetime | None
     leagues: list[LeagueRef] = field(default_factory=list)
     players: list[RosterPlayer] = field(default_factory=list)
+    capacities: dict[str, RosterCapacity] = field(default_factory=dict)
+    # FantasyPros publishes scoring-specific rankings. Keep the provider's
+    # actual reception scoring beside each league rather than guessing one
+    # global format for both ESPN and Sleeper.
+    scoring_formats: dict[str, str] = field(default_factory=dict)
 
     def mine(self, league_key: str | None = None) -> list[RosterPlayer]:
         return [

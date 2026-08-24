@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..matcher import compact_key
+from ..matcher import compact_key, player_name_in_text
 
 # Handles verified against the X API and volume measured over a real 7-day
 # window (posts/day excluding retweets and replies), because reads are billed
@@ -104,7 +104,7 @@ class PlayerNameIndex:
                     continue
                 key = compact_key(" ".join(words[index : index + size]))
                 name = self._names.get(key)
-                if name and key not in seen:
+                if name and key not in seen and player_name_in_text(name, text):
                     found.append(name)
                     seen.add(key)
                     index += size - 1

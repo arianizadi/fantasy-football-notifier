@@ -12,7 +12,7 @@ from typing import Any
 import requests
 
 from ..logging_utils import NotifierError, structured_log
-from ..models import LeagueRef, RosterPlayer
+from ..models import LeagueRef, RosterCapacity, RosterPlayer
 
 BASE_URL = "https://api.sleeper.app/v1"
 REQUEST_TIMEOUT = 20
@@ -25,6 +25,37 @@ BENCH_SLOT = "BE"
 RESERVE_SLOT = "RESERVE"
 TAXI_SLOT = "TAXI"
 NFL_INACTIVE_SLOT = "NFL_INACTIVE"
+
+
+def _player_ids(values: Any) -> set[str]:
+    """Normalize Sleeper roster ids while discarding empty placeholders."""
+    if not isinstance(values, list):
+        return set()
+    return {
+        str(value)
+        for value in values
+        if value is not None and str(value).strip() not in {"", "0", "None"}
+    }
+
+
+def _nonnegative_int(value: Any) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _scoring_format_from_receptions(value: Any) -> str:
+    try:
+        points = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if points >= 0.75:
+        return "PPR"
+    if points >= 0.25:
+        return "HALF"
+    return "STD"
 
 
 def roster_slot(
@@ -67,7 +98,7 @@ def fetch_league_rosters(
     league: dict[str, Any],
     user_id: str,
     player_index: dict[str, Any],
-) -> tuple[LeagueRef, list[RosterPlayer]]:
+) -> tuple[LeagueRef, list[RosterPlayer], RosterCapacity, str]:
     league_id = str(league.get("league_id"))
     league_name = str(league.get("name") or f"Sleeper {league_id}")
 
@@ -92,15 +123,20 @@ def fetch_league_rosters(
         name=league_name,
         my_team_name=team_names.get(user_id, "My Team"),
     )
-
     players: list[RosterPlayer] = []
-    for roster in rosters.json() or []:
+    raw_rosters = rosters.json() or []
+    my_roster: dict[str, Any] | None = None
+    for roster in raw_rosters:
+        if not isinstance(roster, dict):
+            continue
         owner_id = str(roster.get("owner_id") or "")
         is_mine = owner_id == user_id
+        if is_mine:
+            my_roster = roster
         fantasy_team = team_names.get(owner_id, f"Team {roster.get('roster_id')}")
-        starters = {str(p) for p in (roster.get("starters") or []) if p}
-        reserve = {str(p) for p in (roster.get("reserve") or []) if p}
-        taxi = {str(p) for p in (roster.get("taxi") or []) if p}
+        starters = _player_ids(roster.get("starters"))
+        reserve = _player_ids(roster.get("reserve"))
+        taxi = _player_ids(roster.get("taxi"))
         for player_id in roster.get("players") or []:
             record = player_index.get(str(player_id))
             if not record or not record.get("full_name"):
@@ -123,6 +159,52 @@ def fetch_league_rosters(
                 )
             )
 
+    positions = league.get("roster_positions")
+    bench_limit = (
+        sum(
+            str(position).strip().upper() in {"BN", "BE", "BENCH"}
+            for position in positions
+        )
+        if isinstance(positions, list)
+        else None
+    )
+    league_settings = league.get("settings") or {}
+    if not isinstance(league_settings, dict):
+        league_settings = {}
+    ir_limit = _nonnegative_int(league_settings.get("reserve_slots"))
+    if ir_limit is None and isinstance(positions, list):
+        ir_limit = sum(
+            str(position).strip().upper() in {"IR", "RESERVE"}
+            for position in positions
+        )
+
+    bench_used: int | None = None
+    ir_used: int | None = None
+    if my_roster is not None:
+        rostered = _player_ids(my_roster.get("players"))
+        starters = _player_ids(my_roster.get("starters"))
+        reserve = _player_ids(my_roster.get("reserve"))
+        taxi = _player_ids(my_roster.get("taxi"))
+        # Count raw roster membership, not the normalized lineup_slot. An NFL
+        # inactive player still consumes an ordinary bench slot even though
+        # lineup safety labels that player NFL_INACTIVE elsewhere.
+        bench_used = len(rostered - starters - reserve - taxi)
+        ir_used = len(reserve)
+
+    capacity = RosterCapacity(
+        bench_used=bench_used,
+        bench_limit=bench_limit,
+        ir_used=ir_used,
+        ir_limit=ir_limit,
+    )
+
+    scoring_settings = league.get("scoring_settings")
+    scoring_format = ""
+    if isinstance(scoring_settings, dict):
+        scoring_format = _scoring_format_from_receptions(
+            scoring_settings.get("rec", 0)
+        )
+
     structured_log(
         logging.INFO,
         "sleeper.league_loaded",
@@ -130,4 +212,4 @@ def fetch_league_rosters(
         myPlayerCount=sum(1 for p in players if p.on_my_team),
         leaguePlayerCount=len(players),
     )
-    return ref, players
+    return ref, players, capacity, scoring_format

@@ -132,9 +132,25 @@ def test_fetch_league_rosters_preserves_reserve_taxi_and_nfl_status() -> None:
         "5": {"full_name": "Inactive", "position": "TE", "team": "SF", "status": "PUP"},
     }
 
-    _, players = fetch_league_rosters(
+    _, players, capacity, scoring_format = fetch_league_rosters(
         session,
-        {"league_id": "123", "name": "Dynasty"},
+        {
+            "league_id": "123",
+            "name": "Dynasty",
+            "roster_positions": [
+                "QB",
+                "RB",
+                "WR",
+                "TE",
+                "BN",
+                "BN",
+                "BN",
+                "BN",
+                "BN",
+            ],
+            "settings": {"reserve_slots": 1},
+            "scoring_settings": {"rec": 0.5},
+        },
         "me",
         index,
     )
@@ -146,6 +162,13 @@ def test_fetch_league_rosters_preserves_reserve_taxi_and_nfl_status() -> None:
         "Taxi": TAXI_SLOT,
         "Inactive": NFL_INACTIVE_SLOT,
     }
+    # The PUP player still occupies a normal bench slot in Sleeper's raw
+    # roster even though lineup safety labels him NFL_INACTIVE.
+    assert capacity.bench_used == 2
+    assert capacity.bench_limit == 5
+    assert capacity.ir_used == 1
+    assert capacity.ir_limit == 1
+    assert scoring_format == "HALF"
 
 
 def test_cached_player_index_carries_cache_freshness(tmp_path) -> None:

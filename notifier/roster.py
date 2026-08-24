@@ -20,7 +20,7 @@ import requests
 
 from .config import Config, roster_path
 from .logging_utils import NotifierError, structured_log
-from .models import LeagueRef, RosterPlayer, RosterSnapshot
+from .models import LeagueRef, RosterCapacity, RosterPlayer, RosterSnapshot
 
 SNAPSHOT_VERSION = 2
 
@@ -115,6 +115,68 @@ def _as_int(value: Any, default: int = -1) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _optional_nonnegative_int(value: Any) -> int | None:
+    parsed = _as_int(value)
+    return parsed if parsed >= 0 else None
+
+
+def _scoring_format_from_receptions(value: Any) -> str:
+    """Map reception points to the closest FantasyPros scoring enum."""
+    try:
+        points = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if points >= 0.75:
+        return "PPR"
+    if points >= 0.25:
+        return "HALF"
+    return "STD"
+
+
+def _espn_scoring_format(settings: dict[str, Any]) -> str:
+    scoring = settings.get("scoringSettings")
+    if not isinstance(scoring, dict):
+        return ""
+    items = scoring.get("scoringItems")
+    if not isinstance(items, list):
+        return ""
+    # ESPN stat id 53 is a reception. Its absence in an otherwise complete
+    # scoring list means standard/non-PPR scoring.
+    for item in items:
+        if isinstance(item, dict) and _as_int(item.get("statId")) == 53:
+            return _scoring_format_from_receptions(item.get("points"))
+    return "STD"
+
+
+def _espn_capacity(
+    settings: dict[str, Any], my_team: dict[str, Any]
+) -> RosterCapacity:
+    """Read bench/IR limits and occupancy from ESPN's existing mSettings view."""
+    roster_settings = settings.get("rosterSettings") or {}
+    if not isinstance(roster_settings, dict):
+        roster_settings = {}
+    counts = roster_settings.get("lineupSlotCounts") or {}
+    if not isinstance(counts, dict):
+        counts = {}
+
+    def limit(slot_id: int) -> int | None:
+        return _optional_nonnegative_int(counts.get(str(slot_id), counts.get(slot_id)))
+
+    roster = my_team.get("roster") or {}
+    entries = (roster.get("entries") or []) if isinstance(roster, dict) else []
+    slot_ids = [
+        _as_int(entry.get("lineupSlotId"))
+        for entry in entries
+        if isinstance(entry, dict)
+    ]
+    return RosterCapacity(
+        bench_used=sum(slot_id == 20 for slot_id in slot_ids),
+        bench_limit=limit(20),
+        ir_used=sum(slot_id == 21 for slot_id in slot_ids),
+        ir_limit=limit(21),
+    )
 
 
 def _find_my_espn_team(teams: list[dict[str, Any]], config: Config) -> dict[str, Any]:
@@ -221,7 +283,7 @@ def _espn_payload(config: Config, session: requests.Session) -> dict[str, Any]:
 
 def _load_espn(
     config: Config, session: requests.Session
-) -> tuple[LeagueRef, list[RosterPlayer]]:
+) -> tuple[LeagueRef, list[RosterPlayer], RosterCapacity, str]:
     payload = _espn_payload(config, session)
     teams = payload.get("teams") or []
     if not isinstance(teams, list):
@@ -232,6 +294,7 @@ def _load_espn(
     settings = payload.get("settings") or {}
     if not isinstance(settings, dict):
         settings = {}
+    capacity = _espn_capacity(settings, my_team)
 
     ref = LeagueRef(
         provider="espn",
@@ -273,12 +336,12 @@ def _load_espn(
         myPlayerCount=sum(1 for p in players if p.on_my_team),
         leaguePlayerCount=len(players),
     )
-    return ref, players
+    return ref, players, capacity, _espn_scoring_format(settings)
 
 
 def _load_sleeper(
     config: Config, session: requests.Session
-) -> list[tuple[LeagueRef, list[RosterPlayer]]]:
+) -> list[tuple[LeagueRef, list[RosterPlayer], RosterCapacity, str]]:
     from .sources import sleeper, sleeper_league
 
     player_index = sleeper.load_player_index(config.state_dir, session)
@@ -302,16 +365,26 @@ def refresh_snapshot(config: Config) -> RosterSnapshot:
     session = requests.Session()
     leagues: list[LeagueRef] = []
     players: list[RosterPlayer] = []
+    capacities: dict[str, RosterCapacity] = {}
+    scoring_formats: dict[str, str] = {}
     try:
         if config.espn_enabled:
-            ref, espn_players = _load_espn(config, session)
+            ref, espn_players, capacity, scoring_format = _load_espn(config, session)
             leagues.append(ref)
             players.extend(espn_players)
+            capacities[ref.key] = capacity
+            if scoring_format:
+                scoring_formats[ref.key] = scoring_format
 
         if config.sleeper_username:
-            for ref, sleeper_players in _load_sleeper(config, session):
+            for ref, sleeper_players, capacity, scoring_format in _load_sleeper(
+                config, session
+            ):
                 leagues.append(ref)
                 players.extend(sleeper_players)
+                capacities[ref.key] = capacity
+                if scoring_format:
+                    scoring_formats[ref.key] = scoring_format
     finally:
         session.close()
 
@@ -321,7 +394,11 @@ def refresh_snapshot(config: Config) -> RosterSnapshot:
         )
 
     snapshot = RosterSnapshot(
-        generated_at=datetime.now(timezone.utc), leagues=leagues, players=players
+        generated_at=datetime.now(timezone.utc),
+        leagues=leagues,
+        players=players,
+        capacities=capacities,
+        scoring_formats=scoring_formats,
     )
     _write_snapshot(roster_path(config), snapshot)
 
@@ -348,6 +425,19 @@ def _write_snapshot(path: Path, snapshot: RosterSnapshot) -> None:
             }
             for ref in snapshot.leagues
         ],
+        # Additive to snapshot version 2 so a pre-feature production snapshot
+        # remains loadable during deployment and an older rollback safely
+        # ignores the extra root field.
+        "capacities": {
+            league_key: {
+                "benchUsed": capacity.bench_used,
+                "benchLimit": capacity.bench_limit,
+                "irUsed": capacity.ir_used,
+                "irLimit": capacity.ir_limit,
+            }
+            for league_key, capacity in snapshot.capacities.items()
+        },
+        "scoringFormats": snapshot.scoring_formats,
         "players": [
             {
                 "name": p.name,
@@ -386,6 +476,12 @@ def load_snapshot(config: Config) -> RosterSnapshot:
         raise NotifierError("Roster snapshot version mismatch; re-run bin/refresh-roster.py.")
 
     generated_raw = payload.get("generatedAt")
+    raw_capacities = payload.get("capacities") or {}
+    if not isinstance(raw_capacities, dict):
+        raw_capacities = {}
+    raw_scoring_formats = payload.get("scoringFormats") or {}
+    if not isinstance(raw_scoring_formats, dict):
+        raw_scoring_formats = {}
     return RosterSnapshot(
         generated_at=datetime.fromisoformat(generated_raw) if generated_raw else None,
         leagues=[
@@ -409,6 +505,21 @@ def load_snapshot(config: Config) -> RosterSnapshot:
             )
             for e in payload.get("players", [])
         ],
+        capacities={
+            str(league_key): RosterCapacity(
+                bench_used=_optional_nonnegative_int(entry.get("benchUsed")),
+                bench_limit=_optional_nonnegative_int(entry.get("benchLimit")),
+                ir_used=_optional_nonnegative_int(entry.get("irUsed")),
+                ir_limit=_optional_nonnegative_int(entry.get("irLimit")),
+            )
+            for league_key, entry in raw_capacities.items()
+            if isinstance(entry, dict)
+        },
+        scoring_formats={
+            str(league_key): str(scoring_format).upper()
+            for league_key, scoring_format in raw_scoring_formats.items()
+            if str(scoring_format).upper() in {"STD", "HALF", "PPR"}
+        },
     )
 
 

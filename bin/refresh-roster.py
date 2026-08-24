@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Refresh the cached ESPN roster snapshot. Run from cron a few times a day."""
+"""Refresh cached ESPN/Sleeper rosters and capacity. Run from cron."""
 
 from __future__ import annotations
 
@@ -38,6 +38,21 @@ def main() -> int:
         mine = snapshot.mine(league.key)
         print(f"\n{league.provider.upper()}  {league.name}  —  {league.my_team_name}  "
               f"({len(mine)} players)")
+        capacity = snapshot.capacities.get(league.key)
+        scoring_format = snapshot.scoring_formats.get(league.key)
+        if scoring_format:
+            print(f"  Scoring: {scoring_format}")
+        if capacity is not None:
+            values = []
+            if (
+                capacity.bench_used is not None
+                and capacity.bench_limit is not None
+            ):
+                values.append(f"bench {capacity.bench_used}/{capacity.bench_limit}")
+            if capacity.ir_used is not None and capacity.ir_limit is not None:
+                values.append(f"IR {capacity.ir_used}/{capacity.ir_limit}")
+            if values:
+                print("  Roster occupancy: " + " · ".join(values))
         for player in sorted(mine, key=lambda e: (e.position, e.name)):
             print(f"  {player.lineup_slot:<6} {player.name:<26} "
                   f"{player.position:<4} {player.pro_team}")

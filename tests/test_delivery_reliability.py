@@ -7,12 +7,23 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from notifier.dedupe import SeenStore, event_status
-from notifier.models import Alert, Classification, LeagueRef, NewsItem, RosterSnapshot
-from notifier.outbox import DeliveryOutbox
-from notifier.pipeline import Notifier
+import pytest
+
+from notifier.classify import _fallback
+from notifier.dedupe import SeenStore, event_fact_signature, event_status
+from notifier.models import (
+    Alert,
+    Classification,
+    LeagueRef,
+    NewsItem,
+    RosterCapacity,
+    RosterSnapshot,
+)
+from notifier.outbox import DeliveryOutbox, _news_item
+from notifier.pipeline import Notifier, _alert_supersedes
 from notifier.notify import format_alert
 from notifier.plays import Beneficiary, DepthEntry, LeaguePlays, TeamContext
+from notifier.sources.twitter import TwitterStream
 
 
 def _item(
@@ -53,9 +64,35 @@ def _notifier(tmp_path, *, dry_run: bool = False) -> Notifier:
     notifier.outbox = DeliveryOutbox(tmp_path)
     notifier._state_lock = threading.RLock()
     notifier._delivery_lock = threading.RLock()
-    notifier._inflight_guids = set()
-    notifier._inflight_fingerprints = set()
+    notifier._inflight_items = {}
     return notifier
+
+
+def _event_row(
+    alert: Alert,
+    *,
+    received_at: datetime,
+    outcome: str = "delivered",
+) -> dict:
+    item = alert.item
+    classification = alert.classification
+    return {
+        "guid": item.guid,
+        "source": item.source,
+        "player_name": item.player_name,
+        "headline": item.headline,
+        "body": item.body,
+        "url": item.url,
+        "published_at": item.published_at.isoformat() if item.published_at else None,
+        "received_at": received_at.isoformat(),
+        "updated_at": received_at.isoformat(),
+        "event_type": classification.event_type,
+        "severity": classification.severity,
+        "summary": classification.fantasy_impact,
+        "is_actionable": classification.is_actionable,
+        "tier": alert.tier,
+        "outcome": outcome,
+    }
 
 
 def test_failed_send_stays_in_durable_outbox_and_dedupe_is_unmodified(
@@ -110,6 +147,327 @@ def test_pending_alert_replays_after_failure_then_finalizes_dedupe(
     )
 
 
+def test_zero_attempt_restart_revalidates_beneficiary_before_replay(
+    tmp_path, monkeypatch
+) -> None:
+    notifier = _notifier(tmp_path)
+    item = _item("twitter:crash-before-send")
+    league = LeagueRef("sleeper", "123", "Home", "Mine")
+    plays = LeaguePlays(
+        league=league,
+        subject_state="mine",
+        subject_owner="Mine",
+        beneficiaries=[Beneficiary("Backup Player", "RB", 2, "free_agent")],
+    )
+    alert = replace(_alert(item), per_league=[plays])
+    pending = notifier.outbox.add(alert, observed_at=10)
+    assert pending.attempts == 0
+    revalidated = replace(alert, delivery_delayed=True)
+    notifier._revalidate_delayed_alert = Mock(return_value=revalidated)
+    send = Mock(return_value=79)
+    monkeypatch.setattr("notifier.pipeline.send_alert", send)
+
+    assert notifier.deliver_pending() == 1
+
+    notifier._revalidate_delayed_alert.assert_called_once_with(pending)
+    assert send.call_args.args[2].delivery_delayed is True
+    assert len(notifier.outbox) == 0
+
+
+def test_removed_due_snapshot_entry_cannot_send_or_reschedule(
+    tmp_path, monkeypatch
+) -> None:
+    notifier = _notifier(tmp_path)
+    pending = notifier.outbox.add(_alert(_item("twitter:detached")))
+    detached = notifier.outbox.due(float("inf"))[0]
+    notifier.outbox.remove(pending.delivery_id)
+    send = Mock(return_value=80)
+    monkeypatch.setattr("notifier.pipeline.send_alert", send)
+
+    assert notifier._attempt_pending_locked(detached, replay=True) == 0
+
+    send.assert_not_called()
+    assert len(notifier.outbox) == 0
+
+
+def test_pending_literal_duplicate_is_blocked_but_same_guid_revision_escalates(
+    tmp_path, monkeypatch
+) -> None:
+    notifier = _notifier(tmp_path)
+    headline = "Example Player injury update"
+    initial = replace(
+        _item("twitter:shared-guid", headline=headline),
+        body="Example Player is questionable with an ankle injury.",
+    )
+    escalated = replace(
+        initial,
+        body="Example Player has been ruled out with an ankle injury.",
+    )
+    send = Mock(side_effect=[None, 71])
+    monkeypatch.setattr("notifier.pipeline.send_alert", send)
+
+    assert notifier._claim_item(initial)
+    assert notifier._complete_evaluation(initial, _alert(initial, 3, "injury")) == 0
+    assert not notifier._claim_item(initial)
+
+    assert notifier._claim_item(escalated)
+    assert notifier._complete_evaluation(escalated, _alert(escalated, 5, "injury")) == 1
+
+    assert send.call_count == 2
+    assert send.call_args_list[1].args[2].item.body == escalated.body
+    assert len(notifier.outbox) == 0
+
+
+def test_outbox_delivery_ids_are_unambiguous_when_report_text_contains_pipes(
+    tmp_path,
+) -> None:
+    outbox = DeliveryOutbox(tmp_path)
+    first_item = replace(
+        _item("twitter:pipe-collision", headline="Example|Player"),
+        body="role update",
+    )
+    second_item = replace(
+        first_item,
+        headline="Example",
+        body="Player|role update",
+    )
+
+    first = outbox.add(_alert(first_item, 3, "other"))
+    second = outbox.add(_alert(second_item, 3, "other"))
+
+    assert first.delivery_id != second.delivery_id
+    assert len(outbox) == 2
+
+
+@pytest.mark.parametrize(
+    ("body", "severity", "remaining"),
+    [
+        ("Example Player has been ruled out with a concussion.", 5, 0),
+        ("Example Player is questionable with a concussion.", 3, 1),
+        (
+            "Example Player is questionable with an ankle injury and is "
+            "expected to miss 4 to 6 weeks.",
+            3,
+            0,
+        ),
+    ],
+)
+def test_same_headline_new_guid_reaches_status_condition_and_timetable_logic(
+    tmp_path, monkeypatch, body, severity, remaining
+) -> None:
+    notifier = _notifier(tmp_path)
+    headline = "Example Player injury update"
+    initial = replace(
+        _item("twitter:old", headline=headline),
+        body="Example Player is questionable with an ankle injury.",
+    )
+    update = replace(
+        _item("rotowire:new", source="rotowire", headline=headline),
+        body=body,
+    )
+    send = Mock(side_effect=[None, 72])
+    monkeypatch.setattr("notifier.pipeline.send_alert", send)
+
+    assert notifier._claim_item(initial)
+    assert notifier._complete_evaluation(initial, _alert(initial, 3, "injury")) == 0
+    assert notifier._claim_item(update)
+    assert notifier._complete_evaluation(update, _alert(update, severity, "injury")) == 1
+
+    assert send.call_count == 2
+    assert send.call_args_list[1].args[2].item.body == body
+    assert len(notifier.outbox) == remaining
+
+
+def test_newer_pending_return_retires_injury_even_with_zero_attempts(
+    tmp_path, monkeypatch
+) -> None:
+    notifier = _notifier(tmp_path)
+    injured_item = replace(
+        _item("twitter:injury", headline="Example Player injury update"),
+        body="Example Player was ruled out with an ankle injury.",
+        published_at=None,
+    )
+    returned_item = replace(
+        _item("twitter:return", headline="Example Player injury update"),
+        body="Example Player was cleared and returned to practice.",
+        published_at=None,
+    )
+    injured = notifier.outbox.add(
+        _alert(injured_item, 4, "injury"),
+        observed_at=10,
+    )
+    returned = notifier.outbox.add(
+        _alert(returned_item, 4, "return"),
+        observed_at=20,
+    )
+    send = Mock(return_value=81)
+    monkeypatch.setattr("notifier.pipeline.send_alert", send)
+
+    assert injured.attempts == 0
+    assert notifier._attempt_pending_locked(injured) == 0
+
+    send.assert_not_called()
+    assert [entry.delivery_id for entry in notifier.outbox.due(float("inf"))] == [
+        returned.delivery_id
+    ]
+
+
+def test_newer_pending_reinjury_retires_optimistic_return(
+    tmp_path, monkeypatch
+) -> None:
+    notifier = _notifier(tmp_path)
+    returned_item = replace(
+        _item("twitter:return", headline="Example Player update"),
+        body="Example Player was cleared and returned to practice.",
+        published_at=None,
+    )
+    reinjured_item = replace(
+        _item("twitter:reinjury", headline="Example Player update"),
+        body="Example Player was ruled out again with an ankle injury.",
+        published_at=None,
+    )
+    returned = notifier.outbox.add(
+        _alert(returned_item, 3, "return"),
+        observed_at=10,
+    )
+    reinjured = notifier.outbox.add(
+        _alert(reinjured_item, 5, "injury"),
+        observed_at=20,
+    )
+    send = Mock(return_value=82)
+    monkeypatch.setattr("notifier.pipeline.send_alert", send)
+
+    assert notifier._attempt_pending_locked(returned) == 0
+
+    send.assert_not_called()
+    assert [entry.delivery_id for entry in notifier.outbox.due(float("inf"))] == [
+        reinjured.delivery_id
+    ]
+
+
+def test_distinct_same_severity_usage_facts_remain_pending(tmp_path) -> None:
+    notifier = _notifier(tmp_path)
+    starter_item = replace(
+        _item("twitter:starter", headline="Example Player role update"),
+        body="Example Player will start this week.",
+        published_at=None,
+    )
+    goal_line_item = replace(
+        _item("twitter:goal-line", headline="Example Player role update"),
+        body="Example Player will handle the goal-line work.",
+        published_at=None,
+    )
+    starter = _alert(starter_item, 3, "usage")
+    goal_line = _alert(goal_line_item, 3, "usage")
+    older = notifier.outbox.add(starter, observed_at=10)
+    newer = notifier.outbox.add(goal_line, observed_at=20)
+
+    assert _alert_supersedes(starter, goal_line) is False
+    assert notifier._pending_is_superseded(older) is False
+    assert [entry.delivery_id for entry in notifier.outbox.due(float("inf"))] == [
+        older.delivery_id,
+        newer.delivery_id,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("old_body", "new_body", "old_severity", "new_severity"),
+    [
+        (
+            "Example Player is questionable with an ankle injury.",
+            "Example Player has been ruled out with an ankle injury.",
+            3,
+            5,
+        ),
+        (
+            "Example Player was ruled out with an ankle injury.",
+            "Example Player remains ruled out with an ankle injury.",
+            4,
+            4,
+        ),
+    ],
+)
+def test_older_retry_is_suppressed_after_newer_same_event_delivery(
+    tmp_path, monkeypatch, old_body, new_body, old_severity, new_severity
+) -> None:
+    notifier = _notifier(tmp_path)
+    old_time = datetime(2026, 8, 23, 12, tzinfo=timezone.utc)
+    new_time = datetime(2026, 8, 23, 12, 5, tzinfo=timezone.utc)
+    headline = "Example Player injury update"
+    old_item = replace(
+        _item("twitter:old", headline=headline),
+        body=old_body,
+        published_at=old_time,
+    )
+    new_item = replace(
+        _item("rotowire:new", source="rotowire", headline=headline),
+        body=new_body,
+        published_at=new_time,
+    )
+    old = notifier.outbox.add(
+        _alert(old_item, old_severity, "injury"),
+        observed_at=old_time.timestamp(),
+    )
+    old.attempts = 1
+    newer = _alert(new_item, new_severity, "injury")
+    notifier.events = SimpleNamespace(
+        recent_for_player=Mock(
+            return_value=[_event_row(newer, received_at=new_time)]
+        ),
+        mark_outcome=Mock(),
+    )
+    send = Mock(return_value=91)
+    monkeypatch.setattr("notifier.pipeline.send_alert", send)
+
+    assert notifier._attempt_pending_locked(old) == 0
+
+    send.assert_not_called()
+    assert len(notifier.outbox) == 0
+
+
+def test_later_distinct_condition_survives_older_delivered_condition(
+    tmp_path, monkeypatch
+) -> None:
+    notifier = _notifier(tmp_path)
+    old_time = datetime(2026, 8, 23, 12, tzinfo=timezone.utc)
+    new_time = datetime(2026, 8, 23, 12, 5, tzinfo=timezone.utc)
+    earlier_item = replace(
+        _item("twitter:ankle", headline="Example Player injury update"),
+        body="Example Player is questionable with an ankle injury.",
+        published_at=old_time,
+    )
+    later_item = replace(
+        _item("rotowire:concussion", source="rotowire", headline="Example Player injury update"),
+        body="Example Player is questionable with a concussion.",
+        published_at=new_time,
+    )
+    earlier = _alert(earlier_item, 3, "injury")
+    later = _alert(later_item, 3, "injury")
+    notifier.seen.record_semantic(
+        earlier.item.player_name,
+        earlier.classification.event_type,
+        earlier.classification.severity,
+        event_status(earlier.item, earlier.classification.event_type),
+        event_fact_signature(earlier.item),
+    )
+    pending = notifier.outbox.add(later, observed_at=new_time.timestamp())
+    pending.attempts = 1
+    notifier.events = SimpleNamespace(
+        recent_for_player=Mock(
+            return_value=[_event_row(earlier, received_at=old_time)]
+        ),
+        mark_outcome=Mock(),
+    )
+    send = Mock(return_value=92)
+    monkeypatch.setattr("notifier.pipeline.send_alert", send)
+
+    assert notifier._attempt_pending_locked(pending) == 1
+
+    send.assert_called_once()
+    assert send.call_args.args[2].item.body == later_item.body
+    assert len(notifier.outbox) == 0
+
+
 def test_dry_run_never_mutates_seen_or_outbox(tmp_path, monkeypatch) -> None:
     notifier = _notifier(tmp_path, dry_run=True)
     item = _item()
@@ -125,7 +483,7 @@ def test_dry_run_never_mutates_seen_or_outbox(tmp_path, monkeypatch) -> None:
 
 
 def test_outbox_round_trips_full_context(tmp_path) -> None:
-    item = _item()
+    item = replace(_item(), subject_confident=False)
     refreshed = datetime(2026, 8, 23, 11, 30, tzinfo=timezone.utc)
     context = TeamContext(
         team="SF",
@@ -143,11 +501,36 @@ def test_outbox_round_trips_full_context(tmp_path) -> None:
         ],
         player_index_refreshed_at=refreshed,
     )
+    league = LeagueRef("espn", "1", "Home", "Mine")
+    plays = LeaguePlays(
+        league=league,
+        subject_state="mine",
+        subject_owner="Mine",
+        beneficiaries=[
+            Beneficiary(
+                "Backup",
+                "RB",
+                2,
+                "free_agent",
+                named_in_report=True,
+                pro_team="ARI",
+                fantasypros_waiver_rank=34,
+                fantasypros_waiver_pos_rank="RB34",
+                fantasypros_ros_rank=55,
+                fantasypros_ros_pos_rank="RB55",
+                fantasypros_scoring="PPR",
+                fantasypros_updated_at="2026-08-23T18:00:00+00:00",
+            )
+        ],
+        capacity=RosterCapacity(bench_used=5, bench_limit=5, ir_used=0, ir_limit=1),
+        scoring_format="PPR",
+    )
     alert = _alert(item)
     alert = Alert(
         item=alert.item,
         classification=alert.classification,
         tier=alert.tier,
+        per_league=[plays],
         context=context,
         availability_refresh_failed=True,
         delivery_delayed=True,
@@ -160,8 +543,29 @@ def test_outbox_round_trips_full_context(tmp_path) -> None:
     assert restored.item.published_at == item.published_at
     assert restored.context.player_index_refreshed_at == refreshed
     assert restored.context.same_position[0].sleeper_injury_status == "Questionable"
+    assert restored.per_league[0].capacity == plays.capacity
+    assert restored.per_league[0].beneficiaries[0].named_in_report is True
+    assert restored.per_league[0].beneficiaries[0].pro_team == "ARI"
+    assert restored.per_league[0].beneficiaries[0].fantasypros_waiver_rank == 34
+    assert restored.per_league[0].beneficiaries[0].fantasypros_ros_pos_rank == "RB55"
+    assert restored.per_league[0].scoring_format == "PPR"
     assert restored.availability_refresh_failed is True
     assert restored.delivery_delayed is True
+    assert restored.item.subject_confident is False
+
+
+def test_legacy_outbox_news_item_defaults_to_confident_subject() -> None:
+    payload = {
+        "source": "twitter",
+        "guid": "old",
+        "player_name": "Example Player",
+        "headline": "Old alert",
+        "body": "Old alert",
+        "url": "",
+        "published_at": None,
+    }
+
+    assert _news_item(payload).subject_confident is True
 
 
 def test_semantic_dedupe_allows_severity_and_status_escalations(tmp_path) -> None:
@@ -176,6 +580,96 @@ def test_semantic_dedupe_allows_severity_and_status_escalations(tmp_path) -> Non
     assert not store.is_semantically_new("Example Player", "injury", 3, "limited")
 
 
+def test_semantic_dedupe_treats_a_distinct_condition_as_a_new_fact(tmp_path) -> None:
+    store = SeenStore(tmp_path / "seen.json")
+    ankle = _item(headline="Example Player has an ankle injury")
+    concussion = _item(
+        guid="twitter:2:Example Player",
+        headline="Example Player has a concussion",
+    )
+    store.record_semantic(
+        "Example Player",
+        "injury",
+        4,
+        "injury",
+        event_fact_signature(ankle),
+    )
+
+    assert store.is_semantically_new(
+        "Example Player",
+        "injury",
+        4,
+        "injury",
+        event_fact_signature(concussion),
+    )
+
+
+def test_semantic_dedupe_treats_a_new_injury_timetable_as_a_new_fact(tmp_path) -> None:
+    store = SeenStore(tmp_path / "seen.json")
+    initial = _item(headline="Example Player has an ankle injury")
+    timetable = _item(
+        guid="twitter:3:Example Player",
+        headline="Example Player is expected to miss 4 to 6 weeks with an ankle injury",
+    )
+    store.record_semantic(
+        "Example Player",
+        "injury",
+        4,
+        "injury",
+        event_fact_signature(initial),
+    )
+
+    assert store.is_semantically_new(
+        "Example Player",
+        "injury",
+        4,
+        "injury",
+        event_fact_signature(timetable),
+    )
+
+
+def test_semantic_dedupe_accepts_true_ruled_out_corroboration(tmp_path) -> None:
+    store = SeenStore(tmp_path / "seen.json")
+    first = _item(headline="Example Player was ruled out")
+    confirmation = _item(
+        guid="rotowire:2",
+        source="rotowire",
+        headline="Team confirms Example Player will not play",
+    )
+    store.record_semantic(
+        "Example Player",
+        "injury",
+        4,
+        event_status(first, "injury"),
+        event_fact_signature(first),
+    )
+
+    assert not store.is_semantically_new(
+        "Example Player",
+        "injury",
+        4,
+        event_status(confirmation, "injury"),
+        event_fact_signature(confirmation),
+    )
+
+
+def test_lower_severity_corroboration_does_not_forget_prior_urgency(tmp_path) -> None:
+    store = SeenStore(tmp_path / "seen.json")
+    report = _item(headline="Example Player was ruled out")
+    status = event_status(report, "injury")
+    signature = event_fact_signature(report)
+    store.record_semantic("Example Player", "injury", 4, status, signature)
+    store.record_semantic("Example Player", "injury", 3, status, signature)
+
+    assert not store.is_semantically_new(
+        "Example Player",
+        "injury",
+        4,
+        status,
+        signature,
+    )
+
+
 def test_early_dedupe_allows_body_only_status_escalation_for_same_guid(tmp_path) -> None:
     store = SeenStore(tmp_path / "seen.json")
     initial = replace(
@@ -188,6 +682,50 @@ def test_early_dedupe_allows_body_only_status_escalation_for_same_guid(tmp_path)
 
     reloaded = SeenStore(tmp_path / "seen.json")
     assert reloaded.is_new(escalated) is True
+
+
+def test_early_dedupe_allows_body_only_condition_change_for_same_guid(tmp_path) -> None:
+    store = SeenStore(tmp_path / "seen.json")
+    initial = replace(
+        _item(headline="Example Player injury update"),
+        body="Example Player has an ankle injury.",
+    )
+    new_condition = replace(initial, body="Example Player has a concussion.")
+    store.record(initial)
+    assert store.save()
+
+    reloaded = SeenStore(tmp_path / "seen.json")
+    assert reloaded.is_new(new_condition) is True
+
+
+def test_early_dedupe_rejects_exact_raw_revision_after_save_reload(tmp_path) -> None:
+    store = SeenStore(tmp_path / "seen.json")
+    report = replace(
+        _item(headline="Example Player role update"),
+        body="Example Player remains in a committee.",
+    )
+    store.record(report)
+    assert store.save()
+
+    reloaded = SeenStore(tmp_path / "seen.json")
+    assert reloaded.is_new(report) is False
+
+
+def test_early_dedupe_allows_generic_body_revision_for_same_guid(tmp_path) -> None:
+    store = SeenStore(tmp_path / "seen.json")
+    initial = replace(
+        _item(headline="Example Player role update"),
+        body="Example Player remains in a committee.",
+    )
+    changed = replace(
+        initial,
+        body="Example Player will start and handle the goal-line work.",
+    )
+    store.record(initial)
+    assert store.save()
+
+    reloaded = SeenStore(tmp_path / "seen.json")
+    assert reloaded.is_new(changed) is True
 
 
 def test_x_dispatcher_consumes_without_waiting_for_rss_poll(tmp_path) -> None:
@@ -227,6 +765,72 @@ def test_source_priority_lets_x_claim_semantic_slot(tmp_path, monkeypatch) -> No
 
     assert sent == 1
     assert delivered_sources == ["twitter"]
+
+
+def test_semantic_corroboration_reaches_existing_message_edit_path(
+    tmp_path, monkeypatch
+) -> None:
+    notifier = _notifier(tmp_path)
+    notifier.telegram_state = SimpleNamespace(
+        coalescing_target=Mock(return_value=object())
+    )
+    earlier = _alert(_item("twitter:first"))
+    notifier.seen.record_semantic(
+        earlier.item.player_name,
+        earlier.classification.event_type,
+        earlier.classification.severity,
+        event_status(earlier.item, earlier.classification.event_type),
+        event_fact_signature(earlier.item),
+    )
+    corroboration = _alert(
+        _item(
+            "rotowire:corroboration",
+            source="rotowire",
+            headline="Team confirms Example Player was ruled out",
+        )
+    )
+    send = Mock(return_value=77)
+    monkeypatch.setattr("notifier.pipeline.send_alert", send)
+
+    assert notifier._claim_item(corroboration.item)
+    assert notifier._complete_evaluation(corroboration.item, corroboration) == 1
+
+    send.assert_called_once()
+    notifier.telegram_state.coalescing_target.assert_called()
+    assert len(notifier.outbox) == 0
+    assert not notifier.seen.is_new(corroboration.item)
+
+
+def test_failed_coalesced_edit_remains_retryable(tmp_path, monkeypatch) -> None:
+    notifier = _notifier(tmp_path)
+    notifier.telegram_state = SimpleNamespace(
+        coalescing_target=Mock(return_value=object())
+    )
+    earlier = _alert(_item("twitter:first"))
+    notifier.seen.record_semantic(
+        earlier.item.player_name,
+        earlier.classification.event_type,
+        earlier.classification.severity,
+        event_status(earlier.item, earlier.classification.event_type),
+        event_fact_signature(earlier.item),
+    )
+    corroboration = _alert(
+        _item(
+            "rotowire:retry-edit",
+            source="rotowire",
+            headline="Team again confirms Example Player was ruled out",
+        )
+    )
+    send = Mock(side_effect=[None, 88])
+    monkeypatch.setattr("notifier.pipeline.send_alert", send)
+
+    assert notifier._claim_item(corroboration.item)
+    assert notifier._complete_evaluation(corroboration.item, corroboration) == 0
+    pending = notifier.outbox.due(now=float("inf"))[0]
+    assert notifier._attempt_pending_locked(pending) == 1
+
+    assert send.call_count == 2
+    assert len(notifier.outbox) == 0
 
 
 def test_recent_successful_jit_roster_refresh_is_reused(monkeypatch) -> None:
@@ -305,6 +909,137 @@ def test_failed_jit_refresh_fails_closed_without_add_or_free_agent_claim(
     assert "Backup Player" not in rendered
 
 
+def test_ambiguous_multi_player_report_never_triggers_roster_moves(monkeypatch) -> None:
+    notifier = Notifier.__new__(Notifier)
+    league = LeagueRef("sleeper", "1234", "Home League", "Mine")
+    plays = LeaguePlays(
+        league=league,
+        subject_state="mine",
+        subject_owner="Mine",
+        beneficiaries=[Beneficiary("Backup Player", "RB", 2, "free_agent")],
+        bench_options=["Bench Player"],
+    )
+    depth = Mock()
+    depth.build.return_value = ({"full_name": "Example Player"}, [plays])
+    depth.team_context.return_value = None
+    notifier._state_lock = threading.RLock()
+    notifier.snapshot = RosterSnapshot(
+        generated_at=datetime.now(timezone.utc),
+        leagues=[league],
+    )
+    notifier.depth = depth
+    notifier.preseason = False
+    notifier.session = object()
+    notifier.config = SimpleNamespace(
+        dry_run=False,
+        min_severity=2,
+        min_severity_other=3,
+    )
+    notifier._refresh_ownership_just_in_time = Mock(return_value=True)
+    monkeypatch.setattr(
+        "notifier.pipeline.classify",
+        Mock(
+            return_value=Classification(
+                "injury",
+                4,
+                "Backup Player will take over.",
+                True,
+                {"direction": "negative"},
+            )
+        ),
+    )
+    stream = TwitterStream("fake", queue.Queue())
+    stream._names = SimpleNamespace(find=lambda _text: ["Jordan Mason"])
+    item = stream._to_items(
+        {
+            "data": {
+                "id": "ambiguous-subject",
+                "author_id": "7",
+                "text": "Jordan Mason will start with CMC ruled out.",
+            },
+            "includes": {"users": [{"id": "7", "username": "Reporter"}]},
+        }
+    )[0]
+    stream._session.close()
+    assert item.subject_confident is False
+
+    alert = notifier._evaluate(item)
+
+    assert alert is not None
+    notifier._refresh_ownership_just_in_time.assert_not_called()
+    assert alert.classification.event_type == "other"
+    assert alert.classification.raw["subject_attribution"] == "uncertain"
+    assert all(not plays.has_action for plays in alert.per_league)
+    rendered = format_alert(alert)
+    assert "automatic pickup and lineup moves are withheld" in rendered
+    assert "— UPDATE" in rendered
+    assert "— INJURY" not in rendered
+    assert "Backup Player will take over" not in rendered
+    assert "ADD OPTION" not in rendered
+    assert "START" not in rendered
+
+
+def test_non_transaction_release_fails_closed_through_fallback_pipeline(monkeypatch) -> None:
+    notifier = Notifier.__new__(Notifier)
+    league = LeagueRef("sleeper", "1234", "Home League", "Mine")
+    plays = LeaguePlays(
+        league=league,
+        subject_state="mine",
+        subject_owner="Mine",
+        beneficiaries=[Beneficiary("Backup Player", "RB", 2, "free_agent")],
+        bench_options=["Bench Player"],
+    )
+    depth = Mock()
+    depth.build.return_value = ({"full_name": "Jordan Mason"}, [plays])
+    depth.team_context.return_value = None
+    notifier._state_lock = threading.RLock()
+    notifier.snapshot = RosterSnapshot(
+        generated_at=datetime.now(timezone.utc),
+        leagues=[league],
+    )
+    notifier.depth = depth
+    notifier.preseason = False
+    notifier.session = object()
+    notifier.config = SimpleNamespace(
+        dry_run=False,
+        min_severity=2,
+        min_severity_other=3,
+    )
+    notifier._refresh_ownership_just_in_time = Mock(return_value=True)
+    monkeypatch.setattr(
+        "notifier.pipeline.classify",
+        lambda _session, _config, news_item, **_kwargs: _fallback(
+            "test outage", news_item
+        ),
+    )
+    stream = TwitterStream("fake", queue.Queue())
+    stream._names = SimpleNamespace(find=lambda _text: ["Jordan Mason"])
+    item = stream._to_items(
+        {
+            "data": {
+                "id": "transitive-release",
+                "author_id": "7",
+                "text": "The 49ers released Jordan Mason injury update.",
+            },
+            "includes": {"users": [{"id": "7", "username": "Reporter"}]},
+        }
+    )[0]
+    stream._session.close()
+
+    assert item.subject_confident is False
+    assert _fallback("test outage", item).event_type == "release"
+    alert = notifier._evaluate(item)
+
+    assert alert is not None
+    assert alert.classification.event_type == "other"
+    assert alert.classification.raw["subject_attribution"] == "uncertain"
+    assert all(not league_plays.has_action for league_plays in alert.per_league)
+    rendered = format_alert(alert)
+    assert "automatic pickup and lineup moves are withheld" in rendered
+    assert "ADD OPTION" not in rendered
+    assert "START" not in rendered
+
+
 def test_outbox_retries_preserve_chronological_order_across_sources(tmp_path) -> None:
     outbox = DeliveryOutbox(tmp_path)
     older = outbox.add(_alert(_item("rotowire:old", source="rotowire")))
@@ -315,4 +1050,29 @@ def test_outbox_retries_preserve_chronological_order_across_sources(tmp_path) ->
     assert [entry.alert.item.guid for entry in outbox.due(now=float("inf"))] == [
         "rotowire:old",
         "twitter:new",
+    ]
+
+
+def test_outbox_orders_distinct_facts_by_observation_not_classification_finish(
+    tmp_path,
+) -> None:
+    outbox = DeliveryOutbox(tmp_path)
+    # The later report classified quickly and was enqueued first. The earlier
+    # report finished slowly, but must still be delivered first on recovery.
+    later_item = replace(
+        _item("twitter:later", headline="Example Player injury update"),
+        body="Example Player has a concussion.",
+        published_at=None,
+    )
+    earlier_item = replace(
+        _item("rotowire:earlier", source="rotowire", headline="Example Player injury update"),
+        body="Example Player has an ankle injury.",
+        published_at=None,
+    )
+    outbox.add(_alert(later_item, event_type="injury"), observed_at=20)
+    outbox.add(_alert(earlier_item, event_type="injury"), observed_at=10)
+
+    assert [entry.alert.item.guid for entry in outbox.due(float("inf"))] == [
+        "rotowire:earlier",
+        "twitter:later",
     ]

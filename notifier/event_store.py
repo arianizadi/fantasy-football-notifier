@@ -9,7 +9,6 @@ makes no external model calls.
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import sqlite3
 import threading
@@ -18,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from .logging_utils import structured_log
-from .models import Classification, NewsItem
+from .models import Classification, NewsItem, report_revision_identity
 
 DATABASE_FILENAME = "news-events.sqlite3"
 DIRECTIONS = frozenset({"positive", "negative", "mixed", "neutral", "unknown"})
@@ -30,8 +29,8 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _token(guid: str) -> str:
-    return hashlib.sha256(guid.encode("utf-8")).hexdigest()[:16]
+def _token(item: NewsItem) -> str:
+    return report_revision_identity(item)[:16]
 
 
 def classification_direction(classification: Classification) -> str:
@@ -80,34 +79,15 @@ class EventStore:
         with self._lock:
             self._connection.execute("PRAGMA journal_mode=WAL")
             self._connection.execute("PRAGMA synchronous=NORMAL")
+            self._migrate_revision_schema_locked()
+            self._create_news_events_table_locked()
             self._connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS news_events (
-                    id INTEGER PRIMARY KEY,
-                    guid TEXT NOT NULL UNIQUE,
-                    alert_token TEXT NOT NULL UNIQUE,
-                    source TEXT NOT NULL,
-                    player_name TEXT NOT NULL DEFAULT '',
-                    headline TEXT NOT NULL DEFAULT '',
-                    body TEXT NOT NULL DEFAULT '',
-                    url TEXT NOT NULL DEFAULT '',
-                    published_at TEXT,
-                    received_at TEXT NOT NULL,
-                    event_type TEXT,
-                    direction TEXT,
-                    severity INTEGER,
-                    summary TEXT,
-                    is_actionable INTEGER,
-                    tier TEXT,
-                    outcome TEXT NOT NULL DEFAULT 'received',
-                    telegram_message_id INTEGER,
-                    feedback TEXT,
-                    feedback_at TEXT,
-                    embedding_model TEXT,
-                    embedding BLOB,
-                    updated_at TEXT NOT NULL
-                )
-                """
+                "CREATE INDEX IF NOT EXISTS news_events_guid_time "
+                "ON news_events(guid, received_at DESC)"
+            )
+            self._connection.execute(
+                "CREATE INDEX IF NOT EXISTS news_events_legacy_alert_token "
+                "ON news_events(legacy_alert_token)"
             )
             self._connection.execute(
                 "CREATE INDEX IF NOT EXISTS news_events_player_time "
@@ -134,6 +114,111 @@ class EventStore:
                 self._fts_enabled = False
                 structured_log(logging.INFO, "events.fts_unavailable", error=str(error))
             self._connection.commit()
+
+    def _create_news_events_table_locked(self) -> None:
+        """Create the revision-aware journal schema when it is absent."""
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS news_events (
+                id INTEGER PRIMARY KEY,
+                report_id TEXT NOT NULL UNIQUE,
+                guid TEXT NOT NULL,
+                alert_token TEXT NOT NULL UNIQUE,
+                legacy_alert_token TEXT,
+                source TEXT NOT NULL,
+                player_name TEXT NOT NULL DEFAULT '',
+                headline TEXT NOT NULL DEFAULT '',
+                body TEXT NOT NULL DEFAULT '',
+                url TEXT NOT NULL DEFAULT '',
+                published_at TEXT,
+                received_at TEXT NOT NULL,
+                event_type TEXT,
+                direction TEXT,
+                severity INTEGER,
+                summary TEXT,
+                is_actionable INTEGER,
+                tier TEXT,
+                outcome TEXT NOT NULL DEFAULT 'received',
+                telegram_message_id INTEGER,
+                feedback TEXT,
+                feedback_at TEXT,
+                embedding_model TEXT,
+                embedding BLOB,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+
+    def _migrate_revision_schema_locked(self) -> None:
+        """Remove the legacy one-row-per-GUID constraint without data loss.
+
+        Existing callback tokens are intentionally preserved so buttons on
+        messages already visible in Telegram keep mapping to the same rows.
+        New reports use revision-aware tokens after this migration.
+        """
+        exists = self._connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'news_events'"
+        ).fetchone()
+        if exists is None:
+            return
+        columns = [
+            str(row["name"])
+            for row in self._connection.execute("PRAGMA table_info(news_events)")
+        ]
+        if "report_id" in columns:
+            if "legacy_alert_token" not in columns:
+                self._connection.execute(
+                    "ALTER TABLE news_events ADD COLUMN legacy_alert_token TEXT"
+                )
+            return
+
+        self._connection.execute("DROP TABLE IF EXISTS news_events_fts")
+        self._connection.execute(
+            "ALTER TABLE news_events RENAME TO news_events_legacy_revision"
+        )
+        self._create_news_events_table_locked()
+        legacy_rows = self._connection.execute(
+            "SELECT * FROM news_events_legacy_revision ORDER BY id"
+        ).fetchall()
+        copied_columns = [
+            column
+            for column in columns
+            if column not in {"report_id", "alert_token", "legacy_alert_token"}
+        ]
+        column_sql = ", ".join(
+            ["report_id", "alert_token", "legacy_alert_token", *copied_columns]
+        )
+        placeholders = ", ".join("?" for _ in range(len(copied_columns) + 3))
+        for row in legacy_rows:
+            item = NewsItem(
+                source=str(row["source"] or ""),
+                guid=str(row["guid"] or ""),
+                player_name=str(row["player_name"] or ""),
+                headline=str(row["headline"] or ""),
+                body=str(row["body"] or ""),
+                url=str(row["url"] or ""),
+                published_at=None,
+            )
+            report_id = report_revision_identity(item)
+            self._connection.execute(
+                f"INSERT INTO news_events({column_sql}) VALUES ({placeholders})",
+                (
+                    report_id,
+                    report_id[:16],
+                    str(row["alert_token"] or "") or None,
+                    *(row[column] for column in copied_columns),
+                ),
+            )
+        self._connection.execute("DROP TABLE news_events_legacy_revision")
+
+        metadata_exists = self._connection.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'event_store_meta'"
+        ).fetchone()
+        if metadata_exists is not None:
+            self._connection.execute(
+                "DELETE FROM event_store_meta WHERE key = 'fts_rowid_schema'"
+            )
 
     def _migrate_fts_rowids_locked(self) -> None:
         """Key legacy FTS rows by ``news_events.id`` once.
@@ -186,13 +271,14 @@ class EventStore:
         )
 
     def _upsert_received_locked(self, item: NewsItem, now: str) -> None:
-        """Upsert raw report fields and reindex only when searchable text changed."""
+        """Insert one exact revision and collapse only true raw duplicates."""
+        report_id = report_revision_identity(item)
         existing = self._connection.execute(
             """
             SELECT id, player_name, headline, body
-            FROM news_events WHERE guid = ?
+            FROM news_events WHERE report_id = ?
             """,
-            (item.guid,),
+            (report_id,),
         ).fetchone()
         search_changed = existing is None or (
             existing["player_name"],
@@ -203,10 +289,10 @@ class EventStore:
         cursor = self._connection.execute(
             """
             INSERT INTO news_events(
-                guid, alert_token, source, player_name, headline, body, url,
+                report_id, guid, alert_token, source, player_name, headline, body, url,
                 published_at, received_at, outcome, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'received', ?)
-            ON CONFLICT(guid) DO UPDATE SET
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'received', ?)
+            ON CONFLICT(report_id) DO UPDATE SET
                 source = excluded.source,
                 player_name = excluded.player_name,
                 headline = excluded.headline,
@@ -216,8 +302,9 @@ class EventStore:
                 updated_at = excluded.updated_at
             """,
             (
+                report_id,
                 item.guid,
-                _token(item.guid),
+                _token(item),
                 item.source,
                 item.player_name,
                 item.headline,
@@ -258,7 +345,7 @@ class EventStore:
                 UPDATE news_events SET
                     event_type = ?, direction = ?, severity = ?, summary = ?,
                     is_actionable = ?, tier = ?, outcome = ?, updated_at = ?
-                WHERE guid = ?
+                WHERE report_id = ?
                 """,
                 (
                     classification.event_type,
@@ -269,7 +356,7 @@ class EventStore:
                     tier or None,
                     outcome,
                     now,
-                    item.guid,
+                    report_revision_identity(item),
                 ),
             )
             if cursor.rowcount == 0:
@@ -279,7 +366,7 @@ class EventStore:
                     UPDATE news_events SET
                         event_type = ?, direction = ?, severity = ?, summary = ?,
                         is_actionable = ?, tier = ?, outcome = ?, updated_at = ?
-                    WHERE guid = ?
+                    WHERE report_id = ?
                     """,
                     (
                         classification.event_type,
@@ -290,30 +377,41 @@ class EventStore:
                         tier or None,
                         outcome,
                         now,
-                        item.guid,
+                        report_revision_identity(item),
                     ),
                 )
             self._connection.commit()
 
     def mark_outcome(
         self,
-        guid: str,
+        report: NewsItem | str,
         outcome: str,
         *,
         tier: str = "",
         message_id: int | None = None,
     ) -> None:
         with self._lock:
+            if isinstance(report, NewsItem):
+                predicate = "report_id = ?"
+                identity = report_revision_identity(report)
+            else:
+                # Backward-compatible callers target the newest revision for
+                # that source GUID. New delivery code should pass NewsItem.
+                predicate = (
+                    "id = (SELECT id FROM news_events WHERE guid = ? "
+                    "ORDER BY received_at DESC, id DESC LIMIT 1)"
+                )
+                identity = report
             self._connection.execute(
-                """
+                f"""
                 UPDATE news_events SET
                     outcome = ?,
                     tier = COALESCE(NULLIF(?, ''), tier),
                     telegram_message_id = COALESCE(?, telegram_message_id),
                     updated_at = ?
-                WHERE guid = ?
+                WHERE {predicate}
                 """,
-                (outcome, tier, message_id, _utc_now(), guid),
+                (outcome, tier, message_id, _utc_now(), identity),
             )
             self._connection.commit()
 
@@ -324,25 +422,36 @@ class EventStore:
             cursor = self._connection.execute(
                 """
                 UPDATE news_events SET feedback = ?, feedback_at = ?, updated_at = ?
-                WHERE alert_token = ?
+                WHERE alert_token = ? OR legacy_alert_token = ?
                 """,
-                (verdict, _utc_now(), _utc_now(), alert_token),
+                (verdict, _utc_now(), _utc_now(), alert_token, alert_token),
             )
             self._connection.commit()
             return cursor.rowcount > 0
 
-    def store_embedding(self, guid: str, model: str, embedding: bytes) -> bool:
+    def store_embedding(
+        self, report: NewsItem | str, model: str, embedding: bytes
+    ) -> bool:
         """Attach provider-generated vector bytes without prescribing a provider."""
         if not model or not embedding:
             return False
         with self._lock:
+            if isinstance(report, NewsItem):
+                predicate = "report_id = ?"
+                identity = report_revision_identity(report)
+            else:
+                predicate = (
+                    "id = (SELECT id FROM news_events WHERE guid = ? "
+                    "ORDER BY received_at DESC, id DESC LIMIT 1)"
+                )
+                identity = report
             cursor = self._connection.execute(
-                """
+                f"""
                 UPDATE news_events
                 SET embedding_model = ?, embedding = ?, updated_at = ?
-                WHERE guid = ?
+                WHERE {predicate}
                 """,
-                (model, sqlite3.Binary(embedding), _utc_now(), guid),
+                (model, sqlite3.Binary(embedding), _utc_now(), identity),
             )
             self._connection.commit()
             return cursor.rowcount > 0
@@ -351,11 +460,19 @@ class EventStore:
     def _row(row: sqlite3.Row) -> dict[str, Any]:
         return dict(row)
 
-    def get(self, guid: str) -> dict[str, Any] | None:
+    def get(self, report: NewsItem | str) -> dict[str, Any] | None:
         with self._lock:
-            row = self._connection.execute(
-                "SELECT * FROM news_events WHERE guid = ?", (guid,)
-            ).fetchone()
+            if isinstance(report, NewsItem):
+                row = self._connection.execute(
+                    "SELECT * FROM news_events WHERE report_id = ?",
+                    (report_revision_identity(report),),
+                ).fetchone()
+            else:
+                row = self._connection.execute(
+                    "SELECT * FROM news_events WHERE guid = ? "
+                    "ORDER BY received_at DESC, id DESC LIMIT 1",
+                    (report,),
+                ).fetchone()
             return self._row(row) if row is not None else None
 
     def count(self) -> int:
@@ -386,7 +503,7 @@ class EventStore:
                 WHERE player_name LIKE ? COLLATE NOCASE
                   AND (? = '' OR guid != ?)
                   AND (? = '' OR received_at >= ?)
-                ORDER BY received_at DESC
+                ORDER BY received_at DESC, id DESC
                 LIMIT ?
                 """,
                 (
@@ -416,7 +533,7 @@ class EventStore:
                         SELECT events.* FROM news_events_fts AS search
                         JOIN news_events AS events ON events.id = search.rowid
                         WHERE news_events_fts MATCH ?
-                        ORDER BY bm25(news_events_fts), events.received_at DESC
+                        ORDER BY bm25(news_events_fts), events.received_at DESC, events.id DESC
                         LIMIT ?
                         """,
                         (expression, bounded),
@@ -431,7 +548,7 @@ class EventStore:
                 WHERE player_name LIKE ? COLLATE NOCASE
                    OR headline LIKE ? COLLATE NOCASE
                    OR body LIKE ? COLLATE NOCASE
-                ORDER BY received_at DESC
+                ORDER BY received_at DESC, id DESC
                 LIMIT ?
                 """,
                 (pattern, pattern, pattern, bounded),

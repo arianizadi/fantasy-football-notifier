@@ -18,6 +18,8 @@ RotoWire RSS (adaptive polling) ────────────┘
                                                  │
                     deterministic event-aware actions and safety rules
                                                  │
+                    cached FantasyPros WAIVER/ROS context (optional)
+                                                 │
                     cross-source semantic dedupe + severity/tier gate
                               │                  │
                     local news journal     retry-safe Telegram delivery
@@ -26,7 +28,8 @@ RotoWire RSS (adaptive polling) ────────────┘
 X uses a long-lived filtered-stream connection. Its queue wakes the processing
 loop directly; it does not wait for the next RSS poll. RotoWire remains a
 separate fallback source. Source IDs suppress literal repeats, while semantic
-dedupe suppresses the later write-up of the same player event.
+dedupe recognizes a later corroboration of the same player event so Telegram
+can update the existing alert.
 
 The model classifies the event type, fantasy direction, severity, impact
 summary, and whether it is actionable. Code owns the depth chart, roster availability,
@@ -90,6 +93,8 @@ another.
 - Sleeper leagues are discovered from `SLEEPER_USERNAME`, optionally filtered
   by `SLEEPER_LEAGUE_IDS`.
 - Sleeper's NFL player dataset supplies depth, team, rank, and live status.
+- Each league's reception scoring is read from its provider (`PPR`, `HALF`, or
+  `STD`) so optional FantasyPros context uses the right rankings per league.
 
 `bin/refresh-roster.py` writes an atomic local snapshot twice a day, and
 `bin/check-drafts.py` checks hourly for a newly completed draft. ESPN and
@@ -100,11 +105,70 @@ free agent. If that refresh fails, it fails closed: the news can still alert,
 but all `ADD` and free-agent claims are hidden and the message says why.
 Delayed outbox retries re-run the same ownership check.
 
+Each X post is handled as one report, even when it names several players. If
+the notifier cannot confidently attribute an injury or absence to one player,
+it keeps the news alert neutral and withholds automatic pickup and lineup
+recommendations.
+
 Sleeper's full NFL player map is cached for twenty-four hours, matching
 Sleeper's documented once-daily guidance. It provides depth and status context,
 not medical confirmation; breaking news is never delayed while waiting for a
 fresh copy of the full map. A failed daily refresh keeps the last good map live
 and retries after fifteen minutes.
+
+### In-season injury pickups
+
+This notifier is intentionally focused on the short window after an injury or
+inactive report, while the replacement may still be available. It never adds
+or drops a player automatically. When configured, FantasyPros consensus
+WAIVER and rest-of-season rankings are added as a cached second opinion; they
+do not generate candidates, establish workload, or determine availability.
+
+Before showing a pickup option, the notifier refreshes ownership in every
+drafted ESPN and Sleeper league. It keeps the nearest two players after the
+affected player in Sleeper's depth order even when their overall search rank is
+low. When more than one is free, they are presented as alternatives instead of
+two commands to add both:
+
+```text
+[4/5] WAIVER OPPORTUNITY — INJURY
+
+LEAGUE-SPECIFIC MOVES
+Sunday Crew: PICKUP OPTIONS — Michael Carter (Sleeper depth RB2 · named in report
+  · FantasyPros HALF waiver RB34 · ROS RB55) | Bam Knight (Sleeper depth RB3
+  · named in report · FantasyPros HALF waiver RB41 · ROS RB63)
+  Roster occupancy: Bench 5/5 full · IR 0/1 open (eligibility not checked)
+  FantasyPros rank lean: Michael Carter (ranking context only; role unconfirmed)
+  FantasyPros cached HALF rankings · provider updated 2026-08-23 10:00 PT;
+  may lag this breaking report and do not confirm role or workload.
+
+Backup note: Pickup options are alternatives, not instructions to add both.
+Sleeper depth order does not confirm workload or touch share.
+```
+
+The alert path never calls the FantasyPros API. X remains the fast trigger,
+Sleeper generates the nearest depth options, and a just-in-time ESPN/Sleeper
+roster refresh determines whether each option is actually free. The background
+cache downloads four bulk datasets—WAIVER and ROS for the two configured
+scoring formats—every six hours. With one PPR and one half-PPR league that is
+16 requests per day regardless of tweet volume. A persistent rolling-24-hour
+cap defaults to 425, leaving headroom below the account's stated 500-request
+plan. Requests are globally spaced by at least one second and reserved in the
+ledger before network I/O, so restarts cannot forget quota use. Repeated failed
+batches back off from 15 minutes to a six-hour maximum instead of burning the
+daily budget.
+
+FantasyPros freshness uses the provider's `last_updated_ts`, not local fetch
+time. Data older than `FANTASYPROS_MAX_AGE_HOURS` is omitted. A missing key,
+quota exhaustion, stale response, malformed payload, timeout, or provider
+outage leaves the existing Sleeper-based alert unchanged and can never delay
+or suppress it. Displayed rankings are explicitly attributed to FantasyPros.
+
+Bench and IR limits are read separately from each league's provider settings;
+the current ESPN and Sleeper leagues can therefore both show `5` bench and `1`
+IR without hard-coding those values globally. The IR number is occupancy only:
+an open spot does not establish that the injured player is IR-eligible. The
+notifier also does not choose a drop candidate for a full bench.
 
 ### Preseason mode
 
@@ -132,6 +196,12 @@ are refreshed.
 - Local state files are written atomically. An exclusive state-directory lock
   enforces one notifier process for queue, Telegram, and dedupe decisions;
   Redis is not required.
+- A later non-urgent corroboration for the same player, event, status, and
+  condition edits the existing Telegram message within six hours instead of
+  adding chat noise. Severity increases, status or condition changes, new
+  recovery timetables, and different event types post a new alert so urgent
+  transitions are not hidden inside a silent edit. Every raw report remains in
+  the local journal either way.
 
 ## Saved news and feedback
 
@@ -141,7 +211,10 @@ filter/delivery outcome are retained for every saved report. Event type,
 positive/negative/mixed direction, severity, and summary are added when a
 report reaches classification; preseason items rejected before classification
 remain explicitly unclassified. Delivered rows also retain the Telegram
-message id and useful/wrong/noisy feedback. The database uses WAL mode and
+message id and useful/wrong/noisy feedback. Report identity includes the
+source, source GUID, headline, and body, so an upstream edit under a reused
+GUID keeps both revisions and their feedback separate while exact raw
+duplicates still collapse. The database uses WAL mode and
 full-text search, so `/player Kittle` can include recent reports. The
 `/news Kittle` command searches the journal after Telegram's seven-day copies
 have expired.
@@ -200,6 +273,9 @@ Important configuration:
 | `ESPN_TEAM_ID` | Optional team-selection override. |
 | `SLEEPER_USERNAME`, `SLEEPER_LEAGUE_IDS` | Sleeper league discovery/filter. |
 | `TWITTER_BEARER_TOKEN` | Optional usage-billed X filtered stream. |
+| `FANTASYPROS_API_KEY` | Optional cached FantasyPros WAIVER/ROS context; never used in the breaking-alert path. |
+| `FANTASYPROS_REQUEST_LIMIT` | Persistent rolling-24h application cap; default `425`, maximum `450`. |
+| `FANTASYPROS_REFRESH_HOURS`, `FANTASYPROS_MAX_AGE_HOURS` | Ranking refresh cadence and provider-data freshness limit. |
 | `MIN_SEVERITY`, `MIN_SEVERITY_OTHER` | Alert floors for your roster vs other news. |
 | `POLL_SECONDS`, `POLL_SECONDS_IDLE`, `ADAPTIVE_POLLING` | RotoWire polling cadence. |
 | `TELEGRAM_CONTROLS_ENABLED` | Opt in to commands and feedback only when this service exclusively owns the bot's `getUpdates`; default `false`. |

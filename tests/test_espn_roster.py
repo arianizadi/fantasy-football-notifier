@@ -17,7 +17,13 @@ def _config(*, team_id=None, swid="{MY-OWNER-ID}"):
 
 def _payload():
     return {
-        "settings": {"name": "Sunday Friends"},
+        "settings": {
+            "name": "Sunday Friends",
+            "rosterSettings": {"lineupSlotCounts": {"20": 5, "21": 1}},
+            "scoringSettings": {
+                "scoringItems": [{"statId": 53, "points": 1.0}]
+            },
+        },
         "teams": [
             {
                 "id": 7,
@@ -83,7 +89,7 @@ def test_direct_espn_response_preserves_every_team_roster_and_auth() -> None:
     session.get.return_value = response
     config = _config()
 
-    league, players = _load_espn(config, session)
+    league, players, capacity, scoring_format = _load_espn(config, session)
 
     assert league.name == "Sunday Friends"
     assert league.my_team_name == "Arian's Team"
@@ -92,6 +98,11 @@ def test_direct_espn_response_preserves_every_team_roster_and_auth() -> None:
         ("Christian McCaffrey", "RB", "SF", "IR", True),
         ("Mike Evans", "WR", "TB", "WR", False),
     ]
+    assert capacity.bench_used == 0
+    assert capacity.bench_limit == 5
+    assert capacity.ir_used == 1
+    assert capacity.ir_limit == 1
+    assert scoring_format == "PPR"
     call = session.get.call_args
     assert call.kwargs["params"] == {"view": ["mTeam", "mRoster", "mSettings"]}
     assert call.kwargs["cookies"] == {
@@ -99,6 +110,22 @@ def test_direct_espn_response_preserves_every_team_roster_and_auth() -> None:
         "espn_s2": "private-session-cookie",
     }
     assert call.kwargs["timeout"] == 25
+
+
+def test_espn_capacity_counts_only_my_team_slots() -> None:
+    payload = _payload()
+    payload["teams"][0]["roster"]["entries"][0]["lineupSlotId"] = 20
+    payload["teams"][1]["roster"]["entries"][0]["lineupSlotId"] = 20
+    response = Mock()
+    response.raise_for_status.return_value = None
+    response.json.return_value = payload
+    session = Mock()
+    session.get.return_value = response
+
+    _, _, capacity, _ = _load_espn(_config(), session)
+
+    assert capacity.bench_used == 1
+    assert capacity.bench_limit == 5
 
 
 def test_espn_team_id_override_supports_co_managed_and_changed_owner_ids() -> None:

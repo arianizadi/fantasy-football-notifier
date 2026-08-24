@@ -45,6 +45,46 @@ def compact_key(value: str) -> str:
     return normalize_name(value).replace(" ", "")
 
 
+def player_name_pattern(name: str) -> re.Pattern[str] | None:
+    """Build a conservative full-name matcher for source attribution.
+
+    Name words must be separated by whitespace, so ``Will Shipley`` cannot be
+    invented across two sentences such as ``will. Shipley``. Punctuation is
+    tolerated inside initials and hyphenated tokens to retain matches such as
+    ``D.J. Moore`` and ``Amon-Ra St. Brown``.
+    """
+    normalized = normalize_name(name)
+    if not normalized:
+        return None
+    token_patterns: list[str] = []
+    for token in normalized.split():
+        characters = [re.escape(character) for character in token if character.isalnum()]
+        if not characters:
+            continue
+        pattern = r"[.'`‘’_-]*".join(characters)
+        if len(characters) <= 2:
+            pattern += r"[.'`‘’_-]*"
+        token_patterns.append(pattern)
+    if not token_patterns:
+        return None
+    return re.compile(
+        r"(?<![A-Za-z0-9])" + r"\s+".join(token_patterns) + r"(?![A-Za-z0-9])",
+        re.IGNORECASE,
+    )
+
+
+def player_name_spans(name: str, text: str) -> list[tuple[int, int]]:
+    pattern = player_name_pattern(name)
+    if pattern is None or not text:
+        return []
+    return [match.span() for match in pattern.finditer(text)]
+
+
+def player_name_in_text(name: str, text: str) -> bool:
+    """Whether a canonical full player name appears contiguously in text."""
+    return bool(player_name_spans(name, text))
+
+
 def name_from_rotowire_url(url: str) -> str:
     """Recover a player name from a RotoWire player URL slug.
 
