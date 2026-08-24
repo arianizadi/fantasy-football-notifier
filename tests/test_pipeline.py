@@ -141,6 +141,37 @@ def test_subject_normalization_does_not_replay_revision_aware_report(tmp_path) -
     assert seen.is_new(normalized) is False
 
 
+def test_reattribution_audit_logs_only_after_one_successful_claim(monkeypatch) -> None:
+    item = NewsItem(
+        source="rotowire",
+        guid="rotowire:washington-beneficiary-new",
+        player_name="Ashton Jeanty",
+        headline="Sees extra work after Jeanty injury",
+        body="Ashton Jeanty left practice.",
+        url="https://www.rotowire.com/football/player/mike-washington-999",
+        published_at=None,
+    )
+    log = Mock()
+    monkeypatch.setattr(pipeline_module, "structured_log", log)
+    notifier = SimpleNamespace(
+        _state_lock=threading.RLock(),
+        seen=SimpleNamespace(is_new=Mock(return_value=True)),
+        outbox=SimpleNamespace(contains_item=Mock(return_value=False)),
+        _inflight_items={},
+        _journal_received=Mock(),
+    )
+
+    assert Notifier._claim_item(notifier, item) is True
+    assert Notifier._claim_item(notifier, item) is False
+
+    reattribution_logs = [
+        call
+        for call in log.call_args_list
+        if len(call.args) > 1 and call.args[1] == "rotowire.subject_reattributed"
+    ]
+    assert len(reattribution_logs) == 1
+
+
 def test_poll_checks_normalized_rotowire_item_against_seen_state() -> None:
     raw = NewsItem(
         source="rotowire",

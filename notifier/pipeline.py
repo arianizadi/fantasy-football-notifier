@@ -33,7 +33,7 @@ from .dedupe import (
 from .event_store import EventStore
 from .health import HEALTH, age_label, duration_label
 from .logging_utils import NotifierError, structured_log
-from .matcher import name_from_rotowire_url
+from .matcher import compact_key, name_from_rotowire_url
 from .models import Alert, Classification, NewsItem, RosterSnapshot
 from .notify import retry_after_seconds, send_alert, send_plain, telegram_state
 from .outbox import DeliveryOutbox, PendingDelivery
@@ -933,6 +933,25 @@ class Notifier:
                 return False
             self._inflight_items[item] = time.time()
         self._journal_received(item)
+        article_player = (
+            name_from_rotowire_url(item.url) if item.source == "rotowire" else ""
+        )
+        if (
+            article_player
+            and item.player_name
+            and compact_key(article_player) != compact_key(item.player_name)
+        ):
+            # Log only after the normalized revision wins the seen/outbox and
+            # in-flight checks. Feed servers without useful cache validators
+            # can return the same five items every poll; logging during pure
+            # normalization would otherwise create thousands of duplicate
+            # audit lines per day.
+            structured_log(
+                logging.INFO,
+                "rotowire.subject_reattributed",
+                articlePlayer=article_player,
+                absenceSubject=item.player_name,
+            )
         return True
 
     def _normalize_source_subject(self, item: NewsItem) -> NewsItem:
@@ -941,15 +960,7 @@ class Notifier:
             return item
         with self._state_lock:
             player_index = getattr(self, "_player_index", {})
-        normalized = rotowire.reattribute_beneficiary_report(item, player_index)
-        if normalized.player_name != item.player_name:
-            structured_log(
-                logging.INFO,
-                "rotowire.subject_reattributed",
-                articlePlayer=item.player_name,
-                absenceSubject=normalized.player_name,
-            )
-        return normalized
+        return rotowire.reattribute_beneficiary_report(item, player_index)
 
     def _release_item(self, item: NewsItem) -> None:
         with self._state_lock:
