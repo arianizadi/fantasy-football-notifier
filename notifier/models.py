@@ -169,3 +169,10 @@ class Alert:
     # Persisted retries are labelled so an older report is never presented as
     # if it just broke. Claimable actions are revalidated before this is set.
     delivery_delayed: bool = False
+    # A high-similarity vector can suggest editing one existing message, but
+    # only after deterministic event/status/fact guards approve the transition.
+    # TelegramState revalidates the exact message/token before using this hint.
+    embedding_match_message_id: int | None = None
+    embedding_match_token: str = ""
+    embedding_similarity: float | None = None
+    embedding_model: str = ""

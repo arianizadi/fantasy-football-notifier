@@ -116,6 +116,13 @@ def _optional_int(value: Any) -> int | None:
         return None
 
 
+def _optional_float(value: Any) -> float | None:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _beneficiary(payload: dict[str, Any]) -> Beneficiary:
     return Beneficiary(
         name=str(payload.get("name") or ""),
@@ -207,6 +214,12 @@ def _alert_from_dict(payload: dict[str, Any]) -> Alert:
             payload.get("availability_refresh_failed", False)
         ),
         delivery_delayed=bool(payload.get("delivery_delayed", False)),
+        embedding_match_message_id=_optional_int(
+            payload.get("embedding_match_message_id")
+        ),
+        embedding_match_token=str(payload.get("embedding_match_token") or ""),
+        embedding_similarity=_optional_float(payload.get("embedding_similarity")),
+        embedding_model=str(payload.get("embedding_model") or ""),
     )
 
 

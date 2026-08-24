@@ -4,11 +4,19 @@ from types import SimpleNamespace
 
 import pytest
 
-from notifier.config import load_config
+from notifier.config import load_config, optional_float
 from notifier.logging_utils import NotifierError
 from notifier.models import RosterSnapshot
 from notifier.pipeline import Notifier
 from notifier.sources.sleeper import PlayerIndex
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
+def test_optional_float_rejects_non_finite_values(monkeypatch, value) -> None:
+    monkeypatch.setenv("EXAMPLE_FLOAT", value)
+
+    with pytest.raises(NotifierError, match="between"):
+        optional_float("EXAMPLE_FLOAT", 0.9, 0.5, 1.0)
 
 
 def test_dry_run_config_does_not_create_state_directory(tmp_path, monkeypatch) -> None:
@@ -35,6 +43,10 @@ def test_dry_run_config_does_not_create_state_directory(tmp_path, monkeypatch) -
     assert config.daily_digest_hour == 8
     assert config.waiver_report_enabled is True
     assert config.waiver_report_lead_hours == 8
+    assert config.embedding_mode == "off"
+    assert config.embedding_model == "qwen/qwen3-embedding-8b"
+    assert config.embedding_dimensions == 512
+    assert config.embedding_similarity_threshold == pytest.approx(0.90)
     assert not state_dir.exists()
 
 

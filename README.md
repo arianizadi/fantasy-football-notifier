@@ -293,12 +293,28 @@ full-text search, so `/player Kittle` can include recent reports. The
 `/news Kittle` command searches the journal after Telegram's seven-day copies
 have expired.
 
-The schema has nullable `embedding_model` and `embedding` fields, but the
-notifier does not send the archive to another embedding API by default.
-Structured labels are the reliable inputs for alert decisions; embeddings are
-useful later for similarity search once there is enough saved history and
-feedback to evaluate a specific embedding model. This avoids adding cost and
-another outage path before it provides measurable value.
+The journal can also store 512-dimensional Qwen3 embeddings from OpenRouter.
+Embedding work starts asynchronously beside classification, so it normally
+finishes without adding alert latency; provider failures fail open and never
+block a notification. Similarity is deliberately not a hard-delete rule. It
+may only suggest editing an existing Telegram message after deterministic
+checks confirm the same player, canonical event, direction, status, facts, and
+no severity escalation. The match must also point to the exact currently
+editable Telegram message/token, and a terse follow-up cannot replace a richer
+report. Reversals such as "returned to practice" followed by "released"
+therefore remain separate even when their text is highly similar. Every raw
+report remains searchable in SQLite regardless of the alert result.
+
+Backfill and evaluate the complete saved archive without sending messages:
+
+```bash
+./.venv/bin/python bin/backfill-embeddings.py
+./.venv/bin/python bin/eval-embeddings.py --strict
+```
+
+`EMBEDDING_MODE=shadow` stores and scores vectors without changing delivery.
+`EMBEDDING_MODE=coalesce` enables guarded same-message edits. The default is
+`off`, so deployments opt in explicitly after evaluating their own archive.
 
 ## Telegram setup and seven-day history
 
@@ -343,6 +359,8 @@ Important configuration:
 |---|---|
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | Telegram destination. |
 | `OPENROUTER_API_KEY`, `OPENROUTER_MODEL` | Pinned classifier provider/model. |
+| `EMBEDDING_MODE`, `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS` | Optional OpenRouter vector archive and guarded coalescing (`off`, `shadow`, or `coalesce`). |
+| `EMBEDDING_SIMILARITY_THRESHOLD`, `EMBEDDING_WINDOW_HOURS` | Similarity gate and same-player comparison window; defaults `0.90` and six hours. |
 | `ESPN_LEAGUE_ID`, `ESPN_YEAR`, `ESPN_SWID`, `ESPN_S2` | Private ESPN league access. |
 | `ESPN_TEAM_ID` | Optional team-selection override. |
 | `SLEEPER_USERNAME`, `SLEEPER_LEAGUE_IDS` | Sleeper league discovery/filter. |

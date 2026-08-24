@@ -32,6 +32,7 @@ from .dedupe import (
     semantic_event_type,
 )
 from .daily_recap import format_daily_recap
+from .embeddings import INPUT_VERSION, EmbeddingService
 from .event_store import EventStore
 from .health import HEALTH, age_label, duration_label
 from .logging_utils import NotifierError, structured_log
@@ -316,6 +317,7 @@ class Notifier:
         self.seen = SeenStore(seen_path(config))
         self.outbox = DeliveryOutbox(config.state_dir)
         self.events = EventStore(config.state_dir, in_memory=config.dry_run)
+        self.embeddings = EmbeddingService.from_config(self.events, config)
         self.fantasypros = FantasyProsCache(
             config.state_dir,
             "" if config.dry_run else getattr(config, "fantasypros_api_key", ""),
@@ -1050,6 +1052,20 @@ class Notifier:
                 return False
             self._inflight_items[item] = time.time()
         self._journal_received(item)
+        # Start the optional vector request beside classification. In the
+        # normal case it completes before the model result, so similarity adds
+        # no breaking-news latency. The callback archives every claimed raw
+        # report even when its alert is later filtered.
+        embedding_service = getattr(self, "embeddings", None)
+        if embedding_service is not None:
+            try:
+                embedding_service.enqueue(item)
+            except Exception as error:  # noqa: BLE001 - embeddings are optional
+                structured_log(
+                    logging.WARNING,
+                    "embeddings.enqueue_failed",
+                    errorType=type(error).__name__,
+                )
         article_player = (
             name_from_rotowire_url(item.url) if item.source == "rotowire" else ""
         )
@@ -1431,6 +1447,27 @@ class Notifier:
                 self._record_terminal_item(item)
                 return 0
 
+            # Embeddings can only add a guarded edit hint. Provider timeout,
+            # malformed output, or a transition guard failure leaves the alert
+            # unchanged and the deterministic delivery path proceeds.
+            embedding_service = getattr(self, "embeddings", None)
+            if embedding_service is not None:
+                try:
+                    active_target = self.telegram_state.active_edit_identity(
+                        alert.item.player_name
+                    )
+                    alert = embedding_service.annotate(
+                        alert,
+                        active_message_id=(active_target or (0, ""))[0],
+                        active_alert_token=(active_target or (0, ""))[1],
+                    )
+                except Exception as error:  # noqa: BLE001 - delivery fails open
+                    structured_log(
+                        logging.WARNING,
+                        "embeddings.annotate_failed",
+                        errorType=type(error).__name__,
+                    )
+
             if self.config.dry_run:
                 if not self._semantic_is_new(alert):
                     return 0
@@ -1638,6 +1675,17 @@ class Notifier:
             self._health_line("Model", components.get("model")),
         ]
 
+        embedding_status = self.embeddings.status()
+        if not embedding_status.enabled:
+            lines.append("Embeddings: disabled")
+        else:
+            lines.append(
+                f"Embeddings: {embedding_status.mode.upper()} · "
+                f"{self.events.embedding_count(model=embedding_status.model, dimensions=embedding_status.dimensions, input_version=INPUT_VERSION)} saved · "
+                f"{embedding_status.matches} edit hints · "
+                f"{embedding_status.failures} failures"
+            )
+
         fantasypros = self.fantasypros.status()
         if not fantasypros.enabled:
             fp_label = (
@@ -1838,6 +1886,7 @@ class Notifier:
         # write against a closed connection.
         self._pool.shutdown(wait=True, cancel_futures=True)
         self._twitter_pool.shutdown(wait=True, cancel_futures=True)
+        self.embeddings.close()
         self.session.close()
         try:
             self.events.close()
@@ -1855,6 +1904,7 @@ class Notifier:
         self._stop.set()
 
     def run_forever(self) -> None:
+        embedding_service = getattr(self, "embeddings", None)
         structured_log(
             logging.INFO,
             "notifier.started",
@@ -1863,6 +1913,14 @@ class Notifier:
             pollSeconds=self.config.poll_seconds,
             idlePollSeconds=self.config.poll_seconds_idle,
             model=self.config.openrouter_model,
+            embeddingMode=(
+                embedding_service.mode if embedding_service is not None else "off"
+            ),
+            embeddingModel=(
+                embedding_service.model
+                if embedding_service is not None and embedding_service.enabled
+                else "disabled"
+            ),
             fantasyProsEnabled=self.fantasypros.enabled,
         )
         self._start_fantasypros_refresher()

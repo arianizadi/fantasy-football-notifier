@@ -1,10 +1,10 @@
 """Durable, searchable journal of every news item the notifier evaluates.
 
 Structured labels answer operational questions (player, event, direction,
-severity) more reliably than a vector alone. Nullable embedding columns are a
-storage hook for later evaluation; a production similarity index may still
-need explicit model, format, and dimension metadata. This module intentionally
-makes no external model calls.
+severity) more reliably than a vector alone. Nullable embedding columns retain
+the model, provider, input-version, dimensions, and content hash so unlike
+vector spaces can never be compared. This module intentionally makes no
+external model calls.
 """
 
 from __future__ import annotations
@@ -27,6 +27,18 @@ POSITIVE_EVENTS = frozenset({"return"})
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _token(item: NewsItem) -> str:
@@ -81,6 +93,7 @@ class EventStore:
             self._connection.execute("PRAGMA synchronous=NORMAL")
             self._migrate_revision_schema_locked()
             self._create_news_events_table_locked()
+            self._migrate_embedding_schema_locked()
             self._connection.execute(
                 "CREATE INDEX IF NOT EXISTS news_events_guid_time "
                 "ON news_events(guid, received_at DESC)"
@@ -144,10 +157,39 @@ class EventStore:
                 feedback TEXT,
                 feedback_at TEXT,
                 embedding_model TEXT,
+                embedding_provider TEXT,
+                embedding_dimensions INTEGER,
+                embedding_input_version TEXT,
+                embedding_input_hash TEXT,
+                embedding_at TEXT,
                 embedding BLOB,
                 updated_at TEXT NOT NULL
             )
             """
+        )
+
+    def _migrate_embedding_schema_locked(self) -> None:
+        """Add vector provenance without rewriting the saved-news archive."""
+        columns = {
+            str(row["name"])
+            for row in self._connection.execute("PRAGMA table_info(news_events)")
+        }
+        additions = {
+            "embedding_provider": "TEXT",
+            "embedding_dimensions": "INTEGER",
+            "embedding_input_version": "TEXT",
+            "embedding_input_hash": "TEXT",
+            "embedding_at": "TEXT",
+        }
+        for name, sql_type in additions.items():
+            if name not in columns:
+                self._connection.execute(
+                    f"ALTER TABLE news_events ADD COLUMN {name} {sql_type}"
+                )
+        self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS news_events_embedding_lookup "
+            "ON news_events(player_name, embedding_model, embedding_dimensions, "
+            "embedding_input_version, received_at DESC)"
         )
 
     def _migrate_revision_schema_locked(self) -> None:
@@ -438,9 +480,17 @@ class EventStore:
             return cursor.rowcount > 0
 
     def store_embedding(
-        self, report: NewsItem | str, model: str, embedding: bytes
+        self,
+        report: NewsItem | str,
+        model: str,
+        embedding: bytes,
+        *,
+        provider: str = "",
+        dimensions: int | None = None,
+        input_version: str = "",
+        input_hash: str = "",
     ) -> bool:
-        """Attach provider-generated vector bytes without prescribing a provider."""
+        """Attach a validated vector and the metadata needed to compare it safely."""
         if not model or not embedding:
             return False
         with self._lock:
@@ -456,13 +506,174 @@ class EventStore:
             cursor = self._connection.execute(
                 f"""
                 UPDATE news_events
-                SET embedding_model = ?, embedding = ?, updated_at = ?
+                SET embedding_model = ?, embedding_provider = ?,
+                    embedding_dimensions = ?, embedding_input_version = ?,
+                    embedding_input_hash = ?, embedding_at = ?, embedding = ?
                 WHERE {predicate}
                 """,
-                (model, sqlite3.Binary(embedding), _utc_now(), identity),
+                (
+                    model,
+                    provider,
+                    dimensions,
+                    input_version,
+                    input_hash,
+                    _utc_now(),
+                    sqlite3.Binary(embedding),
+                    identity,
+                ),
             )
             self._connection.commit()
             return cursor.rowcount > 0
+
+    def recent_embedded_for_player(
+        self,
+        player_name: str,
+        *,
+        model: str,
+        dimensions: int,
+        input_version: str,
+        exclude_report_id: str,
+        active_message_id: int,
+        active_alert_token: str,
+        since_hours: int,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Return comparable, previously delivered vectors for one player."""
+        if (
+            not player_name.strip()
+            or not model
+            or dimensions <= 0
+            or active_message_id <= 0
+            or not active_alert_token
+        ):
+            return []
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(hours=max(1, since_hours))
+        ).isoformat()
+        with self._lock:
+            current = self._connection.execute(
+                "SELECT id, published_at FROM news_events WHERE report_id = ?",
+                (exclude_report_id,),
+            ).fetchone()
+            if current is None:
+                return []
+            rows = self._connection.execute(
+                """
+                SELECT * FROM news_events
+                WHERE player_name = ? COLLATE NOCASE
+                  AND report_id != ?
+                  AND received_at >= ?
+                  AND embedding_model = ?
+                  AND embedding_dimensions = ?
+                  AND embedding_input_version = ?
+                  AND embedding IS NOT NULL
+                  AND telegram_message_id = ?
+                  AND alert_token = ?
+                  AND outcome = 'delivered'
+                ORDER BY received_at DESC, id DESC
+                LIMIT 100
+                """,
+                (
+                    player_name.strip(),
+                    exclude_report_id,
+                    cutoff,
+                    model,
+                    int(dimensions),
+                    input_version,
+                    int(active_message_id),
+                    active_alert_token,
+                ),
+            ).fetchall()
+            current_published = _parse_datetime(current["published_at"])
+            current_id = int(current["id"])
+            older: list[dict[str, Any]] = []
+            for row in rows:
+                candidate_published = _parse_datetime(row["published_at"])
+                if current_published is not None and candidate_published is not None:
+                    precedes = candidate_published < current_published or (
+                        candidate_published == current_published
+                        and int(row["id"]) < current_id
+                    )
+                else:
+                    precedes = int(row["id"]) < current_id
+                if precedes:
+                    older.append(self._row(row))
+                if len(older) >= max(1, min(int(limit), 100)):
+                    break
+            return older
+
+    def embedding_backlog(
+        self,
+        *,
+        model: str,
+        dimensions: int,
+        input_version: str,
+        limit: int = 2000,
+        force: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Return saved reports needing a vector for the configured space."""
+        bounded = max(1, min(int(limit), 100_000))
+        predicate = "1 = 1" if force else """
+            (embedding IS NULL
+             OR embedding_model IS NULL OR embedding_model != ?
+             OR embedding_dimensions IS NULL OR embedding_dimensions != ?
+             OR embedding_input_version IS NULL OR embedding_input_version != ?)
+        """
+        parameters: tuple[Any, ...]
+        if force:
+            parameters = (bounded,)
+        else:
+            parameters = (model, int(dimensions), input_version, bounded)
+        with self._lock:
+            rows = self._connection.execute(
+                f"""
+                SELECT * FROM news_events
+                WHERE {predicate}
+                ORDER BY received_at, id
+                LIMIT ?
+                """,
+                parameters,
+            ).fetchall()
+            return [self._row(row) for row in rows]
+
+    def embedding_count(
+        self,
+        *,
+        model: str = "",
+        dimensions: int | None = None,
+        input_version: str = "",
+    ) -> int:
+        clauses = ["embedding IS NOT NULL"]
+        values: list[Any] = []
+        if model:
+            clauses.append("embedding_model = ?")
+            values.append(model)
+        if dimensions is not None:
+            clauses.append("embedding_dimensions = ?")
+            values.append(int(dimensions))
+        if input_version:
+            clauses.append("embedding_input_version = ?")
+            values.append(input_version)
+        with self._lock:
+            row = self._connection.execute(
+                f"SELECT COUNT(*) AS total FROM news_events WHERE {' AND '.join(clauses)}",
+                tuple(values),
+            ).fetchone()
+            return int(row["total"] if row is not None else 0)
+
+    def all_reports(self, *, limit: int = 100_000) -> list[dict[str, Any]]:
+        """Return the complete saved-news archive in chronological order."""
+        bounded = max(1, min(int(limit), 100_000))
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT * FROM news_events
+                ORDER BY received_at, id
+                LIMIT ?
+                """,
+                (bounded,),
+            ).fetchall()
+            return [self._row(row) for row in rows]
 
     @staticmethod
     def _row(row: sqlite3.Row) -> dict[str, Any]:

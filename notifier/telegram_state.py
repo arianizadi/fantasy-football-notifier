@@ -385,6 +385,32 @@ class TelegramState:
                 return None
             return message_id
 
+    def active_edit_identity(
+        self,
+        player_name: str,
+        *,
+        now: float | None = None,
+    ) -> tuple[int, str] | None:
+        """Return the exact latest message/token while Telegram permits edits."""
+        key = compact_key(player_name)
+        if not key:
+            return None
+        stamp = time.time() if now is None else now
+        with self._lock:
+            entry = (self._payload.get("threads") or {}).get(key)
+            if not isinstance(entry, dict):
+                return None
+            try:
+                message_id = int(entry["messageId"])
+                sent_at = float(entry["sentAt"])
+                token = str(entry["token"])
+            except (KeyError, TypeError, ValueError):
+                return None
+            age = stamp - sent_at
+            if message_id <= 0 or not token or age < 0 or age >= EDIT_WINDOW_SECONDS:
+                return None
+            return message_id, token
+
     def coalescing_target(
         self,
         alert: Alert,
@@ -439,15 +465,49 @@ class TelegramState:
             age = stamp - sent_at
             if age < 0 or age >= EDIT_WINDOW_SECONDS or not token:
                 return None
-            if current_event != previous_event:
-                return None
-            if not current_status or current_status != previous_status:
-                return None
-            if not event_facts_equivalent(
-                previous_fact_signature,
-                current_fact_signature,
-                status=current_status,
-            ):
+            try:
+                embedding_message_id = int(
+                    alert.embedding_match_message_id or 0
+                )
+                embedding_score = float(alert.embedding_similarity or 0.0)
+            except (TypeError, ValueError):
+                embedding_message_id = 0
+                embedding_score = 0.0
+            embedding_hint = bool(
+                embedding_message_id == message_id
+                and alert.embedding_match_token == token
+                and alert.embedding_model
+                and 0.5 <= embedding_score <= 1.000001
+            )
+            deterministic_match = bool(
+                current_event == previous_event
+                and current_status
+                and current_status == previous_status
+                and event_facts_equivalent(
+                    previous_fact_signature,
+                    current_fact_signature,
+                    status=current_status,
+                )
+            )
+            embedding_state_match = bool(
+                embedding_hint
+                and alert.item.subject_confident
+                and current_event == previous_event
+                and current_status
+                and current_status == previous_status
+                and (
+                    event_facts_equivalent(
+                        previous_fact_signature,
+                        current_fact_signature,
+                        status=current_status,
+                    )
+                    or (
+                        previous_fact_signature == "unspecified"
+                        and current_fact_signature == "unspecified"
+                    )
+                )
+            )
+            if not deterministic_match and not embedding_state_match:
                 return None
             same_role_fact = (
                 current_event == "depth_chart"
@@ -462,8 +522,11 @@ class TelegramState:
                     status=current_status,
                 )
             )
+            if embedding_hint and current_severity > previous_severity:
+                return None
             if (
-                current_severity > previous_severity
+                not embedding_hint
+                and current_severity > previous_severity
                 and not same_role_fact
                 and not same_trade_fact
             ):

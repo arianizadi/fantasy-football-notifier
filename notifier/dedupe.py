@@ -187,6 +187,10 @@ _MEDICAL_EVENT_PATTERN = re.compile(
     r"hernia|achilles|acl|mcl|meniscus)\b",
     re.I,
 )
+_WAIVE_ACTION_PATTERN = re.compile(
+    r"\bwaiv(?:e|es|ed|ing)(?:\s*/\s*injured)?\b",
+    re.I,
+)
 
 # Trade reports arrive as a burst: a breaking-news sentence, full terms, and
 # several source confirmations can all describe the same completed move.  A
@@ -881,6 +885,36 @@ def _direct_subject_medical_report(item: NewsItem) -> bool:
     return attributed_absence_subject(text, [item.player_name]) == item.player_name
 
 
+def _direct_subject_release_report(item: NewsItem) -> bool:
+    """Whether transaction language directly releases the saved subject."""
+    if not item.subject_confident or not item.player_name:
+        return False
+    text = _report_text(item)
+    player = r"\s+".join(re.escape(part) for part in item.player_name.split())
+    if not player:
+        return False
+    if _WAIVE_ACTION_PATTERN.search(text):
+        waive = r"waiv(?:e|es|ed|ing)(?:\s*/\s*injured)?"
+        if re.search(
+            rf"(?:\b{waive}\b[^.\n]{{0,65}}\b{player}\b|"
+            rf"\b{player}\b[^.\n]{{0,65}}\b(?:was|is|has\s+been|"
+            rf"have\s+been|were|got)\s+{waive}\b)",
+            text,
+            re.I,
+        ):
+            return True
+    # A RotoWire URL/title already supplies a dedicated subject. Its compact
+    # headline commonly reads only "Cut by Cardinals" or "Released Monday".
+    return item.source.casefold() == "rotowire" and bool(
+        re.match(
+            r"^\s*(?:waiv(?:e|es|ed|ing)(?:\s*/\s*injured)?|"
+            r"releas(?:e|es|ed|ing)|cuts?|cutting)\b",
+            item.headline,
+            re.I,
+        )
+    )
+
+
 def semantic_event_type(
     item: NewsItem,
     event_type: str,
@@ -888,6 +922,8 @@ def semantic_event_type(
 ) -> str:
     """Canonical event family used only for dedupe/update decisions."""
     normalized = _normalized_event_type(event_type)
+    if normalized in {"other", "injury"} and _direct_subject_release_report(item):
+        return "release"
     if normalized in _ROLE_EVENT_TYPES and role_decision_status(item):
         return "depth_chart"
     if normalized == "other" and _direct_subject_medical_report(item):

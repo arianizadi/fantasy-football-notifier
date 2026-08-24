@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +19,10 @@ DEFAULT_FANTASYPROS_REFRESH_HOURS = 2
 DEFAULT_FANTASYPROS_MAX_AGE_HOURS = 12
 DEFAULT_DAILY_RECAP_HOUR = 8
 DEFAULT_WAIVER_REPORT_LEAD_HOURS = 8
+DEFAULT_EMBEDDING_MODEL = "qwen/qwen3-embedding-8b"
+DEFAULT_EMBEDDING_DIMENSIONS = 512
+DEFAULT_EMBEDDING_SIMILARITY_THRESHOLD = 0.90
+DEFAULT_EMBEDDING_WINDOW_HOURS = 6
 
 
 @dataclass(frozen=True)
@@ -26,6 +31,13 @@ class Config:
     telegram_chat_id: str
     openrouter_api_key: str
     openrouter_model: str
+    embedding_mode: str
+    embedding_model: str
+    embedding_dimensions: int
+    embedding_similarity_threshold: float
+    embedding_window_hours: int
+    embedding_timeout_seconds: int
+    embedding_wait_ms: int
     espn_enabled: bool
     espn_league_id: int
     espn_year: int
@@ -86,12 +98,33 @@ def optional_bool(name: str, default: bool) -> bool:
     raise NotifierError(f"{name} must be a boolean value")
 
 
-def validate_model(value: str) -> str:
+def optional_float(name: str, default: float, minimum: float, maximum: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError as error:
+        raise NotifierError(f"{name} must be a number") from error
+    if not math.isfinite(value) or value < minimum or value > maximum:
+        raise NotifierError(f"{name} must be between {minimum} and {maximum}")
+    return value
+
+
+def optional_choice(name: str, default: str, choices: frozenset[str]) -> str:
+    value = os.environ.get(name, "").strip().lower() or default
+    if value not in choices:
+        allowed = ", ".join(sorted(choices))
+        raise NotifierError(f"{name} must be one of: {allowed}")
+    return value
+
+
+def validate_model(value: str, *, variable: str = "OPENROUTER_MODEL") -> str:
     # A bare "latest" alias can silently change classification behaviour
     # mid-season, so require an explicit provider/model slug.
     if "/" not in value:
         raise NotifierError(
-            "OPENROUTER_MODEL must be a full OpenRouter slug, e.g. "
+            f"{variable} must be a full OpenRouter slug, e.g. "
             "deepseek/deepseek-v4-flash-0731"
         )
     return value
@@ -114,6 +147,46 @@ def load_config() -> Config:
         openrouter_api_key=required("OPENROUTER_API_KEY"),
         openrouter_model=validate_model(
             os.environ.get("OPENROUTER_MODEL", "").strip() or DEFAULT_MODEL
+        ),
+        embedding_mode=optional_choice(
+            "EMBEDDING_MODE",
+            "off",
+            frozenset({"off", "shadow", "coalesce"}),
+        ),
+        embedding_model=validate_model(
+            os.environ.get("EMBEDDING_MODEL", "").strip()
+            or DEFAULT_EMBEDDING_MODEL,
+            variable="EMBEDDING_MODEL",
+        ),
+        embedding_dimensions=optional_int(
+            "EMBEDDING_DIMENSIONS",
+            DEFAULT_EMBEDDING_DIMENSIONS,
+            32,
+            4096,
+        ),
+        embedding_similarity_threshold=optional_float(
+            "EMBEDDING_SIMILARITY_THRESHOLD",
+            DEFAULT_EMBEDDING_SIMILARITY_THRESHOLD,
+            0.5,
+            1.0,
+        ),
+        embedding_window_hours=optional_int(
+            "EMBEDDING_WINDOW_HOURS",
+            DEFAULT_EMBEDDING_WINDOW_HOURS,
+            1,
+            24,
+        ),
+        embedding_timeout_seconds=optional_int(
+            "EMBEDDING_TIMEOUT_SECONDS",
+            8,
+            1,
+            30,
+        ),
+        embedding_wait_ms=optional_int(
+            "EMBEDDING_WAIT_MS",
+            250,
+            0,
+            2000,
         ),
         espn_enabled=bool(os.environ.get("ESPN_LEAGUE_ID", "").strip()),
         espn_league_id=int(os.environ.get("ESPN_LEAGUE_ID", "0").strip() or 0),
