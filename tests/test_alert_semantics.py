@@ -237,6 +237,37 @@ def test_non_removal_events_never_create_mechanical_moves(event_type: str) -> No
     assert "START " not in text
 
 
+def test_deep_release_does_not_promote_an_even_deeper_player() -> None:
+    league = LeagueRef("sleeper", "1234", "Home League", "Mine")
+    raw = LeaguePlays(
+        league=league,
+        subject_state="free_agent",
+        subject_owner="",
+        subject_depth_order=7,
+        beneficiaries=[Beneficiary("Depth WR", "WR", 8, "free_agent")],
+    )
+
+    filtered = plays_for_event([raw], "release", 4)[0]
+
+    assert filtered.claimable == []
+    assert not filtered.has_action
+
+
+def test_starter_release_can_still_surface_the_immediate_successor() -> None:
+    league = LeagueRef("sleeper", "1234", "Home League", "Mine")
+    raw = LeaguePlays(
+        league=league,
+        subject_state="rostered",
+        subject_owner="Opponent",
+        subject_depth_order=1,
+        beneficiaries=[Beneficiary("Next Player", "RB", 2, "free_agent")],
+    )
+
+    filtered = plays_for_event([raw], "release", 4)[0]
+
+    assert [candidate.name for candidate in filtered.claimable] == ["Next Player"]
+
+
 def test_major_injury_retains_deterministic_add_and_start_moves() -> None:
     league = LeagueRef("espn", "9876", "Sunday Crew", "Mine")
     raw = LeaguePlays(

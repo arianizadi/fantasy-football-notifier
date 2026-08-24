@@ -454,7 +454,19 @@ class TelegramState:
                 and current_status.startswith("role_")
                 and current_fact_signature.startswith("role:")
             )
-            if current_severity > previous_severity and not same_role_fact:
+            same_trade_fact = (
+                current_event == "trade"
+                and event_facts_equivalent(
+                    previous_fact_signature,
+                    current_fact_signature,
+                    status=current_status,
+                )
+            )
+            if (
+                current_severity > previous_severity
+                and not same_role_fact
+                and not same_trade_fact
+            ):
                 return None
 
             # The digest record must be editable too. Otherwise a Telegram

@@ -13,7 +13,7 @@ import logging
 import re
 import xml.etree.ElementTree as ElementTree
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any
 
@@ -33,6 +33,11 @@ USER_AGENT = "fantasy-news-notifier/1.0 (personal fantasy league use)"
 # RotoWire titles are "Player Name: Headline text".
 TITLE_PATTERN = re.compile(r"^\s*(?P<player>[^:]{2,60}?)\s*:\s*(?P<headline>.+)$")
 BOILERPLATE = re.compile(r"\s*Visit RotoWire\.com for more analy.*$", re.IGNORECASE | re.DOTALL)
+MERIDIEM_TIME = re.compile(
+    r"\b(?P<hour>0?[1-9]|1[0-2]):(?P<minute>[0-5]\d)"
+    r"(?::(?P<second>[0-5]\d))?\s*(?P<meridiem>[AP]M)\b",
+    re.IGNORECASE,
+)
 
 # Some RotoWire articles are filed under the player who benefits rather than
 # the teammate whose injury created the opportunity.  For example, the title
@@ -204,10 +209,29 @@ def _clean(value: str | None) -> str:
 def _parse_published(value: str | None) -> datetime | None:
     if not value:
         return None
+
+    # RotoWire emits dates such as ``Mon, 24 Aug 2026 11:51:00 AM PDT``.
+    # RFC 2822 has no AM/PM token, and parsedate_to_datetime() silently returns
+    # a *naive* value for that otherwise-valid date.  Convert just the clock to
+    # 24-hour form first so the parser can retain PDT/PST (and the other
+    # explicit RFC feed zones).  Never pass a naive source timestamp onward:
+    # display code would otherwise interpret it as the host's local time.
+    def _to_24_hour(match: re.Match[str]) -> str:
+        hour = int(match.group("hour")) % 12
+        if match.group("meridiem").upper() == "PM":
+            hour += 12
+        second = match.group("second")
+        suffix = f":{second}" if second is not None else ""
+        return f"{hour:02d}:{match.group('minute')}{suffix}"
+
+    normalized = MERIDIEM_TIME.sub(_to_24_hour, value.strip())
     try:
-        return parsedate_to_datetime(value)
+        parsed = parsedate_to_datetime(normalized)
     except (TypeError, ValueError):
         return None
+    if parsed is None or parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
 
 
 def parse_feed(xml_text: str) -> list[NewsItem]:

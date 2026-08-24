@@ -285,12 +285,60 @@ def _context_block(
     severity: int,
     *,
     show_ownership: bool = True,
+    event_type: str = "",
 ) -> list[str]:
     """A readable Sleeper view of only the affected position."""
     if context is None or severity < MIN_SEVERITY_FOR_CONTEXT:
         return []
 
     labels = _league_labels(leagues)
+    transaction_event = normalized_event_type(event_type)
+    if transaction_event in {"trade", "release", "signing"}:
+        subject = next(
+            (entry for entry in context.same_position if entry.is_subject),
+            None,
+        )
+        if subject is None:
+            return []
+        lines = ["📋 <b>FANTASY ROSTER SNAPSHOT</b>"]
+        refreshed = _freshness_label(context.player_index_refreshed_at)
+        provenance = "Sleeper"
+        if refreshed:
+            provenance += f" · updated {refreshed}"
+        lines.append(f"<i>{_escape(provenance)}</i>")
+        if not show_ownership:
+            lines.append("⚠️ Live league ownership unavailable.")
+
+        lines.append(
+            f"➡️ <b>{_escape(subject.position)} {_escape(subject.name)}</b>"
+            " · report subject"
+        )
+        ownership = (
+            _ownership_labels(subject, leagues, labels) if show_ownership else []
+        )
+        lines += [f"↳ {_escape(owner)}" for owner in ownership]
+        metadata: list[str] = []
+        if subject.search_rank and subject.search_rank < 999:
+            metadata.append(f"Sleeper #{subject.search_rank}")
+        if subject.sleeper_injury_status:
+            metadata.append(f"Injury: {_escape(subject.sleeper_injury_status)}")
+        if subject.sleeper_status and subject.sleeper_status.casefold() != "active":
+            metadata.append(f"Status: {_escape(subject.sleeper_status)}")
+        if metadata:
+            lines.append("↳ " + " · ".join(metadata))
+        transaction_note = (
+            "NFL depth is withheld because the player is no longer on the "
+            "listed team."
+            if transaction_event == "release"
+            else "NFL depth is withheld for transaction news until Sleeper "
+            "refreshes the player's team."
+        )
+        lines += [
+            "",
+            f"<i>{_escape(transaction_note)}</i>",
+        ]
+        return lines
+
     lines = [
         f"📋 <b>{_escape(context.team)} {_escape(context.subject_position)} DEPTH</b>"
     ]
@@ -529,6 +577,8 @@ def _deterministic_note(alert: Alert) -> str:
         return "Confirm active status and expected workload before lineup lock."
     if event == "signing":
         return "No automatic waiver move. Confirm the player's official role first."
+    if event == "release":
+        return "Do not add from the old depth chart. Wait for a new team and role."
     if event in {"trade", "depth_chart", "usage"}:
         return "Recheck the official role before making a lineup or waiver move."
     if event == "practice_report" and alert.classification.severity < 4:
@@ -712,6 +762,7 @@ def format_alert(alert: Alert) -> str:
         alert.all_leagues,
         classification.severity,
         show_ownership=not alert.availability_refresh_failed,
+        event_type=classification.event_type,
     )
     if context_lines:
         lines += [""] + context_lines

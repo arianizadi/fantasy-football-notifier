@@ -109,6 +109,13 @@ def _optional_rank(value: Any) -> int | None:
     return parsed if parsed > 0 else None
 
 
+def _optional_int(value: Any) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _beneficiary(payload: dict[str, Any]) -> Beneficiary:
     return Beneficiary(
         name=str(payload.get("name") or ""),
@@ -165,6 +172,7 @@ def _league_plays(payload: dict[str, Any]) -> LeaguePlays:
         league=_league(payload["league"]),
         subject_state=str(payload.get("subject_state") or "free_agent"),
         subject_owner=str(payload.get("subject_owner") or ""),
+        subject_depth_order=_optional_int(payload.get("subject_depth_order")),
         beneficiaries=[_beneficiary(value) for value in payload.get("beneficiaries", [])],
         bench_options=[str(value) for value in payload.get("bench_options", [])],
         capacity=capacity,

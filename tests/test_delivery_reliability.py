@@ -19,6 +19,7 @@ from notifier.dedupe import (
     semantic_event_fact_signature,
     semantic_event_status,
     semantic_event_type,
+    trade_destination,
 )
 from notifier.models import (
     Alert,
@@ -63,6 +64,18 @@ def _alert(item: NewsItem, severity: int = 4, event_type: str = "inactive") -> A
             raw={"source": "test"},
         ),
         tier="league",
+    )
+
+
+def _trade_item(
+    guid: str,
+    headline: str,
+    *,
+    source: str = "twitter",
+) -> NewsItem:
+    return replace(
+        _item(guid=guid, source=source, headline=headline),
+        player_name="Kayshon Boutte",
     )
 
 
@@ -588,6 +601,7 @@ def test_outbox_round_trips_full_context(tmp_path) -> None:
         league=league,
         subject_state="mine",
         subject_owner="Mine",
+        subject_depth_order=2,
         beneficiaries=[
             Beneficiary(
                 "Backup",
@@ -626,6 +640,7 @@ def test_outbox_round_trips_full_context(tmp_path) -> None:
     assert restored.context.player_index_refreshed_at == refreshed
     assert restored.context.same_position[0].sleeper_injury_status == "Questionable"
     assert restored.per_league[0].capacity == plays.capacity
+    assert restored.per_league[0].subject_depth_order == 2
     assert restored.per_league[0].beneficiaries[0].named_in_report is True
     assert restored.per_league[0].beneficiaries[0].pro_team == "ARI"
     assert restored.per_league[0].beneficiaries[0].fantasypros_waiver_rank == 34
@@ -660,6 +675,265 @@ def test_semantic_dedupe_allows_severity_and_status_escalations(tmp_path) -> Non
     store.record_semantic("Example Player", "injury", 4, "questionable")
     assert store.is_semantically_new("Example Player", "injury", 4, "inactive")
     assert not store.is_semantically_new("Example Player", "injury", 3, "limited")
+
+
+def test_completed_trade_corroboration_uses_destination_not_wording_or_terms(
+    tmp_path,
+) -> None:
+    store = SeenStore(tmp_path / "seen.json")
+    initial = _trade_item(
+        "twitter:trade:1",
+        "The Patriots traded Kayshon Boutte to the Texans for a draft pick.",
+    )
+    full_terms = _trade_item(
+        "twitter:trade:2",
+        (
+            "Full terms: Texans get WR Kayshon Boutte. Patriots get safety "
+            "Jaylen Reed and a 2028 seventh-round pick."
+        ),
+    )
+    event_type = semantic_event_type(initial, "trade")
+    status = semantic_event_status(initial, event_type)
+    facts = semantic_event_fact_signature(initial, event_type)
+
+    assert trade_destination(initial) == "HOU"
+    assert trade_destination(full_terms) == "HOU"
+    assert status == "trade"
+    assert facts == "trade:completed:to:HOU"
+    assert semantic_event_fact_signature(full_terms, "trade") == facts
+
+    store.record_semantic(initial.player_name, event_type, 3, status, facts)
+
+    # Classifier severity drift cannot turn corroboration into a fresh alert.
+    assert not store.is_semantically_new(
+        full_terms.player_name,
+        event_type,
+        4,
+        semantic_event_status(full_terms, event_type),
+        semantic_event_fact_signature(full_terms, event_type),
+    )
+
+
+@pytest.mark.parametrize(
+    "headline",
+    [
+        "The Texans will acquire Kayshon Boutte from the Patriots.",
+        "The Texans have agreed to acquire Kayshon Boutte from New England.",
+        "The Texans are acquiring Kayshon Boutte from the Patriots.",
+        "Kayshon Boutte heads from New England to Houston.",
+        (
+            "Texans acquire Kayshon Boutte and send John Smith to the Patriots."
+        ),
+        (
+            "Full terms: Texans get Kayshon Boutte and send John Smith to "
+            "the Patriots."
+        ),
+    ],
+)
+def test_confirmed_trade_phrasings_identify_the_subject_destination(
+    headline,
+) -> None:
+    report = _trade_item("twitter:trade:wording", headline)
+
+    assert trade_destination(report) == "HOU"
+    assert semantic_event_fact_signature(report, "trade") == (
+        "trade:completed:to:HOU"
+    )
+
+
+def test_another_players_destination_is_not_assigned_to_trade_subject() -> None:
+    report = _trade_item(
+        "twitter:trade:return-player",
+        (
+            "Kayshon Boutte has been traded. In the deal, John Smith goes to "
+            "the Patriots."
+        ),
+    )
+
+    assert trade_destination(report) == ""
+    assert semantic_event_fact_signature(report, "trade") == (
+        "trade:completed:to:?"
+    )
+
+
+def test_unknown_trade_destination_enriches_one_way_without_later_regression(
+    tmp_path,
+) -> None:
+    store = SeenStore(tmp_path / "seen.json")
+    unknown = _trade_item(
+        "twitter:trade:unknown",
+        "Kayshon Boutte has been traded.",
+    )
+    known = _trade_item(
+        "twitter:trade:known",
+        "The Patriots traded Kayshon Boutte to the Texans.",
+    )
+    assert semantic_event_fact_signature(unknown, "trade") == (
+        "trade:completed:to:?"
+    )
+    store.record_semantic(
+        unknown.player_name,
+        "trade",
+        3,
+        semantic_event_status(unknown, "trade"),
+        semantic_event_fact_signature(unknown, "trade"),
+    )
+
+    assert not store.is_semantically_new(
+        known.player_name,
+        "trade",
+        4,
+        semantic_event_status(known, "trade"),
+        semantic_event_fact_signature(known, "trade"),
+    )
+    store.record_semantic(
+        known.player_name,
+        "trade",
+        4,
+        semantic_event_status(known, "trade"),
+        semantic_event_fact_signature(known, "trade"),
+    )
+
+    # A later terse report is duplicate evidence, not a reason to replace the
+    # richer destination-aware state or create another alert.
+    assert not store.is_semantically_new(
+        unknown.player_name,
+        "trade",
+        5,
+        semantic_event_status(unknown, "trade"),
+        semantic_event_fact_signature(unknown, "trade"),
+    )
+
+
+def test_false_cancellation_report_does_not_reverse_completed_trade() -> None:
+    report = _trade_item(
+        "twitter:trade:not-cancelled",
+        (
+            "The trade is off report is false; Kayshon Boutte is headed to "
+            "Houston."
+        ),
+    )
+
+    assert semantic_event_status(report, "trade") == "trade"
+    assert semantic_event_fact_signature(report, "trade") == (
+        "trade:completed:to:HOU"
+    )
+
+
+def test_trade_correction_cancellation_and_rumor_remain_new_facts(tmp_path) -> None:
+    store = SeenStore(tmp_path / "seen.json")
+    completed = _trade_item(
+        "twitter:trade:hou",
+        "Patriots are sending Kayshon Boutte to Houston in a completed trade.",
+    )
+    corrected = _trade_item(
+        "twitter:trade:dal",
+        "Correction: the Patriots traded Kayshon Boutte to the Cowboys.",
+    )
+    pronoun_correction = _trade_item(
+        "twitter:trade:pronoun-correction",
+        (
+            "Correction: Kayshon Boutte wasn't traded to the Texans; he was "
+            "dealt to the Cowboys."
+        ),
+    )
+    negated_correction = _trade_item(
+        "twitter:trade:negated-correction",
+        "Kayshon Boutte has not been traded to Houston.",
+    )
+    contracted_correction = _trade_item(
+        "twitter:trade:contracted-correction",
+        "Kayshon Boutte hasn't been traded to Houston.",
+    )
+    cancelled = _trade_item(
+        "twitter:trade:cancelled",
+        "The Kayshon Boutte trade to Houston was cancelled after a failed physical.",
+    )
+    rumor = _trade_item(
+        "twitter:trade:rumor",
+        "The Cowboys could trade for Kayshon Boutte.",
+    )
+    event_type = semantic_event_type(completed, "trade")
+    store.record_semantic(
+        completed.player_name,
+        event_type,
+        3,
+        semantic_event_status(completed, event_type),
+        semantic_event_fact_signature(completed, event_type),
+    )
+
+    assert semantic_event_fact_signature(corrected, "trade") == (
+        "trade:correction:to:DAL"
+    )
+    assert semantic_event_fact_signature(pronoun_correction, "trade") == (
+        "trade:correction:to:?"
+    )
+    assert semantic_event_fact_signature(negated_correction, "trade") == (
+        "trade:correction:to:?"
+    )
+    assert semantic_event_fact_signature(contracted_correction, "trade") == (
+        "trade:correction:to:?"
+    )
+    assert semantic_event_status(cancelled, "trade") == "trade_cancelled"
+    assert semantic_event_status(rumor, "trade") == "trade_rumor"
+    for report in (
+        corrected,
+        pronoun_correction,
+        negated_correction,
+        contracted_correction,
+        cancelled,
+        rumor,
+    ):
+        assert store.is_semantically_new(
+            report.player_name,
+            event_type,
+            3,
+            semantic_event_status(report, event_type),
+            semantic_event_fact_signature(report, event_type),
+        )
+
+
+def test_trade_upgrade_accepts_legacy_unspecified_state_only_for_known_completion(
+    tmp_path,
+) -> None:
+    store = SeenStore(tmp_path / "seen.json")
+    store.record_semantic("Kayshon Boutte", "trade", 3, "trade", "unspecified")
+    assert store.save()
+    store = SeenStore(tmp_path / "seen.json")
+    completed = _trade_item(
+        "twitter:trade:upgrade",
+        "Kayshon Boutte heads to the Texans in a completed trade.",
+    )
+    ambiguous = _trade_item(
+        "twitter:trade:ambiguous",
+        "More discussion about Kayshon Boutte and the trade market.",
+    )
+
+    assert not store.is_semantically_new(
+        completed.player_name,
+        "trade",
+        4,
+        semantic_event_status(completed, "trade"),
+        semantic_event_fact_signature(completed, "trade"),
+    )
+    assert store.is_semantically_new(
+        ambiguous.player_name,
+        "trade",
+        3,
+        semantic_event_status(ambiguous, "trade"),
+        semantic_event_fact_signature(ambiguous, "trade"),
+    )
+
+    # The compatibility exception is trade-specific; generic unspecified
+    # usage reports still represent potentially different actionable facts.
+    store.record_semantic("Example Player", "usage", 3, "usage", "unspecified")
+    assert store.is_semantically_new(
+        "Example Player",
+        "usage",
+        3,
+        "usage",
+        "unspecified",
+    )
 
 
 def test_semantic_dedupe_treats_a_distinct_condition_as_a_new_fact(tmp_path) -> None:

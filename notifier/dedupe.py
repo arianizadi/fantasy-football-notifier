@@ -188,6 +188,142 @@ _MEDICAL_EVENT_PATTERN = re.compile(
     re.I,
 )
 
+# Trade reports arrive as a burst: a breaking-news sentence, full terms, and
+# several source confirmations can all describe the same completed move.  A
+# text fingerprint cannot join those wordings, while treating every generic
+# ``trade`` label as equivalent would hide corrections and unrelated rumors.
+# The destination is the smallest stable identity shared by those reports.
+_NFL_TEAM_ALIASES: dict[str, tuple[str, ...]] = {
+    "ARI": ("Arizona Cardinals", "Cardinals"),
+    "ATL": ("Atlanta Falcons", "Falcons"),
+    "BAL": ("Baltimore Ravens", "Ravens"),
+    "BUF": ("Buffalo Bills", "Bills"),
+    "CAR": ("Carolina Panthers", "Panthers"),
+    "CHI": ("Chicago Bears", "Bears"),
+    "CIN": ("Cincinnati Bengals", "Bengals"),
+    "CLE": ("Cleveland Browns", "Browns"),
+    "DAL": ("Dallas Cowboys", "Cowboys"),
+    "DEN": ("Denver Broncos", "Broncos"),
+    "DET": ("Detroit Lions", "Lions"),
+    "GB": ("Green Bay Packers", "Green Bay", "Packers"),
+    "HOU": ("Houston Texans", "Houston", "Texans"),
+    "IND": ("Indianapolis Colts", "Indianapolis", "Colts"),
+    "JAX": ("Jacksonville Jaguars", "Jacksonville", "Jaguars", "Jags"),
+    "KC": ("Kansas City Chiefs", "Kansas City", "Chiefs"),
+    "LV": ("Las Vegas Raiders", "Las Vegas", "Raiders"),
+    "LAC": ("Los Angeles Chargers", "LA Chargers", "Chargers"),
+    "LAR": ("Los Angeles Rams", "LA Rams", "Rams"),
+    "MIA": ("Miami Dolphins", "Dolphins"),
+    "MIN": ("Minnesota Vikings", "Vikings"),
+    "NE": ("New England Patriots", "New England", "Patriots", "Pats"),
+    "NO": ("New Orleans Saints", "New Orleans", "Saints"),
+    "NYG": ("New York Giants", "NY Giants", "Giants"),
+    "NYJ": ("New York Jets", "NY Jets", "Jets"),
+    "PHI": ("Philadelphia Eagles", "Philadelphia", "Eagles"),
+    "PIT": ("Pittsburgh Steelers", "Pittsburgh", "Steelers"),
+    "SEA": ("Seattle Seahawks", "Seahawks"),
+    "SF": ("San Francisco 49ers", "San Francisco", "49ers", "Niners"),
+    "TB": ("Tampa Bay Buccaneers", "Tampa Bay", "Buccaneers", "Bucs"),
+    "TEN": ("Tennessee Titans", "Tennessee", "Titans"),
+    "WSH": (
+        "Washington Commanders",
+        "Washington",
+        "Commanders",
+    ),
+}
+
+
+def _trade_alias_pattern(alias: str) -> str:
+    return re.escape(alias).replace(r"\ ", r"\s+")
+
+
+_TRADE_TEAM_PATTERN = re.compile(
+    r"\b(?P<team>"
+    + "|".join(
+        sorted(
+            (
+                _trade_alias_pattern(alias)
+                for aliases in _NFL_TEAM_ALIASES.values()
+                for alias in aliases
+            ),
+            key=len,
+            reverse=True,
+        )
+    )
+    + r")\b",
+    re.I,
+)
+_TRADE_TEAM_LOOKUP = {
+    re.sub(r"\s+", " ", alias).casefold(): team
+    for team, aliases in _NFL_TEAM_ALIASES.items()
+    for alias in aliases
+}
+_TRADE_CANCELLATION_PATTERN = re.compile(
+    r"\b(?:"
+    r"(?:trade|deal)[^.\n]{0,100}?"
+    r"(?:is\s+|was\s+|has\s+been\s+)?"
+    r"(?:off|dead|cancel(?:l)?ed|voided|rescinded|vetoed|nixed)|"
+    r"(?:cancel(?:l)?ed|voided|rescinded|vetoed|nixed)\s+(?:the\s+)?"
+    r"(?:trade|deal)|"
+    r"trade\s+(?:fell|falls|has\s+fallen)\s+through|"
+    r"deal\s+(?:fell|falls|has\s+fallen)\s+through|"
+    r"failed\s+(?:his\s+|the\s+)?physical[^.\n]{0,80}"
+    r"(?:trade|deal)|"
+    r"(?:trade|deal)[^.\n]{0,100}failed\s+(?:his\s+|the\s+)?physical)\b",
+    re.I,
+)
+_TRADE_CANCELLATION_DENIAL_PATTERN = re.compile(
+    r"\b(?:"
+    r"(?:trade|deal)[^.\n]{0,60}\b(?:is|was|has\s+been)\s+not\s+"
+    r"(?:off|dead|cancel(?:l)?ed|voided|rescinded|vetoed|nixed)|"
+    r"(?:off|dead|cancel(?:l)?ed|voided|rescinded|vetoed|nixed)\s+"
+    r"(?:(?:reports?|rumou?rs?|claims?)\s+)?"
+    r"(?:is|are|was|were)\s+(?:false|incorrect|wrong|denied))\b",
+    re.I,
+)
+_TRADE_CORRECTION_PATTERN = re.compile(
+    r"\b(?:"
+    r"correction|retraction|retracted|corrected\s+report|"
+    r"(?:was|is|has)\s+not\s+(?:(?:been|being)\s+)?"
+    r"(?:traded|dealt|sent)|"
+    r"(?:wasn|isn|hasn)['’]t\s+(?:(?:been|being)\s+)?"
+    r"(?:traded|dealt|sent)|"
+    r"incorrectly\s+reported"
+    r")\b",
+    re.I,
+)
+_TRADE_RUMOR_PATTERN = re.compile(
+    r"\b(?:"
+    r"trade\s+(?:talks?|rumou?rs?|interest|candidate)|"
+    r"(?:on|placed\s+on)\s+the\s+trade\s+block|"
+    r"(?:could|may|might|would|expected|likely)\s+(?:to\s+)?"
+    r"(?:be\s+)?traded|"
+    r"(?:could|may|might|would)\s+trade\s+for|"
+    r"(?:could|may|might|would)\s+(?:to\s+)?"
+    r"(?:get|acquire|land)\b|"
+    r"(?:exploring|discussing|considering|seeking|working\s+on)\s+"
+    r"(?:a\s+)?trade|"
+    r"interested\s+in\s+trading\s+for)\b",
+    re.I,
+)
+_TRADE_COMPLETION_PATTERN = re.compile(
+    r"\b(?:"
+    r"traded|dealt|acquir(?:e|es|ed|ing)|receiv(?:e|es|ed|ing)|"
+    r"get(?:s|ting)?|"
+    r"sent\s+to|sends\s+[^.\n]{0,100}\s+to|"
+    r"(?:is|are|was|were)\s+(?:being\s+)?(?:traded|dealt|sent)|"
+    r"(?:is|are|was|were)\s+sending|"
+    r"(?:heads?|headed|goes?)\s+(?:(?:from|out\s+of)\s+"
+    r"[^,.\n]{1,45}\s+)?to|lands?\s+(?:with|in)|"
+    r"trade[sd]?\s+for|deal\s+(?:agreed|complete|completed|done)|"
+    r"full\s+(?:trade\s+)?terms|trade\s*[!:—-])(?=\s|$|[.,;:!?—-])",
+    re.I,
+)
+_TRADE_SIGNATURE_PATTERN = re.compile(
+    r"^trade:(?P<state>completed|cancelled|correction|rumor):to:"
+    r"(?P<team>[A-Z?]+)$"
+)
+
 
 def _normalized_event_type(event_type: str) -> str:
     return (event_type or "other").strip().lower().replace("-", "_").replace(" ", "_")
@@ -204,6 +340,172 @@ def _report_text(item: NewsItem) -> str:
     if body == headline or body.startswith(headline) or headline.startswith(body):
         return body if len(body) >= len(headline) else headline
     return f"{headline}. {body}"
+
+
+def _canonical_trade_team(value: str) -> str:
+    return _TRADE_TEAM_LOOKUP.get(re.sub(r"\s+", " ", value).casefold(), "")
+
+
+def _first_trade_team(fragment: str) -> str:
+    match = _TRADE_TEAM_PATTERN.search(fragment)
+    if match is not None:
+        return _canonical_trade_team(match.group("team"))
+
+    # Short abbreviations are useful in terse transaction posts, but matching
+    # them case-insensitively would turn ordinary words such as "no" into an
+    # NFL team. Only accept their conventional all-uppercase form.
+    abbreviations = {
+        match.group(0): match.start()
+        for match in re.finditer(
+            r"(?<![A-Za-z])(?:ARI|ATL|BAL|BUF|CAR|CHI|CIN|CLE|DAL|DEN|DET|"
+            r"GB|HOU|IND|JAX|JAC|KC|LV|LAC|LAR|MIA|MIN|NE|NO|NYG|NYJ|PHI|"
+            r"PIT|SEA|SF|TB|TEN|WAS|WSH)(?![A-Za-z])",
+            fragment,
+        )
+    }
+    if not abbreviations:
+        return ""
+    abbreviation = min(abbreviations, key=abbreviations.get)
+    return {"JAC": "JAX", "WAS": "WSH"}.get(abbreviation, abbreviation)
+
+
+def _trade_subject_patterns(item: NewsItem) -> tuple[re.Pattern[str], ...]:
+    parts = [part for part in item.player_name.split() if part]
+    if not parts:
+        return ()
+    names = [item.player_name]
+    # Dedicated player items and confidently attributed tweets frequently use
+    # only the surname in their prose. Keep the full name first, and require a
+    # non-trivial surname to avoid matching initials or position labels.
+    if len(parts) > 1 and len(parts[-1]) >= 4:
+        names.append(parts[-1])
+    return tuple(
+        re.compile(
+            r"\b" + r"\s+".join(re.escape(part) for part in name.split()) + r"\b",
+            re.I,
+        )
+        for name in names
+    )
+
+
+def trade_destination(item: NewsItem) -> str:
+    """Return a destination team only when the report states direction.
+
+    A transaction report often names two clubs, so selecting the first team
+    mention would confuse the player's former club or the team receiving the
+    return compensation for the destination. These narrow subject-relative
+    patterns handle both ``Player to Texans`` and ``Texans acquire Player``.
+    """
+    if not item.subject_confident or not item.player_name:
+        return ""
+    text = _report_text(item)
+    after_cue = re.compile(
+        r"\b(?:"
+        r"to|joins?|(?:heads?|headed|goes?|bound)\s+(?:to|for)|"
+        r"lands?\s+(?:with|in)|"
+        r"(?:is|are|was|were|has\s+been|have\s+been)?\s*"
+        r"(?:traded|dealt|sent|shipped|moved|moving)\s+to"
+        r")\b\s+(?:to\s+|for\s+|the\s+)?(?P<destination>[^.,;\n]{0,45})",
+        re.I,
+    )
+    subject_after_cue = re.compile(
+        r"^\s*(?:"
+        r"to|"
+        r"(?:(?:is|was|will\s+be)\s+)?joins?|"
+        r"(?:(?:is|was|will\s+be)\s+)?(?:heads?|headed|goes?|bound)\s+"
+        r"(?:(?:from|out\s+of)\s+[^,.;\n]{1,45}\s+)?(?:to|for)|"
+        r"(?:(?:is|was|will\s+be)\s+)?lands?\s+(?:with|in)|"
+        r"(?:(?:is|are|was|were|has\s+been|have\s+been|"
+        r"is\s+being|was\s+being)\s+)?"
+        r"(?:traded|dealt|sent|shipped|moved|moving)"
+        r"(?:(?:\s+from)\s+[^,.;\n]{1,45})?\s+to"
+        r")\b\s+(?:the\s+)?(?P<destination>[^,.;\n]{0,45})",
+        re.I,
+    )
+    subjects: list[re.Match[str]] = []
+    for pattern in _trade_subject_patterns(item):
+        subjects = list(pattern.finditer(text))
+        if subjects:
+            break
+    if not subjects:
+        # RotoWire's player-specific article URL/title already establishes the
+        # structured subject. Its terse headline can therefore omit the name
+        # entirely (for example, ``Dealt to Texans``) while still proving the
+        # destination. Do not grant this fallback to free-form social posts.
+        if item.source == "rotowire":
+            destination = after_cue.search(text)
+            if destination is not None:
+                return _first_trade_team(destination.group("destination"))
+        return ""
+    acquiring_cue = re.compile(
+        r"^\s*(?:(?:have|has)\s+agreed\s+to\s+|agreed\s+to\s+|"
+        r"(?:have|has|had|is|are|was|were|will|will\s+be|"
+        r"could|may|might|would)\s+)?"
+        r"(?:get(?:s|ting)?|acquir(?:e|es|ed|ing)|receiv(?:e|es|ed|ing)|"
+        r"add(?:s|ed|ing)?|land(?:s|ed|ing)?|"
+        r"trad(?:e|es|ed|ing)\s+for)\b",
+        re.I,
+    )
+
+    for subject in subjects:
+        # Work backwards through nearby club mentions; the closest club with
+        # an acquisition verb is the one receiving the report subject.
+        prefix_start = max(0, subject.start() - 140)
+        prefix = text[prefix_start : subject.start()]
+        team_mentions = list(_TRADE_TEAM_PATTERN.finditer(prefix))
+        for team_match in reversed(team_mentions):
+            between = prefix[team_match.end() :]
+            if acquiring_cue.search(between):
+                team = _canonical_trade_team(team_match.group("team"))
+                if team:
+                    return team
+
+        # Only accept direction immediately attached to the subject. Searching
+        # the whole remaining sentence can accidentally assign the club that
+        # receives a different player in the return package.
+        tail = text[subject.end() : subject.end() + 140]
+        destination = subject_after_cue.search(tail)
+        if destination is not None:
+            team = _first_trade_team(destination.group("destination"))
+            if team:
+                return team
+    return ""
+
+
+def _trade_is_cancelled(text: str) -> bool:
+    if _TRADE_CANCELLATION_DENIAL_PATTERN.search(text):
+        return False
+    return _TRADE_CANCELLATION_PATTERN.search(text) is not None
+
+
+def trade_event_status(item: NewsItem) -> str:
+    """Deterministic phase for a trade-labelled report.
+
+    Completed trades retain the legacy status string ``trade`` so a deployed
+    ``trade / unspecified`` thread can be enriched instead of replayed once
+    during this schema upgrade.
+    """
+    text = _report_text(item)
+    if _trade_is_cancelled(text):
+        return "trade_cancelled"
+    if _TRADE_RUMOR_PATTERN.search(text):
+        return "trade_rumor"
+    return "trade"
+
+
+def trade_fact_signature(item: NewsItem) -> str:
+    """Stable transaction identity, or ``unspecified`` when not provable."""
+    text = _report_text(item)
+    destination = trade_destination(item) or "?"
+    if _trade_is_cancelled(text):
+        return f"trade:cancelled:to:{destination}"
+    if _TRADE_CORRECTION_PATTERN.search(text):
+        return f"trade:correction:to:{destination}"
+    if _TRADE_RUMOR_PATTERN.search(text):
+        return f"trade:rumor:to:{destination}"
+    if _TRADE_COMPLETION_PATTERN.search(text):
+        return f"trade:completed:to:{destination}"
+    return "unspecified"
 
 
 def role_decision_status(item: NewsItem) -> str:
@@ -436,6 +738,8 @@ def semantic_event_status(item: NewsItem, event_type: str) -> str:
         role_status = role_decision_status(item)
         if role_status:
             return role_status
+    if normalized == "trade":
+        return trade_event_status(item)
     return event_status(item, normalized)
 
 
@@ -453,6 +757,8 @@ def semantic_event_fact_signature(item: NewsItem, event_type: str) -> str:
         role_status = role_decision_status(item)
         if role_status:
             return role_status.replace("role_", "role:", 1)
+    if normalized == "trade":
+        return trade_fact_signature(item)
     return event_fact_signature(item)
 
 
@@ -463,6 +769,8 @@ def _semantic_window_seconds(
 ) -> int:
     normalized = _normalized_event_type(event_type)
     if normalized == "depth_chart" and fact_signature.startswith("role:"):
+        return STABLE_FACT_WINDOW_SECONDS
+    if normalized == "trade" and fact_signature.startswith("trade:"):
         return STABLE_FACT_WINDOW_SECONDS
     if normalized in {"injury", "inactive", "practice_report"} and (
         fact_signature not in {"", "unspecified"}
@@ -501,6 +809,19 @@ def event_fact_signature(item: NewsItem) -> str:
     return "|".join(sorted(set(markers))) if markers else "unspecified"
 
 
+def _trade_fact_is_less_informative(previous: str, current: str) -> bool:
+    """True when current repeats a known trade phase but omits destination."""
+    previous_trade = _TRADE_SIGNATURE_PATTERN.fullmatch(previous)
+    current_trade = _TRADE_SIGNATURE_PATTERN.fullmatch(current)
+    return bool(
+        previous_trade is not None
+        and current_trade is not None
+        and previous_trade.group("state") == current_trade.group("state")
+        and previous_trade.group("team") != "?"
+        and current_trade.group("team") == "?"
+    )
+
+
 def event_facts_equivalent(
     previous_signature: str,
     current_signature: str,
@@ -510,6 +831,38 @@ def event_facts_equivalent(
     """Whether condition metadata proves two reports are corroboration."""
     if not previous_signature or not current_signature:
         return False
+
+    previous_trade = _TRADE_SIGNATURE_PATTERN.fullmatch(previous_signature)
+    current_trade = _TRADE_SIGNATURE_PATTERN.fullmatch(current_signature)
+    if previous_trade is not None or current_trade is not None:
+        # A legacy deployed trade thread has status=trade with no fact
+        # signature. Let the first destination-aware completed report upgrade
+        # that exact state in place. Do not extend this exception to generic
+        # unspecified events or to cancellation/rumor transitions.
+        if (
+            status == "trade"
+            and previous_signature == "unspecified"
+            and current_trade is not None
+            and current_trade.group("state") == "completed"
+            and current_trade.group("team") != "?"
+        ):
+            return True
+        if previous_trade is None or current_trade is None:
+            return False
+        previous_state = previous_trade.group("state")
+        current_state = current_trade.group("state")
+        previous_team = previous_trade.group("team")
+        current_team = current_trade.group("team")
+        # Matching known destinations prove corroboration. A first breaking
+        # report may establish the completed move before naming the receiving
+        # club; a later known destination is a safe one-way refinement. The
+        # reverse is deliberately false so terse follow-ups cannot overwrite
+        # richer state.
+        return (
+            previous_state == current_state
+            and current_team != "?"
+            and (previous_team == "?" or previous_team == current_team)
+        )
     if previous_signature != current_signature:
         return False
     if current_signature != "unspecified":
@@ -826,32 +1179,51 @@ class SeenStore:
                 return True
 
             old_severity = previous.get("severity")
+            old_status = str(previous.get("status") or "")
+            previous_signature = str(previous.get("fact_signature") or "")
             same_role_fact = (
                 _normalized_event_type(event_type) == "depth_chart"
                 and status.startswith("role_")
-                and str(previous.get("status") or "") == status
+                and old_status == status
                 and fact_signature.startswith("role:")
-                and str(previous.get("fact_signature") or "") == fact_signature
+                and previous_signature == fact_signature
+            )
+            same_trade_fact = (
+                _normalized_event_type(event_type) == "trade"
+                and old_status == status
+                and event_facts_equivalent(
+                    previous_signature,
+                    fact_signature,
+                    status=status,
+                )
+            )
+            less_informative_trade_fact = (
+                _normalized_event_type(event_type) == "trade"
+                and old_status == status
+                and _trade_fact_is_less_informative(
+                    previous_signature,
+                    fact_signature,
+                )
             )
             if (
                 severity is not None
                 and old_severity is not None
                 and severity > old_severity
                 and not same_role_fact
+                and not same_trade_fact
+                and not less_informative_trade_fact
             ):
                 return True
-            old_status = str(previous.get("status") or "")
             if fact_signature and status and old_status and status != old_status:
                 return True
             if status and old_status and _status_rank(status) > _status_rank(old_status):
                 return True
             if fact_signature:
-                previous_signature = str(previous.get("fact_signature") or "")
                 if not event_facts_equivalent(
                     previous_signature,
                     fact_signature,
                     status=status,
-                ):
+                ) and not less_informative_trade_fact:
                     return True
             return False
 

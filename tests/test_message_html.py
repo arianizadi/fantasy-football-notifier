@@ -250,6 +250,131 @@ def test_mobile_roster_role_alert_leads_with_next_step_and_clear_ownership():
     assert text.index("NEXT STEP") < text.index("REPORT") < text.index("CAR RB DEPTH")
 
 
+def test_trade_alert_withholds_stale_team_depth_but_keeps_fantasy_ownership():
+    league = LeagueRef("sleeper", "1", "Home League", "Mine")
+    alert = Alert(
+        item=NewsItem(
+            source="twitter",
+            guid="twitter:boutte-trade",
+            player_name="Kayshon Boutte",
+            headline="Patriots trade Kayshon Boutte to the Texans.",
+            body="Patriots trade Kayshon Boutte to the Texans.",
+            url="https://example.test/boutte",
+            published_at=datetime(2026, 8, 24, 18, 37, tzinfo=timezone.utc),
+        ),
+        classification=Classification("trade", 3, "", True, {}),
+        tier="rival",
+        context=TeamContext(
+            team="NE",
+            subject_position="WR",
+            same_position=[
+                DepthEntry(
+                    "Romeo Doubs",
+                    "WR",
+                    2,
+                    117,
+                    False,
+                    {league.key: ("rostered", "CMC Tax Return")},
+                ),
+                DepthEntry(
+                    "Kayshon Boutte",
+                    "WR",
+                    3,
+                    164,
+                    True,
+                    {league.key: ("rostered", "CMC Tax Return")},
+                ),
+                DepthEntry(
+                    "DeMario Douglas",
+                    "WR",
+                    4,
+                    533,
+                    False,
+                    {league.key: ("free_agent", "")},
+                ),
+            ],
+            player_index_refreshed_at=datetime(
+                2026, 8, 24, 8, 12, tzinfo=timezone.utc
+            ),
+        ),
+        all_leagues=[league],
+    )
+
+    text = format_alert(alert)
+
+    assert "📋 <b>FANTASY ROSTER SNAPSHOT</b>" in text
+    assert "➡️ <b>WR Kayshon Boutte</b> · report subject" in text
+    assert "↳ Owned by CMC Tax Return" in text
+    assert "NFL depth is withheld for transaction news" in text
+    assert "NE WR DEPTH" not in text
+    assert "Romeo Doubs" not in text
+    assert "DeMario Douglas" not in text
+
+
+def test_clear_release_has_release_guidance_without_old_team_depth():
+    league = LeagueRef("sleeper", "1", "Home League", "Mine")
+    alert = replace(
+        _alert(all_leagues=[league]),
+        item=NewsItem(
+            source="twitter",
+            guid="twitter:noah-brown-release",
+            player_name="Noah Brown",
+            headline="Raiders released veteran WR Noah Brown.",
+            body="Raiders released veteran WR Noah Brown.",
+            url="https://example.test/noah-brown",
+            published_at=datetime(2026, 8, 24, 19, 0, tzinfo=timezone.utc),
+        ),
+        classification=Classification("release", 4, "", True, {}),
+        tier="league",
+        context=TeamContext(
+            team="LV",
+            subject_position="WR",
+            same_position=[
+                DepthEntry(
+                    "Phillip Dorsett",
+                    "WR",
+                    6,
+                    999,
+                    False,
+                    {league.key: ("free_agent", "")},
+                ),
+                DepthEntry(
+                    "Noah Brown",
+                    "WR",
+                    7,
+                    634,
+                    True,
+                    {league.key: ("free_agent", "")},
+                ),
+                DepthEntry(
+                    "Shedrick Jackson",
+                    "WR",
+                    8,
+                    587,
+                    False,
+                    {league.key: ("free_agent", "")},
+                ),
+            ],
+            player_index_refreshed_at=datetime(
+                2026, 8, 24, 8, 12, tzinfo=timezone.utc
+            ),
+        ),
+    )
+
+    text = format_alert(alert)
+
+    assert "<b>RELEASE</b> · Raiders released veteran WR Noah Brown." in text
+    assert "Player attribution is unclear" not in text
+    assert "Do not add from the old depth chart" in text
+    assert "📋 <b>FANTASY ROSTER SNAPSHOT</b>" in text
+    assert "➡️ <b>WR Noah Brown</b> · report subject" in text
+    assert "↳ Available" in text
+    assert "player is no longer on the listed team" in text
+    assert "LV WR DEPTH" not in text
+    assert "Phillip Dorsett" not in text
+    assert "Shedrick Jackson" not in text
+
+
 def test_preescaped_feed_text_is_normalized_before_telegram_escaping():
     alert = _alert()
     item = replace(

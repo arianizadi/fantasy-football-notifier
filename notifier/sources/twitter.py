@@ -234,6 +234,25 @@ INJURY_DETAIL_WORDS = frozenset(
     }
 )
 TRANSACTION_CUES = frozenset({"released", "waived", "suspended", "cut"})
+TRANSACTION_PLAYER_DESCRIPTORS = frozenset(
+    {
+        "veteran",
+        "rookie",
+        "qb",
+        "quarterback",
+        "rb",
+        "running",
+        "back",
+        "wr",
+        "wide",
+        "receiver",
+        "te",
+        "tight",
+        "end",
+        "k",
+        "kicker",
+    }
+)
 PASSIVE_TRANSACTION_BRIDGES = frozenset(
     {
         "is",
@@ -433,7 +452,8 @@ def _direct_prefix(
     if cue_text in TRANSACTION_CUES:
         tail_words = set(_bridge_words(after_player[:80]))
         return (
-            not words
+            len(words) <= 3
+            and all(word in TRANSACTION_PLAYER_DESCRIPTORS for word in words)
             and _has_roster_context(before_cue[-80:])
             and not bool(tail_words & NON_ROSTER_RELEASE_WORDS)
         )
@@ -780,7 +800,11 @@ class TwitterStream:
         # No matched player already has no mechanical roster path. A single
         # matched replacement is not automatically the subject when the post
         # contains absence language about an unmatched nickname or surname.
-        subject_confident = len(players) <= 1
+        # Zero matches means there is no player identity to support mechanical
+        # roster advice or player-level dedupe. Keep the report in the
+        # searchable journal, but do not push ordinary 3/5 commentary through
+        # the existing uncertain-subject threshold.
+        subject_confident = len(players) == 1
         player = players[0] if players else ""
         if len(players) == 1 and ABSENCE_CUE.search(text):
             subject_confident = attributed_absence_subject(text, players) == player

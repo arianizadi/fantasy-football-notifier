@@ -33,6 +33,41 @@ def test_rotowire_feed_preserves_source_time_and_cleans_markup() -> None:
     assert item.url == "https://www.rotowire.com/football/player.php?id=1"
 
 
+def test_rotowire_feed_preserves_explicit_zone_with_12_hour_clock() -> None:
+    xml = """
+    <rss><channel>
+      <item>
+        <title>Kayshon Boutte: Traded to Houston</title>
+        <guid>boutte-pdt</guid>
+        <description>Traded Monday.</description>
+        <pubDate>Mon, 24 Aug 2026 11:51:00 AM PDT</pubDate>
+      </item>
+      <item>
+        <title>Example Player: Afternoon update</title>
+        <guid>player-pst</guid>
+        <description>Updated Monday.</description>
+        <pubDate>Mon, 14 Dec 2026 1:05:00 PM PST</pubDate>
+      </item>
+      <item>
+        <title>Example Player: Unknown timezone</title>
+        <guid>player-unknown-zone</guid>
+        <description>Updated Monday.</description>
+        <pubDate>Mon, 24 Aug 2026 11:51:00 AM XYZ</pubDate>
+      </item>
+    </channel></rss>
+    """
+
+    by_guid = {item.guid: item for item in parse_feed(xml)}
+
+    assert by_guid["rotowire:boutte-pdt"].published_at == datetime(
+        2026, 8, 24, 18, 51, tzinfo=timezone.utc
+    )
+    assert by_guid["rotowire:player-pst"].published_at == datetime(
+        2026, 12, 14, 21, 5, tzinfo=timezone.utc
+    )
+    assert by_guid["rotowire:player-unknown-zone"].published_at is None
+
+
 def _raiders_running_backs() -> dict[str, dict[str, object]]:
     return {
         "1": {
@@ -159,6 +194,44 @@ def test_twitter_payload_keeps_created_at_and_player_match() -> None:
     assert item.player_name == "George Kittle"
     assert item.published_at == datetime(2026, 8, 23, 17, 30, tzinfo=timezone.utc)
     assert item.url == "https://x.com/Reporter/status/42"
+    stream._session.close()
+
+
+def test_twitter_report_without_player_match_is_not_subject_confident() -> None:
+    stream = TwitterStream("fake", queue.Queue())
+    stream._names = SimpleNamespace(find=lambda _text: [])
+    payload = {
+        "data": {
+            "id": "unmatched-context",
+            "author_id": "7",
+            "text": "The receiver-needy team added depth after an earlier injury.",
+        },
+        "includes": {"users": [{"id": "7", "username": "Reporter"}]},
+    }
+
+    item = stream._to_items(payload)[0]
+
+    assert item.player_name == ""
+    assert item.subject_confident is False
+    stream._session.close()
+
+
+def test_transaction_with_position_descriptor_has_clear_player_subject() -> None:
+    stream = TwitterStream("fake", queue.Queue())
+    stream._names = SimpleNamespace(find=lambda _text: ["Noah Brown"])
+    payload = {
+        "data": {
+            "id": "noah-brown-release",
+            "author_id": "7",
+            "text": "Raiders released veteran WR Noah Brown.",
+        },
+        "includes": {"users": [{"id": "7", "username": "Reporter"}]},
+    }
+
+    item = stream._to_items(payload)[0]
+
+    assert item.player_name == "Noah Brown"
+    assert item.subject_confident is True
     stream._session.close()
 
 

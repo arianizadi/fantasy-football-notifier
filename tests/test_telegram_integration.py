@@ -131,6 +131,25 @@ def _alert(
     )
 
 
+def _trade_alert(
+    guid: str,
+    headline: str,
+    *,
+    body: str | None = None,
+    severity: int = 3,
+    source: str = "twitter",
+) -> Alert:
+    return _alert(
+        guid,
+        headline=headline,
+        body=body,
+        event_type="trade",
+        severity=severity,
+        player_name="Kayshon Boutte",
+        source=source,
+    )
+
+
 def test_same_event_corroboration_edits_existing_message_and_digest(tmp_path) -> None:
     notify_module._TELEGRAM_STATES.clear()
     config = _config(tmp_path)
@@ -183,6 +202,204 @@ def test_same_event_corroboration_edits_existing_message_and_digest(tmp_path) ->
     assert first_token in persisted["feedbackTargets"]
     assert second_token in persisted["feedbackTargets"]
     assert not (tmp_path / "sent-messages.json").exists()
+
+
+def test_exact_completed_trade_burst_edits_one_message(
+    tmp_path,
+) -> None:
+    notify_module._TELEGRAM_STATES.clear()
+    config = _config(tmp_path)
+    session = Session()
+    reports = [
+        _trade_alert(
+            "twitter:trade:1",
+            (
+                "Trade! The Patriots are sending WR Kayshon Boutte to the "
+                "Texans for safety Jaylen Reed and a draft pick."
+            ),
+            severity=3,
+        ),
+        _trade_alert(
+            "twitter:trade:2",
+            (
+                "It's a 28 7th rounder, the #Saints one, going in the trade. "
+                "Kayshon Boutte heads to the #Texans."
+            ),
+            severity=3,
+        ),
+        _trade_alert(
+            "rotowire:trade:3",
+            "Dealt to Texans",
+            body=(
+                "The Patriots traded Boutte to the Texans for safety Jaylen "
+                "Reed and a draft pick Monday."
+            ),
+            severity=3,
+            source="rotowire",
+        ),
+        _trade_alert(
+            "twitter:trade:4",
+            (
+                "Trade: The Patriots are sending WR Kayshon Boutte to the "
+                "Texans in exchange for safety Jaylen Reed and a 2028 "
+                "seventh-round pick."
+            ),
+        ),
+        _trade_alert(
+            "twitter:trade:5",
+            (
+                "Full terms: Texans get: WR Kayshon Boutte. Patriots get: S "
+                "Jaylen Reed, 2028 seventh-round pick."
+            ),
+        ),
+    ]
+
+    assert [send_alert(session, config, report) for report in reports] == [
+        100,
+        100,
+        100,
+        100,
+        100,
+    ]
+    assert [url.rsplit("/", 1)[-1] for url in session.urls] == [
+        "sendMessage",
+        "editMessageText",
+        "editMessageText",
+        "editMessageText",
+        "editMessageText",
+    ]
+    assert all(
+        payload.get("message_id") == 100 for payload in session.payloads[1:]
+    )
+
+    persisted = json.loads((tmp_path / "telegram-state.json").read_text())
+    thread = persisted["threads"]["kayshonboutte"]
+    assert thread["messageId"] == 100
+    assert thread["severity"] == 3
+    assert thread["eventStatus"] == "trade"
+    assert thread["eventFactSignature"] == "trade:completed:to:HOU"
+    assert len(persisted["alerts"]) == 1
+    assert persisted["alerts"][0]["headline"] == reports[-1].item.headline
+
+
+def test_trade_destination_refinement_edits_despite_severity_drift(tmp_path) -> None:
+    notify_module._TELEGRAM_STATES.clear()
+    config = _config(tmp_path)
+    session = Session()
+    terse = _trade_alert(
+        "twitter:trade:terse",
+        "Kayshon Boutte has been traded.",
+        severity=3,
+    )
+    destination = _trade_alert(
+        "twitter:trade:destination",
+        "The Patriots traded Kayshon Boutte to the Texans.",
+        severity=4,
+    )
+
+    assert send_alert(session, config, terse) == 100
+    assert send_alert(session, config, destination) == 100
+    assert session.urls[-1].endswith("/editMessageText")
+
+    persisted = json.loads((tmp_path / "telegram-state.json").read_text())
+    thread = persisted["threads"]["kayshonboutte"]
+    assert thread["severity"] == 4
+    assert thread["eventFactSignature"] == "trade:completed:to:HOU"
+    assert len(persisted["alerts"]) == 1
+
+
+def test_trade_cancellation_and_different_destination_send_new_replies(tmp_path) -> None:
+    notify_module._TELEGRAM_STATES.clear()
+    config = _config(tmp_path)
+    session = Session()
+    completed = _trade_alert(
+        "twitter:trade:hou",
+        "Patriots traded Kayshon Boutte to the Texans.",
+    )
+    cancelled = _trade_alert(
+        "twitter:trade:cancelled",
+        "The Kayshon Boutte trade to Houston was cancelled after a failed physical.",
+        severity=4,
+    )
+    rerouted = _trade_alert(
+        "twitter:trade:dal",
+        "New deal: the Patriots traded Kayshon Boutte to the Cowboys.",
+        severity=4,
+    )
+
+    assert send_alert(session, config, completed) == 100
+    assert send_alert(session, config, cancelled) == 101
+    assert send_alert(session, config, rerouted) == 102
+
+    assert all(url.endswith("/sendMessage") for url in session.urls)
+    assert session.payloads[1]["reply_parameters"]["message_id"] == 100
+    assert session.payloads[2]["reply_parameters"]["message_id"] == 101
+    persisted = json.loads((tmp_path / "telegram-state.json").read_text())
+    assert len(persisted["alerts"]) == 3
+    assert persisted["threads"]["kayshonboutte"]["eventFactSignature"] == (
+        "trade:completed:to:DAL"
+    )
+
+
+def test_unresolved_explicit_trade_correction_sends_a_new_reply(tmp_path) -> None:
+    notify_module._TELEGRAM_STATES.clear()
+    config = _config(tmp_path)
+    session = Session()
+    completed = _trade_alert(
+        "twitter:trade:hou-before-correction",
+        "The Patriots traded Kayshon Boutte to the Texans.",
+    )
+    correction = _trade_alert(
+        "twitter:trade:pronoun-correction",
+        (
+            "Correction: Kayshon Boutte wasn't traded to the Texans; he was "
+            "dealt to the Cowboys."
+        ),
+    )
+
+    assert send_alert(session, config, completed) == 100
+    assert send_alert(session, config, correction) == 101
+    assert all(url.endswith("/sendMessage") for url in session.urls)
+    assert session.payloads[1]["reply_parameters"]["message_id"] == 100
+
+    persisted = json.loads((tmp_path / "telegram-state.json").read_text())
+    assert len(persisted["alerts"]) == 2
+    assert persisted["threads"]["kayshonboutte"]["eventFactSignature"] == (
+        "trade:correction:to:?"
+    )
+
+
+def test_legacy_trade_thread_is_upgraded_in_place(tmp_path) -> None:
+    notify_module._TELEGRAM_STATES.clear()
+    config = _config(tmp_path)
+    session = Session()
+    first = _trade_alert(
+        "twitter:trade:legacy",
+        "Patriots traded Kayshon Boutte to the Texans.",
+    )
+    assert send_alert(session, config, first) == 100
+
+    path = tmp_path / "telegram-state.json"
+    payload = json.loads(path.read_text())
+    payload["threads"]["kayshonboutte"]["eventFactSignature"] = "unspecified"
+    payload["alerts"][0]["eventFactSignature"] = "unspecified"
+    path.write_text(json.dumps(payload))
+    notify_module._TELEGRAM_STATES.clear()
+
+    confirmation = _trade_alert(
+        "rotowire:trade:legacy-confirmation",
+        "Boutte was dealt to Houston for a 2028 draft pick.",
+        severity=4,
+        source="rotowire",
+    )
+    assert send_alert(session, config, confirmation) == 100
+    assert session.urls[-1].endswith("/editMessageText")
+
+    persisted = json.loads(path.read_text())
+    assert persisted["threads"]["kayshonboutte"]["eventFactSignature"] == (
+        "trade:completed:to:HOU"
+    )
+    assert len(persisted["alerts"]) == 1
 
 
 def test_send_and_edit_payloads_stay_within_telegram_text_limit(tmp_path) -> None:

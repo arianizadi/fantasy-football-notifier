@@ -53,6 +53,8 @@ LINEUP_SUB_MIN_SEVERITY = {
     "suspension": 4,
     "release": 4,
 }
+
+
 def normalized_event_type(event_type: str) -> str:
     return (event_type or "other").strip().lower().replace("-", "_").replace(" ", "_")
 
@@ -126,6 +128,7 @@ class LeaguePlays:
     league: LeagueRef
     subject_state: str  # "mine" | "rostered" | "free_agent"
     subject_owner: str
+    subject_depth_order: int | None = None
     beneficiaries: list[Beneficiary] = field(default_factory=list)
     bench_options: list[str] = field(default_factory=list)
     capacity: RosterCapacity | None = None
@@ -141,11 +144,22 @@ class LeaguePlays:
 
     def for_event(self, event_type: str, severity: int) -> LeaguePlays:
         """Copy containing only recommendations valid for this classified event."""
+        event = normalized_event_type(event_type)
+        release_has_meaningful_vacancy = not (
+            event == "release"
+            and (
+                self.subject_depth_order is None
+                or self.subject_depth_order > 3
+            )
+        )
         return replace(
             self,
             beneficiaries=(
                 self.beneficiaries
-                if event_allows_backup_moves(event_type, severity)
+                if (
+                    event_allows_backup_moves(event, severity)
+                    and release_has_meaningful_vacancy
+                )
                 else []
             ),
             bench_options=(
@@ -394,6 +408,7 @@ class DepthCharts:
                 league=league,
                 subject_state=state,
                 subject_owner=owner,
+                subject_depth_order=order,
                 capacity=snapshot.capacities.get(league.key),
                 scoring_format=snapshot.scoring_formats.get(league.key, ""),
             )
