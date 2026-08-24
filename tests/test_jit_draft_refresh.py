@@ -318,6 +318,78 @@ def test_drafted_refresh_targets_only_active_sleeper_league(
     ] == ["Waiting Rival Keeper"]
 
 
+def test_provider_scoped_refresh_preserves_other_drafted_provider(
+    tmp_path, monkeypatch
+) -> None:
+    espn = LeagueRef("espn", "1", "ESPN League", "Mine")
+    sleeper = LeagueRef("sleeper", "2", "Sleeper League", "Mine")
+    sleeper_capacity = RosterCapacity(
+        bench_used=5,
+        bench_limit=5,
+        ir_used=0,
+        ir_limit=1,
+    )
+    sleeper_player = _player(
+        "Sleeper Roster Player",
+        sleeper,
+        mine=True,
+        fantasy_team="Mine",
+    )
+    previous = RosterSnapshot(
+        generated_at=datetime.now(timezone.utc),
+        leagues=[espn, sleeper],
+        players=[
+            _player(
+                "ESPN Quarterback",
+                espn,
+                mine=True,
+                fantasy_team="Mine",
+                position="QB",
+            ),
+            sleeper_player,
+        ],
+        capacities={
+            espn.key: RosterCapacity(bench_used=5, bench_limit=5),
+            sleeper.key: sleeper_capacity,
+        },
+        scoring_formats={espn.key: "PPR", sleeper.key: "HALF"},
+    )
+    fresh_espn_players = [
+        _player(
+            "ESPN Quarterback",
+            espn,
+            mine=True,
+            fantasy_team="Mine",
+            position="QB",
+        )
+    ]
+    monkeypatch.setattr(
+        "notifier.roster._load_espn",
+        lambda config, session: (
+            espn,
+            fresh_espn_players,
+            RosterCapacity(bench_used=4, bench_limit=5),
+            "PPR",
+        ),
+    )
+    sleeper_loader = Mock(
+        side_effect=AssertionError("unrequested Sleeper provider was queried")
+    )
+    monkeypatch.setattr("notifier.roster._load_sleeper", sleeper_loader)
+
+    refreshed, _ = refresh_drafted_snapshot(
+        _config(tmp_path),
+        previous,
+        league_keys={espn.key},
+    )
+
+    assert sleeper_loader.call_count == 0
+    assert refreshed.league(sleeper.key) == sleeper
+    assert refreshed.mine(sleeper.key) == [sleeper_player]
+    assert refreshed.capacities[sleeper.key] == sleeper_capacity
+    assert refreshed.scoring_formats[sleeper.key] == "HALF"
+
+
 def test_jit_merge_preserves_league_that_drafted_during_network_refresh(
     tmp_path, monkeypatch
 ) -> None:

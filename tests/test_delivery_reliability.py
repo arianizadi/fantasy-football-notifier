@@ -26,6 +26,7 @@ from notifier.models import (
     LeagueRef,
     NewsItem,
     RosterCapacity,
+    RosterPlayer,
     RosterSnapshot,
 )
 from notifier.outbox import DeliveryOutbox, _news_item
@@ -1485,10 +1486,31 @@ def test_recent_successful_jit_roster_refresh_is_reused(monkeypatch) -> None:
     notifier._state_lock = threading.RLock()
     notifier._last_jit_roster_refresh = 0.0
     notifier._last_jit_roster_success = 0.0
+    notifier._last_jit_roster_attempt_keys = frozenset()
+    notifier._last_jit_roster_success_keys = frozenset()
     notifier._snapshot_mtime = 0.0
     notifier._player_index = {}
-    notifier.snapshot = RosterSnapshot(generated_at=datetime.now(timezone.utc))
-    fresh = RosterSnapshot(generated_at=datetime.now(timezone.utc))
+    league = LeagueRef("espn", "1", "ESPN", "Mine")
+    player = RosterPlayer(
+        "Lamar Jackson",
+        "QB",
+        "BAL",
+        "QB",
+        True,
+        "Mine",
+        league.key,
+    )
+    original = RosterSnapshot(
+        generated_at=datetime.now(timezone.utc),
+        leagues=[league],
+        players=[player],
+    )
+    notifier.snapshot = original
+    fresh = RosterSnapshot(
+        generated_at=datetime.now(timezone.utc),
+        leagues=[league],
+        players=[player],
+    )
     refresh = Mock(return_value=(fresh, 123))
     monkeypatch.setattr("notifier.pipeline.refresh_drafted_snapshot", refresh)
     current_mtime = Mock(return_value=456)
@@ -1497,6 +1519,11 @@ def test_recent_successful_jit_roster_refresh_is_reused(monkeypatch) -> None:
     assert notifier._refresh_ownership_just_in_time() is True
     assert notifier._refresh_ownership_just_in_time() is True
     assert refresh.call_count == 1
+    refresh.assert_called_once_with(
+        notifier.config,
+        original,
+        league_keys={league.key},
+    )
     assert notifier.snapshot is fresh
     assert notifier._snapshot_mtime == 123
     # A full refresh written after the helper returned stays newer than the

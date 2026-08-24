@@ -17,7 +17,7 @@ import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import requests
@@ -31,6 +31,7 @@ from .dedupe import (
     semantic_event_status,
     semantic_event_type,
 )
+from .daily_recap import format_daily_recap
 from .event_store import EventStore
 from .health import HEALTH, age_label, duration_label
 from .logging_utils import NotifierError, structured_log
@@ -45,6 +46,7 @@ from .sources import rotowire, sleeper
 from .sources.fantasypros import FantasyProsCache
 from .sources.twitter import TwitterStream
 from .telegram_control import TelegramControl
+from .waiver_schedule import WaiverReportCoordinator
 
 # X is the origin for most breaking news; RotoWire writes it up 1-5 minutes
 # later. Ordering by priority means the faster source claims the semantic
@@ -73,6 +75,7 @@ JIT_ROSTER_REFRESH_MIN_SECONDS = 60
 FANTASYPROS_RETRY_BASE_SECONDS = 15 * 60
 FANTASYPROS_RETRY_MAX_SECONDS = 6 * 60 * 60
 FANTASYPROS_ENRICHMENT_ERROR_LOG_SECONDS = 5 * 60
+FANTASYPROS_UNAVAILABLE_RETRY_SECONDS = 6 * 60 * 60
 FANTASYPROS_UNAVAILABLE_ERRORS = frozenset(
     {"dataset_unavailable", "partial_dataset_unavailable"}
 )
@@ -104,9 +107,9 @@ def _fantasypros_failure_delay(
     consecutive_failures: int,
     healthy_refresh_seconds: float,
 ) -> float:
-    """Keep unpublished datasets on cadence; back off hard failures."""
+    """Avoid spending quota repeatedly on rankings not published yet."""
     if error in FANTASYPROS_UNAVAILABLE_ERRORS:
-        return float(healthy_refresh_seconds)
+        return float(max(healthy_refresh_seconds, FANTASYPROS_UNAVAILABLE_RETRY_SECONDS))
     return _fantasypros_retry_delay(consecutive_failures)
 
 
@@ -334,6 +337,8 @@ class Notifier:
         self._jit_roster_lock = threading.Lock()
         self._last_jit_roster_refresh = 0.0
         self._last_jit_roster_success = 0.0
+        self._last_jit_roster_attempt_keys: frozenset[str] = frozenset()
+        self._last_jit_roster_success_keys: frozenset[str] = frozenset()
         self.poller = rotowire.FeedPoller()
         self._tweet_queue: queue.Queue = queue.Queue(maxsize=500)
         # Classification is ~2s of network wait, so a burst of items should
@@ -360,6 +365,15 @@ class Notifier:
         self.preseason = not self.snapshot.drafted_leagues()
         self._rebuild_depth_charts()
         self.telegram_state = telegram_state(config)
+        self.waiver_reports = WaiverReportCoordinator(
+            config,
+            snapshot_provider=self._waiver_snapshot,
+            player_index_provider=self._waiver_player_index,
+            refresh_provider=self._refresh_ownership_just_in_time,
+            event_store=self.events,
+            fantasypros=self.fantasypros,
+            completed_provider=self.telegram_state.scheduled_report_completed,
+        )
         self.telegram_control = TelegramControl(
             config,
             self.telegram_state,
@@ -367,6 +381,8 @@ class Notifier:
             player_provider=self.player_text,
             search_provider=self.news_search_text,
             feedback_provider=self.events.record_feedback,
+            daily_recap_provider=self.daily_recap_parts,
+            scheduled_report_provider=self.waiver_reports.due_reports,
         )
         HEALTH.mark(
             "roster",
@@ -445,21 +461,49 @@ class Notifier:
                 detail=f"{len(snapshot.leagues)} leagues, {len(snapshot.mine())} mine",
             )
 
-    def _refresh_ownership_just_in_time(self) -> bool:
+    def _refresh_ownership_just_in_time(
+        self,
+        league_keys: set[str] | None = None,
+    ) -> bool:
         """Refresh drafted-league ownership before evaluating a waiver candidate."""
+        with self._state_lock:
+            drafted_keys = {league.key for league in self.snapshot.drafted_leagues()}
+        requested_keys = frozenset(
+            drafted_keys if league_keys is None else drafted_keys & set(league_keys)
+        )
+        if not requested_keys:
+            return False
         now = time.time()
-        if now - self._last_jit_roster_success < JIT_ROSTER_REFRESH_MIN_SECONDS:
+        if (
+            now - self._last_jit_roster_success < JIT_ROSTER_REFRESH_MIN_SECONDS
+            and requested_keys.issubset(self._last_jit_roster_success_keys)
+        ):
             return True
-        if now - self._last_jit_roster_refresh < JIT_ROSTER_REFRESH_MIN_SECONDS:
+        if (
+            now - self._last_jit_roster_refresh < JIT_ROSTER_REFRESH_MIN_SECONDS
+            and requested_keys.issubset(self._last_jit_roster_attempt_keys)
+        ):
             return False
         with self._jit_roster_lock:
             now = time.time()
-            if now - self._last_jit_roster_success < JIT_ROSTER_REFRESH_MIN_SECONDS:
+            if (
+                now - self._last_jit_roster_success < JIT_ROSTER_REFRESH_MIN_SECONDS
+                and requested_keys.issubset(self._last_jit_roster_success_keys)
+            ):
                 return True
-            if now - self._last_jit_roster_refresh < JIT_ROSTER_REFRESH_MIN_SECONDS:
+            if (
+                now - self._last_jit_roster_refresh < JIT_ROSTER_REFRESH_MIN_SECONDS
+                and requested_keys.issubset(self._last_jit_roster_attempt_keys)
+            ):
                 return False
             # Throttle failures as well as successes; an outage should not make
             # every simultaneous breaking-news worker hammer active providers.
+            if now - self._last_jit_roster_refresh < JIT_ROSTER_REFRESH_MIN_SECONDS:
+                self._last_jit_roster_attempt_keys = frozenset(
+                    set(self._last_jit_roster_attempt_keys) | set(requested_keys)
+                )
+            else:
+                self._last_jit_roster_attempt_keys = requested_keys
             self._last_jit_roster_refresh = now
             try:
                 with self._state_lock:
@@ -467,6 +511,7 @@ class Notifier:
                 snapshot, written_version = refresh_drafted_snapshot(
                     self.config,
                     previous,
+                    league_keys=set(requested_keys),
                 )
             except Exception as error:  # noqa: BLE001 - keep the alert path alive
                 HEALTH.mark("roster", ok=False, detail=str(error))
@@ -478,7 +523,18 @@ class Notifier:
                 self._snapshot_mtime = written_version
                 self.preseason = not snapshot.drafted_leagues()
                 self.depth = DepthCharts(self._player_index, snapshot)
-                self._last_jit_roster_success = time.time()
+                succeeded_at = time.time()
+                if (
+                    succeeded_at - self._last_jit_roster_success
+                    < JIT_ROSTER_REFRESH_MIN_SECONDS
+                ):
+                    self._last_jit_roster_success_keys = frozenset(
+                        set(self._last_jit_roster_success_keys)
+                        | set(requested_keys)
+                    )
+                else:
+                    self._last_jit_roster_success_keys = requested_keys
+                self._last_jit_roster_success = succeeded_at
             HEALTH.mark(
                 "roster",
                 ok=True,
@@ -491,6 +547,14 @@ class Notifier:
                 playerCount=len(snapshot.players),
             )
             return True
+
+    def _waiver_snapshot(self) -> RosterSnapshot:
+        with self._state_lock:
+            return self.snapshot
+
+    def _waiver_player_index(self) -> dict:
+        with self._state_lock:
+            return self._player_index
 
     def _fantasypros_scoring_formats(self) -> tuple[str, ...]:
         """Scoring formats actually used by drafted provider leagues."""
@@ -596,9 +660,9 @@ class Notifier:
             if not refreshed:
                 if status.last_error in FANTASYPROS_UNAVAILABLE_ERRORS:
                     # The endpoint is healthy; the seasonal ranking family is
-                    # simply unpublished. Reprobe all due siblings on the
-                    # configured healthy cadence instead of degrading to the
-                    # six-hour hard-failure backoff.
+                    # simply unpublished. Reprobe at most every six hours so
+                    # an empty preseason dataset does not consume quota that
+                    # will be more useful once rankings are available.
                     consecutive_failures = 0
                 else:
                     consecutive_failures += 1
@@ -1636,6 +1700,17 @@ class Notifier:
         )
         lines.append(f"Telegram: last success {age_label(telegram_stamp)}")
         lines.append(f"Bot controls: {self.telegram_control.status_label}")
+        lines.append(
+            "Daily recap: "
+            f"{self.config.daily_digest_hour}:00 "
+            f"{self.config.daily_digest_timezone}"
+        )
+        if bool(getattr(self.config, "waiver_report_enabled", True)):
+            lines.append(
+                "Waiver report: "
+                f"{int(getattr(self.config, 'waiver_report_lead_hours', 8))}h "
+                "before each live league deadline"
+            )
         retention = self.telegram_control.auto_delete_seconds
         if retention is None:
             lines.append("Telegram auto-delete: not checked yet")
@@ -1687,6 +1762,24 @@ class Notifier:
             lines += ["", f"<b>{rating}{player}</b> · {direction}", headline]
         return "\n".join(lines)
 
+    def daily_recap_parts(self, now: datetime) -> tuple[str, ...]:
+        """Build the morning recap from every journaled report, not alerts only."""
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        now = now.astimezone(timezone.utc)
+        rows = self.events.recent(
+            since=now - timedelta(hours=24),
+            until=now + timedelta(seconds=1),
+            limit=2000,
+        )
+        recap = format_daily_recap(
+            rows,
+            now=now,
+            hours=24,
+            timezone_name=self.config.daily_digest_timezone,
+        )
+        return recap.parts
+
     # ---------- lifecycle ----------
 
     def check_roster_freshness(self) -> None:
@@ -1716,6 +1809,9 @@ class Notifier:
         """Stop background workers and close local resources."""
         self._stop.set()
         self.telegram_control.stop()
+        coordinator = getattr(self, "waiver_reports", None)
+        if coordinator is not None:
+            coordinator.close()
         self.fantasypros.close()
         if self._fantasypros_thread is not None:
             self._fantasypros_thread.join(timeout=2)
@@ -1757,7 +1853,11 @@ class Notifier:
         )
         self._start_fantasypros_refresher()
         if (
-            (self.config.telegram_controls_enabled or self.config.daily_digest_enabled)
+            (
+                self.config.telegram_controls_enabled
+                or self.config.daily_digest_enabled
+                or bool(getattr(self.config, "waiver_report_enabled", False))
+            )
             and not self.config.dry_run
         ):
             self.telegram_control.start()

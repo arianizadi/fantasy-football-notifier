@@ -580,8 +580,8 @@ def test_two_hour_bulk_schedule_uses_forty_eight_requests_per_day(
     "reason",
     ["dataset_unavailable", "partial_dataset_unavailable"],
 )
-def test_unpublished_dataset_retries_on_healthy_two_hour_cadence(reason: str) -> None:
-    assert _fantasypros_failure_delay(reason, 5, 2 * 60 * 60) == 2 * 60 * 60
+def test_unpublished_dataset_backs_off_to_preserve_daily_quota(reason: str) -> None:
+    assert _fantasypros_failure_delay(reason, 5, 2 * 60 * 60) == 6 * 60 * 60
 
 
 def test_hard_fantasypros_failure_keeps_exponential_backoff() -> None:

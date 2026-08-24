@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -12,7 +13,7 @@ import notifier.telegram_state as telegram_state_module
 from notifier.dedupe import semantic_event_type
 from notifier.models import Alert, Classification, NewsItem
 from notifier.notify import TELEGRAM_TEXT_LIMIT, _visible_units, send_alert
-from notifier.telegram_control import TelegramControl
+from notifier.telegram_control import ScheduledReport, TelegramControl
 from notifier.telegram_state import TelegramState, alert_token
 
 
@@ -785,3 +786,39 @@ def test_control_routes_commands_and_persists_feedback(tmp_path) -> None:
     )
     assert state.feedback_verdict(token) == "useful"
     feedback.assert_called_once_with(token, "useful")
+
+
+def test_expired_scheduled_report_is_not_sent(tmp_path, monkeypatch) -> None:
+    config = _config(tmp_path)
+    state = TelegramState(tmp_path / "telegram-state.json")
+    key = "waiver:espn:1:expired"
+    assert state.register_scheduled_report(
+        key,
+        kind="waiver_report",
+        parts=("expired waiver report",),
+        notify_first=True,
+    )
+    control = TelegramControl(
+        config,
+        state,
+        status_provider=lambda: "status",
+        player_provider=lambda query: query,
+    )
+    send = Mock(return_value=100)
+    monkeypatch.setattr("notifier.telegram_control.send_plain", send)
+    report = ScheduledReport(
+        key=key,
+        kind="waiver_report",
+        parts=("expired waiver report",),
+        notify_first=True,
+        expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+    )
+
+    assert control._deliver_registered_report(report) is False
+    send.assert_not_called()
+    assert state.next_scheduled_report_part(key) == (
+        0,
+        "expired waiver report",
+        None,
+        True,
+    )

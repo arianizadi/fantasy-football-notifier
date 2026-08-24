@@ -16,6 +16,8 @@ DEFAULT_MIN_SEVERITY_OTHER = 3
 DEFAULT_FANTASYPROS_REQUEST_LIMIT = 425
 DEFAULT_FANTASYPROS_REFRESH_HOURS = 2
 DEFAULT_FANTASYPROS_MAX_AGE_HOURS = 12
+DEFAULT_DAILY_RECAP_HOUR = 8
+DEFAULT_WAIVER_REPORT_LEAD_HOURS = 8
 
 
 @dataclass(frozen=True)
@@ -48,6 +50,8 @@ class Config:
     daily_digest_enabled: bool
     daily_digest_hour: int
     daily_digest_timezone: str
+    waiver_report_enabled: bool
+    waiver_report_lead_hours: int
     dry_run: bool
 
 
@@ -163,10 +167,21 @@ def load_config() -> Config:
         # still inside the chat's retention window.
         player_thread_hours=optional_int("PLAYER_THREAD_HOURS", 168, 1, 24 * 30),
         daily_digest_enabled=optional_bool("DAILY_DIGEST_ENABLED", True),
-        daily_digest_hour=optional_int("DAILY_DIGEST_HOUR", 18, 0, 23),
+        # The daily digest is now a morning football recap. Keep the existing
+        # variable names so deployments upgrade without a state migration.
+        daily_digest_hour=optional_int(
+            "DAILY_DIGEST_HOUR", DEFAULT_DAILY_RECAP_HOUR, 0, 23
+        ),
         daily_digest_timezone=(
             os.environ.get("DAILY_DIGEST_TIMEZONE", "").strip()
             or "America/Los_Angeles"
+        ),
+        waiver_report_enabled=optional_bool("WAIVER_REPORT_ENABLED", True),
+        waiver_report_lead_hours=optional_int(
+            "WAIVER_REPORT_LEAD_HOURS",
+            DEFAULT_WAIVER_REPORT_LEAD_HOURS,
+            1,
+            48,
         ),
         dry_run=dry_run,
     )

@@ -964,8 +964,25 @@ def send_alert(session: requests.Session, config: Config, alert: Alert) -> int |
     return message_id
 
 
-def send_plain(session: requests.Session, config: Config, text: str) -> int | None:
+def send_plain(
+    session: requests.Session,
+    config: Config,
+    text: str,
+    *,
+    silent: bool = True,
+    reply_to: int | None = None,
+) -> int | None:
     if config.dry_run:
         structured_log(logging.INFO, "notify.dry_run_plain", preview=text[:160])
         return -1
-    return _post(session, config, {"text": text, "disable_notification": True})
+    payload: dict = {
+        "text": text,
+        "disable_notification": bool(silent),
+        "link_preview_options": {"is_disabled": True},
+    }
+    if reply_to is not None:
+        payload["reply_parameters"] = {
+            "message_id": int(reply_to),
+            "allow_sending_without_reply": True,
+        }
+    return _post(session, config, payload)

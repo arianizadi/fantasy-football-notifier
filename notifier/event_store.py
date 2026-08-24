@@ -130,6 +130,7 @@ class EventStore:
                 headline TEXT NOT NULL DEFAULT '',
                 body TEXT NOT NULL DEFAULT '',
                 url TEXT NOT NULL DEFAULT '',
+                subject_confident INTEGER NOT NULL DEFAULT 1,
                 published_at TEXT,
                 received_at TEXT NOT NULL,
                 event_type TEXT,
@@ -169,6 +170,11 @@ class EventStore:
             if "legacy_alert_token" not in columns:
                 self._connection.execute(
                     "ALTER TABLE news_events ADD COLUMN legacy_alert_token TEXT"
+                )
+            if "subject_confident" not in columns:
+                self._connection.execute(
+                    "ALTER TABLE news_events ADD COLUMN "
+                    "subject_confident INTEGER NOT NULL DEFAULT 1"
                 )
             return
 
@@ -290,14 +296,15 @@ class EventStore:
             """
             INSERT INTO news_events(
                 report_id, guid, alert_token, source, player_name, headline, body, url,
-                published_at, received_at, outcome, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'received', ?)
+                subject_confident, published_at, received_at, outcome, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'received', ?)
             ON CONFLICT(report_id) DO UPDATE SET
                 source = excluded.source,
                 player_name = excluded.player_name,
                 headline = excluded.headline,
                 body = excluded.body,
                 url = excluded.url,
+                subject_confident = excluded.subject_confident,
                 published_at = COALESCE(excluded.published_at, news_events.published_at),
                 updated_at = excluded.updated_at
             """,
@@ -310,6 +317,7 @@ class EventStore:
                 item.headline,
                 item.body,
                 item.url,
+                int(item.subject_confident),
                 published,
                 now,
                 now,
@@ -514,6 +522,40 @@ class EventStore:
                     cutoff,
                     max(1, min(limit, 50)),
                 ),
+            ).fetchall()
+            return [self._row(row) for row in rows]
+
+    def recent(
+        self,
+        *,
+        since: datetime,
+        until: datetime | None = None,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        """Return every saved report in a bounded UTC window.
+
+        The daily recap intentionally reads the complete journal rather than
+        the Telegram alert list.  That preserves lower-severity transactions
+        and role notes which are useful in a morning football briefing even
+        though they did not justify an immediate notification.
+        """
+        if since.tzinfo is None:
+            since = since.replace(tzinfo=timezone.utc)
+        since_utc = since.astimezone(timezone.utc).isoformat()
+        until_value = until or datetime.now(timezone.utc)
+        if until_value.tzinfo is None:
+            until_value = until_value.replace(tzinfo=timezone.utc)
+        until_utc = until_value.astimezone(timezone.utc).isoformat()
+        bounded = max(1, min(int(limit), 2000))
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT * FROM news_events
+                WHERE received_at >= ? AND received_at < ?
+                ORDER BY received_at DESC, id DESC
+                LIMIT ?
+                """,
+                (since_utc, until_utc, bounded),
             ).fetchall()
             return [self._row(row) for row in rows]
 

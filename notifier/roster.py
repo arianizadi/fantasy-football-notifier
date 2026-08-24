@@ -427,6 +427,7 @@ def refresh_snapshot(config: Config) -> RosterSnapshot:
 def refresh_drafted_snapshot(
     config: Config,
     previous: RosterSnapshot,
+    league_keys: set[str] | None = None,
 ) -> tuple[RosterSnapshot, int]:
     """Refresh ownership only for leagues already active in ``previous``.
 
@@ -438,6 +439,8 @@ def refresh_drafted_snapshot(
     noticing their eventual draft completion.
     """
     drafted = previous.drafted_leagues()
+    if league_keys is not None:
+        drafted = [league for league in drafted if league.key in league_keys]
     target_keys = {league.key for league in drafted}
     if not target_keys:
         return previous, snapshot_mtime(config)

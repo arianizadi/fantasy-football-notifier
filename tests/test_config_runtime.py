@@ -32,6 +32,9 @@ def test_dry_run_config_does_not_create_state_directory(tmp_path, monkeypatch) -
     assert config.dry_run is True
     assert config.telegram_controls_enabled is False
     assert config.fantasypros_refresh_hours == 2
+    assert config.daily_digest_hour == 8
+    assert config.waiver_report_enabled is True
+    assert config.waiver_report_lead_hours == 8
     assert not state_dir.exists()
 
 

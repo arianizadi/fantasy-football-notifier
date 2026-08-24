@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime, timezone
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 
 from notifier.event_store import EventStore
 from notifier.models import Classification, NewsItem, report_revision_identity
@@ -69,6 +70,30 @@ def test_event_journal_upsert_does_not_duplicate_exact_revision(tmp_path) -> Non
     store.record_received(item)
 
     assert len(store.search("Kittle")) == 1
+    store.close()
+
+
+def test_subject_confidence_persists_updates_and_is_returned_by_recent(tmp_path) -> None:
+    store = EventStore(tmp_path)
+    item = replace(_item(), subject_confident=False)
+    before = datetime.now(timezone.utc) - timedelta(minutes=1)
+
+    store.record_received(item)
+
+    assert store.get(item)["subject_confident"] == 0
+    rows = store.recent(
+        since=before,
+        until=datetime.now(timezone.utc) + timedelta(minutes=1),
+    )
+    assert len(rows) == 1
+    assert rows[0]["subject_confident"] == 0
+
+    # Confidence is metadata, not part of the raw revision identity.  A more
+    # confident parse of the exact same report updates the existing row.
+    store.record_received(replace(item, subject_confident=True))
+
+    assert store.count() == 1
+    assert store.get(item)["subject_confident"] == 1
     store.close()
 
 
@@ -259,6 +284,83 @@ def test_legacy_guid_unique_schema_migrates_without_breaking_old_feedback(
     store.record_received(changed)
     assert store.count() == 2
     assert store.get(changed)["alert_token"] != store.get(item)["alert_token"]
+    store.close()
+
+
+def test_revision_schema_migration_adds_subject_confidence_default_true(
+    tmp_path,
+) -> None:
+    item = _item()
+    database = tmp_path / "news-events.sqlite3"
+    connection = sqlite3.connect(database)
+    connection.execute(
+        """
+        CREATE TABLE news_events (
+            id INTEGER PRIMARY KEY,
+            report_id TEXT NOT NULL UNIQUE,
+            guid TEXT NOT NULL,
+            alert_token TEXT NOT NULL UNIQUE,
+            legacy_alert_token TEXT,
+            source TEXT NOT NULL,
+            player_name TEXT NOT NULL DEFAULT '',
+            headline TEXT NOT NULL DEFAULT '',
+            body TEXT NOT NULL DEFAULT '',
+            url TEXT NOT NULL DEFAULT '',
+            published_at TEXT,
+            received_at TEXT NOT NULL,
+            event_type TEXT,
+            direction TEXT,
+            severity INTEGER,
+            summary TEXT,
+            is_actionable INTEGER,
+            tier TEXT,
+            outcome TEXT NOT NULL DEFAULT 'received',
+            telegram_message_id INTEGER,
+            feedback TEXT,
+            feedback_at TEXT,
+            embedding_model TEXT,
+            embedding BLOB,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    now = datetime.now(timezone.utc).isoformat()
+    report_id = report_revision_identity(item)
+    connection.execute(
+        """
+        INSERT INTO news_events(
+            report_id, guid, alert_token, source, player_name, headline, body,
+            url, published_at, received_at, outcome, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'delivered', ?)
+        """,
+        (
+            report_id,
+            item.guid,
+            report_id[:16],
+            item.source,
+            item.player_name,
+            item.headline,
+            item.body,
+            item.url,
+            item.published_at.isoformat(),
+            now,
+            now,
+        ),
+    )
+    connection.commit()
+    connection.close()
+
+    store = EventStore(tmp_path)
+
+    columns = {
+        row["name"] for row in store._connection.execute("PRAGMA table_info(news_events)")
+    }
+    assert "subject_confident" in columns
+    assert store.get(item)["subject_confident"] == 1
+    assert store.recent(
+        since=datetime.now(timezone.utc) - timedelta(minutes=1),
+        until=datetime.now(timezone.utc) + timedelta(minutes=1),
+    )[0]["subject_confident"] == 1
     store.close()
 
 

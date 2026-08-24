@@ -14,6 +14,7 @@ import time
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -36,6 +37,24 @@ MAX_FEEDBACK = 1000
 MAX_FEEDBACK_TARGETS = 2000
 ALERT_RETENTION_DAYS = 8
 EDIT_WINDOW_SECONDS = 6 * 60 * 60
+SCHEDULED_REPORT_RETENTION_DAYS = 30
+MAX_SCHEDULED_REPORTS = 120
+
+
+class _VisibleTextParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+
+    def handle_data(self, data: str) -> None:
+        self.parts.append(data)
+
+
+def _visible_units(markup: str) -> int:
+    parser = _VisibleTextParser()
+    parser.feed(markup)
+    parser.close()
+    return len("".join(parser.parts).encode("utf-16-le")) // 2
 
 
 @dataclass(frozen=True)
@@ -154,6 +173,7 @@ class TelegramState:
             "feedback": {},
             "feedbackTargets": {},
             "lastDigestDate": "",
+            "scheduledReports": {},
             "lastTelegramSuccess": 0.0,
         }
 
@@ -736,6 +756,155 @@ class TelegramState:
         with self._lock:
             entry = (self._payload.get("feedback") or {}).get(token) or {}
             return str(entry.get("verdict") or "")
+
+    def register_scheduled_report(
+        self,
+        key: str,
+        *,
+        kind: str,
+        parts: tuple[str, ...] | list[str],
+        notify_first: bool = False,
+    ) -> bool:
+        """Persist a multipart report before its first Telegram request.
+
+        If the daemon restarts after only some parts were accepted, the exact
+        original content and the accepted message ids remain available. A
+        regenerated waiver pool or recap can therefore never make a retry
+        duplicate part one or silently skip a changed part.
+        """
+        report_key = str(key or "").strip()
+        normalized_parts = [str(part) for part in parts if str(part).strip()]
+        if not report_key or not normalized_parts or len(normalized_parts) > 20:
+            return False
+        if any(_visible_units(part) > 4096 for part in normalized_parts):
+            return False
+
+        now = time.time()
+        with self._lock:
+            reports = self._payload.setdefault("scheduledReports", {})
+            existing = reports.get(report_key)
+            if isinstance(existing, dict):
+                message_ids = existing.get("messageIds") or []
+                completed = float(existing.get("completedAt") or 0) > 0
+                if (
+                    not completed
+                    and isinstance(message_ids, list)
+                    and not message_ids
+                ):
+                    # Nothing reached Telegram yet, so an availability refresh
+                    # may safely replace a stale rendering. Once any part is
+                    # accepted, the exact original sequence wins so a restart
+                    # resumes rather than mixing two report versions.
+                    previous_payload = copy.deepcopy(self._payload)
+                    existing.update(
+                        {
+                            "kind": str(kind or "report")[:40],
+                            "parts": normalized_parts,
+                            "notifyFirst": bool(notify_first),
+                            "updatedAt": now,
+                        }
+                    )
+                    if not self._save_locked():
+                        self._payload = previous_payload
+                        return False
+                return True
+            previous_payload = copy.deepcopy(self._payload)
+            reports[report_key] = {
+                "kind": str(kind or "report")[:40],
+                "parts": normalized_parts,
+                "messageIds": [],
+                "notifyFirst": bool(notify_first),
+                "createdAt": now,
+                "completedAt": 0.0,
+            }
+            self._prune_scheduled_reports_locked(now)
+            if not self._save_locked():
+                self._payload = previous_payload
+                return False
+            return True
+
+    def _prune_scheduled_reports_locked(self, now: float) -> None:
+        reports = self._payload.get("scheduledReports") or {}
+        cutoff = now - (SCHEDULED_REPORT_RETENTION_DAYS * 24 * 3600)
+
+        def timestamp(value: object) -> float:
+            if not isinstance(value, dict):
+                return 0.0
+            try:
+                return float(value.get("completedAt") or value.get("createdAt") or 0)
+            except (TypeError, ValueError):
+                return 0.0
+
+        kept = {
+            key: value
+            for key, value in reports.items()
+            if isinstance(value, dict) and timestamp(value) >= cutoff
+        }
+        if len(kept) > MAX_SCHEDULED_REPORTS:
+            newest = sorted(kept, key=lambda key: timestamp(kept[key]), reverse=True)[
+                :MAX_SCHEDULED_REPORTS
+            ]
+            kept = {key: kept[key] for key in newest}
+        self._payload["scheduledReports"] = kept
+
+    def next_scheduled_report_part(
+        self,
+        key: str,
+    ) -> tuple[int, str, int | None, bool] | None:
+        """Return the next unsent part and its reply-chain parent."""
+        with self._lock:
+            entry = (self._payload.get("scheduledReports") or {}).get(key)
+            if not isinstance(entry, dict) or float(entry.get("completedAt") or 0) > 0:
+                return None
+            parts = entry.get("parts") or []
+            message_ids = entry.get("messageIds") or []
+            if not isinstance(parts, list) or not isinstance(message_ids, list):
+                return None
+            index = len(message_ids)
+            if index >= len(parts):
+                return None
+            try:
+                reply_to = int(message_ids[-1]) if message_ids else None
+            except (TypeError, ValueError):
+                reply_to = None
+            return index, str(parts[index]), reply_to, bool(entry.get("notifyFirst"))
+
+    def record_scheduled_report_part(
+        self,
+        key: str,
+        *,
+        part_index: int,
+        message_id: int,
+    ) -> bool | None:
+        """Commit one accepted part; return completion, or ``None`` on failure."""
+        now = time.time()
+        with self._lock:
+            entry = (self._payload.get("scheduledReports") or {}).get(key)
+            if not isinstance(entry, dict):
+                return None
+            parts = entry.get("parts") or []
+            message_ids = entry.get("messageIds") or []
+            if not isinstance(parts, list) or not isinstance(message_ids, list):
+                return None
+            if int(part_index) != len(message_ids) or len(message_ids) >= len(parts):
+                return None
+            previous_payload = copy.deepcopy(self._payload)
+            message_ids.append(int(message_id))
+            entry["messageIds"] = message_ids
+            entry["updatedAt"] = now
+            completed = len(message_ids) == len(parts)
+            if completed:
+                entry["completedAt"] = now
+            self._payload["lastTelegramSuccess"] = now
+            if not self._save_locked():
+                self._payload = previous_payload
+                return None
+            return completed
+
+    def scheduled_report_completed(self, key: str) -> bool:
+        with self._lock:
+            entry = (self._payload.get("scheduledReports") or {}).get(key)
+            return isinstance(entry, dict) and float(entry.get("completedAt") or 0) > 0
 
     def digest_due(self, now: datetime, *, hour: int, timezone_name: str) -> bool:
         local = now.astimezone(ZoneInfo(timezone_name))

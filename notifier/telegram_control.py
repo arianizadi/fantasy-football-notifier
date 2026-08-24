@@ -5,8 +5,10 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Callable
+from typing import Callable, Sequence
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -17,6 +19,17 @@ from .telegram_state import TelegramState, feedback_markup_for_token
 
 LONG_POLL_SECONDS = 25
 REQUEST_TIMEOUT = (5, LONG_POLL_SECONDS + 10)
+
+
+@dataclass(frozen=True)
+class ScheduledReport:
+    """One idempotent, already-formatted outbound report."""
+
+    key: str
+    kind: str
+    parts: tuple[str, ...]
+    notify_first: bool = False
+    expires_at: datetime | None = None
 
 
 class TelegramControl:
@@ -31,6 +44,9 @@ class TelegramControl:
         player_provider: Callable[[str], str],
         search_provider: Callable[[str], str] | None = None,
         feedback_provider: Callable[[str, str], bool] | None = None,
+        daily_recap_provider: Callable[[datetime], Sequence[str]] | None = None,
+        scheduled_report_provider: Callable[[datetime], Sequence[ScheduledReport]]
+        | None = None,
     ) -> None:
         self._config = config
         self._state = state
@@ -38,6 +54,8 @@ class TelegramControl:
         self._player_provider = player_provider
         self._search_provider = search_provider
         self._feedback_provider = feedback_provider
+        self._daily_recap_provider = daily_recap_provider
+        self._scheduled_report_provider = scheduled_report_provider
         self._session = requests.Session()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -95,6 +113,7 @@ class TelegramControl:
             # even when OpenClaw or another process owns getUpdates.
             while not self._stop.is_set():
                 self._maybe_send_digest()
+                self._maybe_send_scheduled_reports()
                 self._stop.wait(30)
             return
 
@@ -127,13 +146,14 @@ class TelegramControl:
                 # connection. A 409 conflict or transient outage cannot block
                 # the scheduled outbound message.
                 self._maybe_send_digest()
+                self._maybe_send_scheduled_reports()
 
     def _set_commands(self) -> None:
         commands = [
             {"command": "status", "description": "Check source and delivery health"},
             {"command": "player", "description": "Look up a player: /player Kittle"},
             {"command": "news", "description": "Search saved reports: /news Kittle"},
-            {"command": "digest", "description": "Show the last 24 hours of alerts"},
+            {"command": "digest", "description": "Show the 24-hour football recap"},
             {"command": "help", "description": "Show bot commands"},
         ]
         try:
@@ -201,19 +221,22 @@ class TelegramControl:
                     lambda: self._search_provider(query),
                 )
         elif command == "/digest":
-            self._reply(
-                self._state.format_digest(
-                    datetime.now(timezone.utc),
-                    timezone_name=self._config.daily_digest_timezone,
-                )
-            )
+            try:
+                parts = self._daily_recap_parts(datetime.now(timezone.utc))
+            except Exception:  # failure was logged by the provider wrapper
+                self._reply("Daily recap is temporarily unavailable.")
+                return
+            if len(parts) == 1:
+                self._reply(parts[0])
+            else:
+                self._reply_many(parts)
         elif command in {"/help", "/start"}:
             self._reply(
                 "<b>Fantasy notifier commands</b>\n"
                 "/status - source and delivery health\n"
                 "/player Kittle - depth, status, and league ownership\n"
                 "/news Kittle - search the saved tweet/report journal\n"
-                "/digest - alerts from the last 24 hours\n\n"
+                "/digest - big news, smaller moves, and a learning note\n\n"
                 "Use the buttons under an alert to mark it useful, wrong, or too noisy."
             )
 
@@ -290,6 +313,94 @@ class TelegramControl:
             self._state.mark_telegram_success()
         return message_id
 
+    def _reply_many(self, parts: Sequence[str]) -> None:
+        previous: int | None = None
+        for part in parts:
+            message_id = send_plain(
+                self._session,
+                self._config,
+                str(part),
+                reply_to=previous,
+            )
+            if message_id is None or message_id < 0:
+                return
+            self._state.mark_telegram_success()
+            previous = message_id
+
+    def _daily_recap_parts(self, now: datetime) -> tuple[str, ...]:
+        if self._daily_recap_provider is not None:
+            try:
+                parts = tuple(str(part) for part in self._daily_recap_provider(now))
+                if parts:
+                    return parts
+            except Exception as error:  # noqa: BLE001 - scheduled retry is safe
+                structured_log(
+                    logging.WARNING,
+                    "telegram.daily_recap_failed",
+                    errorType=type(error).__name__,
+                    error=str(error)[:160],
+                )
+                raise
+        return (
+            self._state.format_digest(
+                now,
+                timezone_name=self._config.daily_digest_timezone,
+            ),
+        )
+
+    def _deliver_registered_report(self, report: ScheduledReport) -> bool:
+        """Send only unsent parts, committing each accepted message id."""
+        while True:
+            expires_at = report.expires_at
+            if expires_at is not None:
+                if expires_at.tzinfo is None:
+                    expires_at = expires_at.replace(tzinfo=timezone.utc)
+                if datetime.now(timezone.utc) >= expires_at.astimezone(timezone.utc):
+                    structured_log(
+                        logging.INFO,
+                        "telegram.scheduled_report_expired",
+                        reportKind=report.kind,
+                        reportKey=report.key,
+                    )
+                    return False
+            pending = self._state.next_scheduled_report_part(report.key)
+            if pending is None:
+                return self._state.scheduled_report_completed(report.key)
+            part_index, text, reply_to, notify_first = pending
+            message_id = send_plain(
+                self._session,
+                self._config,
+                text,
+                silent=not (notify_first and part_index == 0),
+                reply_to=reply_to,
+            )
+            if message_id is None or message_id < 0:
+                return False
+            completed = self._state.record_scheduled_report_part(
+                report.key,
+                part_index=part_index,
+                message_id=message_id,
+            )
+            if completed is None:
+                structured_log(
+                    logging.ERROR,
+                    "telegram.scheduled_report_state_failed",
+                    reportKind=report.kind,
+                    reportKey=report.key,
+                    part=part_index + 1,
+                )
+                return False
+            structured_log(
+                logging.INFO,
+                "telegram.scheduled_report_part_sent",
+                reportKind=report.kind,
+                reportKey=report.key,
+                part=part_index + 1,
+                messageId=message_id,
+            )
+            if completed:
+                return True
+
     def _maybe_send_digest(self) -> None:
         if self._config.dry_run or not self._config.daily_digest_enabled:
             return
@@ -300,12 +411,71 @@ class TelegramControl:
             timezone_name=self._config.daily_digest_timezone,
         ):
             return
-        text = self._state.format_digest(
-            now,
-            timezone_name=self._config.daily_digest_timezone,
+        local = now.astimezone(ZoneInfo(self._config.daily_digest_timezone))
+        key = f"daily-recap:{local.date().isoformat()}"
+        try:
+            parts = self._daily_recap_parts(now)
+        except Exception:  # failure was logged by the provider wrapper
+            return
+        report = ScheduledReport(
+            key=key,
+            kind="daily_recap",
+            parts=parts,
+            notify_first=False,
         )
-        if self._reply(text) is not None:
+        if not self._state.register_scheduled_report(
+            report.key,
+            kind=report.kind,
+            parts=report.parts,
+            notify_first=report.notify_first,
+        ):
+            structured_log(
+                logging.ERROR,
+                "telegram.scheduled_report_registration_failed",
+                reportKind=report.kind,
+                reportKey=report.key,
+                partCount=len(report.parts),
+            )
+            return
+        if self._deliver_registered_report(report):
             self._state.mark_digest_sent(
                 now,
                 timezone_name=self._config.daily_digest_timezone,
             )
+
+    def _maybe_send_scheduled_reports(self) -> None:
+        if (
+            self._config.dry_run
+            or self._scheduled_report_provider is None
+        ):
+            return
+        try:
+            reports = tuple(
+                self._scheduled_report_provider(datetime.now(timezone.utc))
+            )
+        except Exception as error:  # noqa: BLE001 - retry on the next scheduler tick
+            structured_log(
+                logging.WARNING,
+                "telegram.scheduled_reports_failed",
+                errorType=type(error).__name__,
+                error=str(error)[:160],
+            )
+            return
+        for report in reports:
+            if not report.parts:
+                continue
+            if not self._state.register_scheduled_report(
+                report.key,
+                kind=report.kind,
+                parts=report.parts,
+                notify_first=report.notify_first,
+            ):
+                structured_log(
+                    logging.ERROR,
+                    "telegram.scheduled_report_registration_failed",
+                    reportKind=report.kind,
+                    reportKey=report.key,
+                    partCount=len(report.parts),
+                )
+                continue
+            self._deliver_registered_report(report)
