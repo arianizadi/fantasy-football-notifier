@@ -11,7 +11,15 @@ from unittest.mock import Mock
 import pytest
 
 from notifier.classify import _fallback
-from notifier.dedupe import SeenStore, event_fact_signature, event_status
+from notifier.dedupe import (
+    SeenStore,
+    event_fact_signature,
+    event_status,
+    role_decision_status,
+    semantic_event_fact_signature,
+    semantic_event_status,
+    semantic_event_type,
+)
 from notifier.models import (
     Alert,
     Classification,
@@ -360,6 +368,64 @@ def test_newer_pending_reinjury_retires_optimistic_return(
     ]
 
 
+def test_newer_role_reversal_retires_stale_pending_starter(
+    tmp_path, monkeypatch
+) -> None:
+    notifier = _notifier(tmp_path)
+    starter_item = replace(
+        _item(
+            "twitter:starter",
+            headline="Browns named Deshaun Watson their Week 1 starter",
+        ),
+        player_name="Deshaun Watson",
+    )
+    benched_item = replace(
+        _item(
+            "twitter:benched",
+            headline="The Browns benched Deshaun Watson and named Sanders starter",
+        ),
+        player_name="Deshaun Watson",
+    )
+    starter = notifier.outbox.add(
+        _alert(starter_item, 3, "depth_chart"),
+        observed_at=10,
+    )
+    starter.attempts = 1
+    benched = notifier.outbox.add(
+        _alert(benched_item, 3, "depth_chart"),
+        observed_at=20,
+    )
+    send = Mock(return_value=82)
+    monkeypatch.setattr("notifier.pipeline.send_alert", send)
+
+    assert notifier._attempt_pending_locked(benched) == 1
+
+    send.assert_called_once()
+    assert send.call_args.args[2].item == benched_item
+    assert len(notifier.outbox) == 0
+
+
+def test_expected_role_is_superseded_by_confirmed_role() -> None:
+    expected = _alert(
+        replace(
+            _item(headline="Deshaun Watson is expected to start Week 1"),
+            player_name="Deshaun Watson",
+        ),
+        3,
+        "depth_chart",
+    )
+    confirmed = _alert(
+        replace(
+            _item(headline="The Browns named Deshaun Watson their Week 1 starter"),
+            player_name="Deshaun Watson",
+        ),
+        3,
+        "depth_chart",
+    )
+
+    assert _alert_supersedes(expected, confirmed) is True
+
+
 def test_distinct_same_severity_usage_facts_remain_pending(tmp_path) -> None:
     notifier = _notifier(tmp_path)
     starter_item = replace(
@@ -640,6 +706,510 @@ def test_semantic_dedupe_treats_a_new_injury_timetable_as_a_new_fact(tmp_path) -
         4,
         "injury",
         event_fact_signature(timetable),
+    )
+
+
+def test_stable_injury_corroboration_crosses_other_and_injury_labels(tmp_path) -> None:
+    store = SeenStore(tmp_path / "seen.json")
+    first = replace(
+        _item(
+            guid="twitter:jeanty",
+            headline=(
+                "Raiders RB Ashton Jeanty, who had to be helped off the practice "
+                "field today, is believed to have sprained his ankle"
+            ),
+        ),
+        player_name="Ashton Jeanty",
+        subject_confident=False,
+    )
+    corroboration = replace(
+        _item(
+            guid="rotowire:jeanty",
+            source="rotowire",
+            headline="Ashton Jeanty has an ankle sprain",
+        ),
+        player_name="Ashton Jeanty",
+    )
+
+    first_event = semantic_event_type(first, "other", "injury")
+    assert first_event == "injury"
+    store.record_semantic(
+        first.player_name,
+        first_event,
+        4,
+        semantic_event_status(first, first_event),
+        semantic_event_fact_signature(first, first_event),
+    )
+
+    corroboration_event = semantic_event_type(corroboration, "injury")
+    assert corroboration_event == "injury"
+    assert not store.is_semantically_new(
+        corroboration.player_name,
+        corroboration_event,
+        4,
+        semantic_event_status(corroboration, corroboration_event),
+        semantic_event_fact_signature(corroboration, corroboration_event),
+    )
+
+
+def test_pipeline_uses_original_medical_label_only_as_dedupe_hint(tmp_path) -> None:
+    notifier = _notifier(tmp_path)
+    first_item = replace(
+        _item(
+            guid="twitter:jeanty-ambiguous",
+            headline=(
+                "Raiders RB Ashton Jeanty, who had to be helped off the practice "
+                "field, is believed to have sprained his ankle"
+            ),
+        ),
+        player_name="Ashton Jeanty",
+        subject_confident=False,
+    )
+    first = _alert(first_item, event_type="other")
+    first = replace(
+        first,
+        classification=replace(
+            first.classification,
+            raw={"event_type": "injury", "subject_attribution": "uncertain"},
+        ),
+    )
+    assert notifier._record_success(first)
+
+    confirmation_item = replace(
+        _item(
+            guid="rotowire:jeanty-confirmation",
+            source="rotowire",
+            headline="Ashton Jeanty has an ankle sprain",
+        ),
+        player_name="Ashton Jeanty",
+    )
+    confirmation = _alert(confirmation_item, event_type="injury")
+
+    assert not notifier._semantic_is_new(confirmation)
+
+
+def test_restart_recovery_preserves_ambiguous_medical_dedupe_provenance(
+    tmp_path, monkeypatch
+) -> None:
+    notifier = _notifier(tmp_path)
+    item = replace(
+        _item(
+            guid="twitter:jeanty-accepted",
+            headline=(
+                "Raiders RB Ashton Jeanty, who had to be helped off the practice "
+                "field, is believed to have sprained his ankle"
+            ),
+        ),
+        player_name="Ashton Jeanty",
+        subject_confident=False,
+    )
+    alert = replace(
+        _alert(item, event_type="other"),
+        classification=Classification(
+            "other",
+            4,
+            "",
+            False,
+            {"event_type": "injury", "subject_attribution": "uncertain"},
+        ),
+    )
+    pending = notifier.outbox.add(alert, observed_at=10)
+    pending.attempts = 1
+    notifier.events = SimpleNamespace(
+        recent_for_player=Mock(
+            return_value=[
+                _event_row(
+                    alert,
+                    received_at=datetime(2026, 8, 24, tzinfo=timezone.utc),
+                )
+            ]
+        ),
+        mark_outcome=Mock(),
+    )
+    send = Mock(return_value=99)
+    monkeypatch.setattr("notifier.pipeline.send_alert", send)
+
+    assert notifier._attempt_pending_locked(pending, replay=True) == 0
+
+    send.assert_not_called()
+    assert len(notifier.outbox) == 0
+    confirmation_item = replace(
+        _item(
+            guid="rotowire:jeanty-after-restart",
+            source="rotowire",
+            headline="Ashton Jeanty has an ankle sprain",
+        ),
+        player_name="Ashton Jeanty",
+    )
+    assert not notifier._semantic_is_new(
+        _alert(confirmation_item, event_type="injury")
+    )
+
+
+def test_six_hour_coalescing_is_checked_even_when_semantic_event_is_new(tmp_path) -> None:
+    notifier = _notifier(tmp_path)
+    alert = _alert(_item())
+    notifier._semantic_is_new = Mock(return_value=True)
+    notifier._can_coalesce = Mock(return_value=True)
+    notifier._attempt_pending_locked = Mock(return_value=1)
+    notifier._inflight_items[alert.item] = time.time()
+
+    assert notifier._complete_evaluation(alert.item, alert) == 1
+
+    notifier._can_coalesce.assert_called_once_with(alert)
+    assert notifier._attempt_pending_locked.call_args.kwargs["force_semantic"] is True
+
+
+def test_beneficiary_usage_is_not_recast_as_his_injury() -> None:
+    report = replace(
+        _item(
+            headline=(
+                "Mike Washington sees extra work after Ashton Jeanty left "
+                "with a knee injury"
+            )
+        ),
+        player_name="Mike Washington",
+    )
+
+    assert semantic_event_type(report, "other", "usage") == "other"
+
+
+@pytest.mark.parametrize("hint", ["injury", "inactive", "practice_report"])
+def test_uncertain_medical_display_label_keeps_its_model_family(hint: str) -> None:
+    report = replace(
+        _item(headline="Example Player has a sprained ankle"),
+        subject_confident=False,
+    )
+
+    assert semantic_event_type(report, "other", hint) == hint
+
+
+def test_usage_restriction_with_starter_wording_stays_a_distinct_event() -> None:
+    restriction = replace(
+        _item(
+            headline=(
+                "Deshaun Watson will start but play only one series before "
+                "rotating every drive"
+            )
+        ),
+        player_name="Deshaun Watson",
+    )
+
+    assert semantic_event_type(restriction, "usage") == "usage"
+
+
+@pytest.mark.parametrize(
+    ("headline", "expected_status"),
+    [
+        ("Deshaun Watson is not expected to start Week 1", "role_expected_not_starter"),
+        ("Deshaun Watson isn't expected to start Week 1", "role_expected_not_starter"),
+        ("Deshaun Watson is unlikely to start Week 1", "role_expected_not_starter"),
+        ("Deshaun Watson may not start Week 1", "role_expected_not_starter"),
+        ("Deshaun Watson won’t start Week 1", "role_not_starter"),
+        ("Deshaun Watson was not named the starter", "role_not_starter"),
+        ("The team did not name Deshaun Watson starter", "role_not_starter"),
+        ("The team won’t name Deshaun Watson starter", "role_not_starter"),
+        ("Deshaun Watson is expected not to start Week 1", "role_expected_not_starter"),
+        ("Deshaun Watson not named starter", "role_not_starter"),
+        ("Deshaun Watson not picked as QB1", "role_not_starter"),
+        ("The Browns don't name Deshaun Watson starter", "role_not_starter"),
+        ("The Browns do not name Deshaun Watson starter", "role_not_starter"),
+        ("The Browns haven't named Deshaun Watson starter", "role_not_starter"),
+        ("The Browns haven’t named Deshaun Watson starter", "role_not_starter"),
+        ("Deshaun Watson doesn't get the start", "role_not_starter"),
+        ("Deshaun Watson does not get the start", "role_not_starter"),
+        ("Deshaun Watson won't get the start", "role_not_starter"),
+        ("Deshaun Watson isn't starting Week 1", "role_not_starter"),
+        ("Deshaun Watson isn’t starting Week 1", "role_not_starter"),
+    ],
+)
+def test_negated_role_language_never_becomes_a_positive_starter_fact(
+    headline: str,
+    expected_status: str,
+) -> None:
+    report = replace(
+        _item(headline=headline),
+        player_name="Deshaun Watson",
+    )
+
+    assert role_decision_status(report) == expected_status
+    assert semantic_event_fact_signature(report, "depth_chart") == (
+        expected_status.replace("role_", "role:", 1)
+    )
+
+
+def test_projected_nonstarter_to_confirmed_benching_is_a_new_role_fact(tmp_path) -> None:
+    store = SeenStore(tmp_path / "seen.json")
+    projected = replace(
+        _item(headline="Deshaun Watson may not start Week 1"),
+        player_name="Deshaun Watson",
+    )
+    event_type = semantic_event_type(projected, "depth_chart")
+    store.record_semantic(
+        projected.player_name,
+        event_type,
+        3,
+        semantic_event_status(projected, event_type),
+        semantic_event_fact_signature(projected, event_type),
+    )
+    confirmed = replace(
+        _item(headline="Deshaun Watson won’t start Week 1"),
+        player_name="Deshaun Watson",
+    )
+
+    assert store.is_semantically_new(
+        confirmed.player_name,
+        semantic_event_type(confirmed, "depth_chart"),
+        3,
+        semantic_event_status(confirmed, "depth_chart"),
+        semantic_event_fact_signature(confirmed, "depth_chart"),
+    )
+
+
+@pytest.mark.parametrize(
+    "headline",
+    [
+        "Watson named starter",
+        "Watson named QB1",
+        "Browns name Watson QB1",
+        "Browns select Watson to start",
+        "Browns pick Watson to start",
+        "Watson gets Week 1 start",
+        "Watson starting Week 1",
+        (
+            "Sources: The Browns are naming Deshaun Watson as their starting "
+            "QB for Week 1"
+        ),
+    ],
+)
+def test_common_confirmed_role_headlines_canonicalize_as_starter(
+    headline: str,
+) -> None:
+    report = replace(
+        _item(
+            headline=headline,
+            source="rotowire" if "Deshaun Watson" not in headline else "twitter",
+        ),
+        player_name="Deshaun Watson",
+    )
+
+    assert role_decision_status(report) == "role_starter"
+
+
+@pytest.mark.parametrize(
+    "headline",
+    [
+        (
+            "The Browns are expected to name a starting quarterback between "
+            "Deshaun Watson and Shedeur Sanders today"
+        ),
+        (
+            "The starting quarterback battle between Deshaun Watson and "
+            "Shedeur Sanders remains open"
+        ),
+    ],
+)
+def test_predecision_competition_language_is_never_a_confirmed_starter(
+    headline: str,
+) -> None:
+    report = replace(
+        _item(headline=headline),
+        player_name="Deshaun Watson",
+    )
+
+    assert role_decision_status(report) in {"", "role_uncertain"}
+    assert role_decision_status(report) != "role_starter"
+
+
+@pytest.mark.parametrize(
+    "headline",
+    [
+        "If Deshaun Watson starts Week 1, the Browns will lean on experience",
+        "Whether Deshaun Watson starts Week 1 remains unclear",
+        "It is unclear whether Deshaun Watson starts Week 1",
+        "Deshaun Watson starts rehab Monday",
+        "Deshaun Watson is starting rehab Monday",
+        "Deshaun Watson will start rehab Monday",
+        "Deshaun Watson starts the season on PUP",
+        "Deshaun Watson will start the season on IR",
+        "Deshaun Watson is starting camp on PUP",
+        "Deshaun Watson is starting to throw again",
+    ],
+)
+def test_non_role_start_language_never_becomes_a_starter_fact(headline: str) -> None:
+    report = replace(
+        _item(headline=headline),
+        player_name="Deshaun Watson",
+    )
+
+    assert role_decision_status(report) != "role_starter"
+
+
+@pytest.mark.parametrize(
+    "headline",
+    [
+        "Deshaun Watson is no longer the starter",
+        "Deshaun Watson is no longer QB1",
+        "Deshaun Watson lost the starting job",
+        "Deshaun Watson loses his starting role",
+    ],
+)
+def test_common_role_reversal_headlines_are_not_starter_facts(headline: str) -> None:
+    report = replace(
+        _item(headline=headline),
+        player_name="Deshaun Watson",
+    )
+
+    assert role_decision_status(report) == "role_not_starter"
+
+
+def test_role_reversal_and_injury_timetable_remain_new_semantic_facts(tmp_path) -> None:
+    store = SeenStore(tmp_path / "seen.json")
+    starter = replace(
+        _item(headline="Browns named Deshaun Watson their Week 1 starter"),
+        player_name="Deshaun Watson",
+    )
+    role_event = semantic_event_type(starter, "other")
+    store.record_semantic(
+        starter.player_name,
+        role_event,
+        3,
+        semantic_event_status(starter, role_event),
+        semantic_event_fact_signature(starter, role_event),
+    )
+    benched = replace(
+        _item(
+            guid="twitter:watson-benched",
+            headline="The Browns benched Deshaun Watson and named Sanders starter",
+        ),
+        player_name="Deshaun Watson",
+    )
+    assert store.is_semantically_new(
+        benched.player_name,
+        semantic_event_type(benched, "depth_chart"),
+        3,
+        semantic_event_status(benched, "depth_chart"),
+        semantic_event_fact_signature(benched, "depth_chart"),
+    )
+
+    injury = replace(
+        _item(
+            guid="twitter:jeanty-injury",
+            headline="Ashton Jeanty has a sprained ankle",
+        ),
+        player_name="Ashton Jeanty",
+    )
+    injury_event = semantic_event_type(injury, "injury")
+    store.record_semantic(
+        injury.player_name,
+        injury_event,
+        4,
+        semantic_event_status(injury, injury_event),
+        semantic_event_fact_signature(injury, injury_event),
+    )
+    timetable = replace(
+        injury,
+        guid="twitter:jeanty-timetable",
+        headline="Ashton Jeanty will miss 4 to 6 weeks with a sprained ankle",
+        body="Ashton Jeanty will miss 4 to 6 weeks with a sprained ankle",
+    )
+    assert store.is_semantically_new(
+        timetable.player_name,
+        semantic_event_type(timetable, "other"),
+        4,
+        semantic_event_status(timetable, "other"),
+        semantic_event_fact_signature(timetable, "other"),
+    )
+
+
+def test_role_severity_model_drift_is_corroboration_but_injury_escalation_is_new(
+    tmp_path,
+) -> None:
+    store = SeenStore(tmp_path / "seen.json")
+    starter = replace(
+        _item(headline="Browns named Deshaun Watson their Week 1 starter"),
+        player_name="Deshaun Watson",
+    )
+    role_event = semantic_event_type(starter, "depth_chart")
+    role_status = semantic_event_status(starter, role_event)
+    role_facts = semantic_event_fact_signature(starter, role_event)
+    store.record_semantic(starter.player_name, role_event, 3, role_status, role_facts)
+
+    assert not store.is_semantically_new(
+        starter.player_name,
+        role_event,
+        4,
+        role_status,
+        role_facts,
+    )
+
+    injury = replace(
+        _item(headline="Ashton Jeanty has a sprained ankle"),
+        player_name="Ashton Jeanty",
+    )
+    injury_event = semantic_event_type(injury, "injury")
+    injury_status = semantic_event_status(injury, injury_event)
+    injury_facts = semantic_event_fact_signature(injury, injury_event)
+    store.record_semantic(
+        injury.player_name,
+        injury_event,
+        3,
+        injury_status,
+        injury_facts,
+    )
+    assert store.is_semantically_new(
+        injury.player_name,
+        injury_event,
+        4,
+        injury_status,
+        injury_facts,
+    )
+
+
+def test_concrete_injury_fact_lasts_24_hours_but_generic_usage_does_not(
+    tmp_path, monkeypatch
+) -> None:
+    clock = [1_000_000.0]
+    monkeypatch.setattr("notifier.dedupe.time.time", lambda: clock[0])
+    store = SeenStore(tmp_path / "seen.json")
+    injury = replace(
+        _item(headline="Ashton Jeanty has a sprained ankle"),
+        player_name="Ashton Jeanty",
+    )
+    event_type = semantic_event_type(injury, "injury")
+    status = semantic_event_status(injury, event_type)
+    facts = semantic_event_fact_signature(injury, event_type)
+    store.record_semantic(injury.player_name, event_type, 4, status, facts)
+
+    clock[0] += 16 * 60 * 60
+    assert not store.is_semantically_new(
+        injury.player_name,
+        event_type,
+        4,
+        status,
+        facts,
+    )
+    clock[0] += 8 * 60 * 60 + 1
+    assert store.is_semantically_new(
+        injury.player_name,
+        event_type,
+        4,
+        status,
+        facts,
+    )
+
+    usage = replace(
+        _item(headline="Example Player handled first-team reps"),
+        player_name="Example Player",
+    )
+    store.record_semantic("Example Player", "usage", 3, "usage", "unspecified")
+    clock[0] += 91 * 60
+    assert store.is_semantically_new(
+        usage.player_name,
+        "usage",
+        3,
+        "usage",
+        "unspecified",
     )
 
 
@@ -1057,6 +1627,17 @@ def test_ambiguous_multi_player_report_never_triggers_roster_moves(monkeypatch) 
     assert "Backup Player will take over" not in rendered
     assert "ADD OPTION" not in rendered
     assert "START" not in rendered
+
+
+def test_ambiguous_league_commentary_requires_severity_four() -> None:
+    notifier = Notifier.__new__(Notifier)
+    notifier.config = SimpleNamespace(
+        min_severity=2,
+        min_severity_other=3,
+    )
+
+    assert notifier._threshold_for("league", subject_confident=True) == 3
+    assert notifier._threshold_for("league", subject_confident=False) == 4
 
 
 def test_non_transaction_release_fails_closed_through_fallback_pipeline(monkeypatch) -> None:

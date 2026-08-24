@@ -26,9 +26,10 @@ from .classify import classify
 from .config import Config, seen_path
 from .dedupe import (
     SeenStore,
-    event_fact_signature,
     event_facts_equivalent,
-    event_status,
+    semantic_event_fact_signature,
+    semantic_event_status,
+    semantic_event_type,
 )
 from .event_store import EventStore
 from .health import HEALTH, age_label, duration_label
@@ -58,6 +59,11 @@ CLASSIFY_WORKERS = 8
 # using Sleeper's overall rank. It engages automatically whenever no rostered
 # players exist and disengages by itself after the draft.
 PRESEASON_MIN_SEVERITY = 3
+# When deterministic attribution cannot tell which mentioned player owns the
+# report, the app already withholds roster actions and labels it generic news.
+# Requiring one more relevance point prevents 3/5 multi-player commentary from
+# flooding league chat while retaining major injuries and transactions.
+UNCERTAIN_SUBJECT_MIN_SEVERITY = 4
 PRESEASON_MAX_RANK = 250
 
 ROSTER_STALE_HOURS = 36
@@ -182,15 +188,36 @@ def _report_is_newer(
 
 def _same_event_update_supersedes(older: Alert, newer: Alert) -> bool:
     """Whether a chronological update makes an older same-event send stale."""
-    if newer.classification.event_type != older.classification.event_type:
+    old_event = semantic_event_type(
+        older.item,
+        older.classification.event_type,
+        str(older.classification.raw.get("event_type") or ""),
+    )
+    new_event = semantic_event_type(
+        newer.item,
+        newer.classification.event_type,
+        str(newer.classification.raw.get("event_type") or ""),
+    )
+    if new_event != old_event:
         return False
 
     old_severity = older.classification.severity
     new_severity = newer.classification.severity
-    old_status = event_status(older.item, older.classification.event_type)
-    new_status = event_status(newer.item, newer.classification.event_type)
+    old_status = semantic_event_status(older.item, old_event)
+    new_status = semantic_event_status(newer.item, new_event)
     old_rank = _status_rank(old_status)
     new_rank = _status_rank(new_status)
+
+    # This helper decides which alert survives a delivery outage, not whether
+    # a live role reversal deserves a notification. A newer explicit role
+    # decision always makes an older queued role message stale; otherwise a
+    # failed "named starter" alert could be retried after a later benching.
+    if (
+        new_event == "depth_chart"
+        and old_status.startswith("role_")
+        and new_status.startswith("role_")
+    ):
+        return True
 
     # A deterministic clearance is a forward transition even though the
     # absence-oriented rank scale is numerically lower.
@@ -203,8 +230,8 @@ def _same_event_update_supersedes(older: Alert, newer: Alert) -> bool:
     if new_severity > old_severity or new_rank > old_rank:
         return True
 
-    old_facts = event_fact_signature(older.item)
-    new_facts = event_fact_signature(newer.item)
+    old_facts = semantic_event_fact_signature(older.item, old_event)
+    new_facts = semantic_event_fact_signature(newer.item, new_event)
     if old_facts == new_facts:
         # Equal concrete condition markers prove corroboration. Two generic
         # usage reports both map to ``unspecified``, however, and may contain
@@ -227,8 +254,16 @@ def _same_event_update_supersedes(older: Alert, newer: Alert) -> bool:
 
 
 def _alert_supersedes(older: Alert, newer: Alert) -> bool:
-    newer_event = newer.classification.event_type
-    older_event = older.classification.event_type
+    newer_event = semantic_event_type(
+        newer.item,
+        newer.classification.event_type,
+        str(newer.classification.raw.get("event_type") or ""),
+    )
+    older_event = semantic_event_type(
+        older.item,
+        older.classification.event_type,
+        str(older.classification.raw.get("event_type") or ""),
+    )
     if newer_event in SUPERSEDING_EVENTS.get(older_event, frozenset()):
         return True
     return _same_event_update_supersedes(older, newer)
@@ -609,12 +644,16 @@ class Notifier:
             return "rival"
         return "league"
 
-    def _threshold_for(self, tier: str) -> int:
+    def _threshold_for(self, tier: str, *, subject_confident: bool = True) -> int:
         if tier == "mine":
-            return self.config.min_severity
-        if tier == "claimable":
-            return max(self.config.min_severity, 3)
-        return self.config.min_severity_other
+            threshold = self.config.min_severity
+        elif tier == "claimable":
+            threshold = max(self.config.min_severity, 3)
+        else:
+            threshold = self.config.min_severity_other
+        if not subject_confident:
+            threshold = max(threshold, UNCERTAIN_SUBJECT_MIN_SEVERITY)
+        return threshold
 
     def _journal_received(self, item: NewsItem) -> None:
         if getattr(self.config, "dry_run", False) or not hasattr(self, "events"):
@@ -809,7 +848,10 @@ class Notifier:
         per_league = self._enrich_fantasypros(per_league)
         tier = self._tier_for(per_league) if per_league else "league"
 
-        threshold = self._threshold_for(tier)
+        threshold = self._threshold_for(
+            tier,
+            subject_confident=item.subject_confident,
+        )
         if classification.severity < threshold:
             self._journal_classification(
                 item,
@@ -991,12 +1033,17 @@ class Notifier:
 
     def _semantic_is_new(self, alert: Alert) -> bool:
         classification = alert.classification
+        event_type = semantic_event_type(
+            alert.item,
+            classification.event_type,
+            str(classification.raw.get("event_type") or ""),
+        )
         return self.seen.is_semantically_new(
             alert.item.player_name,
-            classification.event_type,
+            event_type,
             classification.severity,
-            event_status(alert.item, classification.event_type),
-            event_fact_signature(alert.item),
+            semantic_event_status(alert.item, event_type),
+            semantic_event_fact_signature(alert.item, event_type),
         )
 
     def _can_coalesce(self, alert: Alert) -> bool:
@@ -1018,13 +1065,18 @@ class Notifier:
 
     def _record_success(self, alert: Alert) -> bool:
         classification = alert.classification
+        event_type = semantic_event_type(
+            alert.item,
+            classification.event_type,
+            str(classification.raw.get("event_type") or ""),
+        )
         self.seen.record(alert.item)
         self.seen.record_semantic(
             alert.item.player_name,
-            classification.event_type,
+            event_type,
             classification.severity,
-            event_status(alert.item, classification.event_type),
-            event_fact_signature(alert.item),
+            semantic_event_status(alert.item, event_type),
+            semantic_event_fact_signature(alert.item, event_type),
         )
         return self.seen.save()
 
@@ -1111,8 +1163,11 @@ class Notifier:
             )
             if same_revision:
                 # Telegram accepted this exact revision and the journal was
-                # committed before an interrupted outbox removal.
-                return delivered, True
+                # committed before an interrupted outbox removal. The journal
+                # does not persist subject-confidence or raw model provenance,
+                # so retain the full pending alert when rebuilding semantic
+                # state instead of degrading it to the reconstructed row.
+                return alert, True
             # A reused GUID keeps its original received_at in SQLite. Its
             # updated_at is the only durable chronology for the replacement.
             if delivered.item.guid == alert.item.guid:
@@ -1319,7 +1374,11 @@ class Notifier:
 
             with self._delivery_lock:
                 semantic_new = self._semantic_is_new(alert)
-                coalescing = not semantic_new and self._can_coalesce(alert)
+                # Telegram's six-hour update window intentionally outlives the
+                # short semantic chatter window. Check it independently so a
+                # safe same-state edit remains an edit even after semantic
+                # state expires or was written by a legacy schema.
+                coalescing = self._can_coalesce(alert)
                 if not semantic_new and not coalescing:
                     structured_log(
                         logging.INFO,

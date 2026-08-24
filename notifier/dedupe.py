@@ -29,6 +29,10 @@ DEFAULT_WINDOW_SECONDS = 30 * 60
 # differently, so text similarity cannot catch the duplicate. After
 # classification we know (player, event_type), which is stable across sources.
 SEMANTIC_WINDOW_SECONDS = 90 * 60
+# Concrete medical facts and explicit role decisions are commonly rehashed all
+# day. Keep those identities longer than generic usage chatter; real severity,
+# status, condition, and timetable changes still pass the checks below.
+STABLE_FACT_WINDOW_SECONDS = 24 * 60 * 60
 MAX_TRACKED_ENTRIES = 5000
 STOPWORDS = frozenset({"the", "a", "an", "is", "was", "for", "of", "to", "in", "on", "at", "with"})
 
@@ -165,6 +169,307 @@ _DETAIL_FREE_CORROBORATION_STATUSES = frozenset(
         "cleared",
     }
 )
+
+# Models reasonably disagree over whether an explicit starter announcement is
+# ``depth_chart`` or a generic ``other`` update. Treat the deterministic role
+# decision as the durable identity instead of letting that presentation label
+# create several alerts. ``usage`` remains separate because a snap/rotation
+# restriction can be actionable even when its report repeats who will start.
+_ROLE_EVENT_TYPES = frozenset({"depth_chart", "other"})
+_MEDICAL_EVENT_TYPES = frozenset({"injury", "inactive", "practice_report"})
+_MEDICAL_EVENT_PATTERN = re.compile(
+    r"\b(?:injur(?:y|ed)|hurt|concussion|illness|sick|"
+    r"sprain(?:ed)?|strain(?:ed)?|fractur(?:e|ed)|broken|"
+    r"tear|tore|torn|ruptur(?:e|ed)|surgery|"
+    r"ankle|knee|hamstring|quadriceps|quad|groin|calf|foot|toe|hip|"
+    r"back|neck|shoulder|pectoral|pec|biceps|triceps|elbow|forearm|"
+    r"wrist|hand|finger|thumb|ribs?|chest|abdomen|abdominal|oblique|"
+    r"hernia|achilles|acl|mcl|meniscus)\b",
+    re.I,
+)
+
+
+def _normalized_event_type(event_type: str) -> str:
+    return (event_type or "other").strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _report_text(item: NewsItem) -> str:
+    """Join headline/body without repeating a tweet's truncated full text."""
+    headline = (item.headline or "").strip()
+    body = (item.body or "").strip()
+    if not headline:
+        return body
+    if not body:
+        return headline
+    if body == headline or body.startswith(headline) or headline.startswith(body):
+        return body if len(body) >= len(headline) else headline
+    return f"{headline}. {body}"
+
+
+def role_decision_status(item: NewsItem) -> str:
+    """Return a deterministic role outcome only when the report states one.
+
+    This intentionally ignores ordinary snap-count or first-team-rep usage.
+    Those can be separate actionable facts.  It is narrowly for announcements
+    such as ``named QB1`` / ``will start`` and their reversals.
+    """
+    if not item.subject_confident:
+        return ""
+    text = _report_text(item)
+    player = r"\s+".join(re.escape(part) for part in item.player_name.split())
+    if not player:
+        return ""
+    if not re.search(rf"\b{player}\b", text, re.I):
+        # A RotoWire item has already attributed its structured player from a
+        # dedicated article title/URL. Its prose often switches to surname
+        # only. X does not get this fallback because a surname can refer to a
+        # different player in a multi-player post.
+        surname = item.player_name.split()[-1]
+        if item.source != "rotowire" or len(surname) < 4:
+            return ""
+        player = re.escape(surname)
+        if not re.search(rf"\b{player}\b", text, re.I):
+            return ""
+
+    after_player = rf"\b{player}\b[^.\n]{{0,80}}"
+    before_player = rf"[^.\n]{{0,100}}\b{player}\b"
+    role_one = (
+        r"(?:starter|starting\s+(?:quarterback|running\s+back|wide\s+receiver|"
+        r"tight\s+end|qb|rb|wr|te)|(?:qb|rb|wr|te)1)"
+    )
+    role_backup = r"(?:backup|(?:qb|rb|wr|te)[2-9])"
+
+    open_competition = (
+        r"(?:(?:open|ongoing|unsettled)\s+(?:competition|battle)|"
+        r"(?:competition|battle)[^.\n]{0,100}"
+        r"(?:remains?|is\s+still|still)\s+open|no\s+decision|undecided)"
+    )
+    predecision_selection = (
+        r"(?:expected|plans?|set|will)\s+to\s+name[^.\n]{0,80}"
+        r"(?:between|from)"
+    )
+    conditional_start = (
+        rf"(?:\b(?:if|whether)\b[^.\n]{{0,45}}\b{player}\b[^.\n]{{0,35}}"
+        rf"\bstart(?:s|ing)?\b|\bunclear\b[^.\n]{{0,70}}\b{player}\b"
+        rf"[^.\n]{{0,35}}\bstart(?:s|ing)?\b)"
+    )
+    if (
+        re.search(rf"(?:{after_player}\b{open_competition}\b|"
+                  rf"\b{open_competition}\b{before_player})", text, re.I)
+        or re.search(rf"\b{predecision_selection}\b{before_player}", text, re.I)
+        or re.search(conditional_start, text, re.I)
+    ):
+        return "role_uncertain"
+
+    projected_negative_start = (
+        r"(?:may\s+not\s+start|might\s+not\s+start|could\s+not\s+start|"
+        r"should\s+not\s+start|"
+        r"(?:is|was)\s+not\s+(?:expected|likely|projected)\s+to\s+start|"
+        r"(?:isn|wasn)['’]t\s+(?:expected|likely|projected)\s+to\s+start|"
+        r"(?:is|was)\s+unlikely\s+to\s+start|unlikely\s+to\s+start|"
+        r"(?:expected|projected)\s+not\s+to\s+start|"
+        r"not\s+(?:expected|likely|projected)\s+to\s+start|"
+        r"no\s+longer\s+(?:(?:expected|likely|projected)\s+to\s+)?start)"
+    )
+    if re.search(rf"{after_player}\b{projected_negative_start}\b", text, re.I):
+        return "role_expected_not_starter"
+
+    definitive_negative_start = (
+        r"(?:will\s+not\s+start|won['’]t\s+start|"
+        r"(?:is\s+not|isn['’]t)\s+starting|"
+        r"(?:does\s+not|doesn['’]t|will\s+not|won['’]t)\s+"
+        r"get(?:\s+(?:the|week\s+\d{1,2}))?\s+start)"
+    )
+    negative_selection_after = (
+        r"(?:not|(?:is|was|has\s+been|had\s+been)\s+not|"
+        r"(?:isn|wasn|hasn|hadn)['’]t|will\s+not\s+be|won['’]t\s+be)\s+"
+        r"(?:named|picked|selected)\b(?:\s+as)?[^.\n]{0,45}"
+    )
+    negative_selection_before = (
+        r"(?:(?:did|do|does|have|has|will)\s+not|"
+        r"(?:didn|don|doesn|haven|hasn|won)['’]t)\s+"
+        r"(?:name|named|pick|picked|select|selected)\b"
+    )
+    if re.search(
+        rf"(?:{after_player}\b(?:{definitive_negative_start}|"
+        rf"{negative_selection_after}"
+        rf"{role_one}|not\s+(?:the\s+)?{role_one}|"
+        rf"(?:is\s+)?no\s+longer\s+(?:the\s+)?{role_one}|"
+        rf"(?:(?:has\s+)?lost|loses?)\s+(?:(?:the|his|their)\s+)?"
+        rf"(?:starting\s+(?:job|role)|starter\s+(?:job|role))|"
+        rf"bench(?:ed|ing)?|demot(?:ed|ion))\b|"
+        rf"\b{negative_selection_before}{before_player}[^.\n]{{0,45}}"
+        rf"\b{role_one}\b|"
+        rf"\b(?:bench(?:ed|ing)?|demot(?:ed|ion))\b{before_player}|"
+        rf"\b{role_one}\b[^.\n]{{0,50}}\bover\b{before_player})",
+        text,
+        re.I,
+    ):
+        return "role_not_starter"
+
+    expected_start = (
+        r"(?:(?:is|was)\s+(?:expected|likely|projected)\s+to\s+start|"
+        r"(?:expected|likely|projected)\s+to\s+start|"
+        r"(?:could|may)\s+start)"
+    )
+    expected_before = (
+        r"(?:expects?|expected|projects?|projected)[^.\n]{0,55}"
+    )
+    projected_selection = (
+        r"(?:expected|likely|projected|plans?)\s+to\s+"
+        r"(?:name|pick|select)"
+    )
+    if re.search(rf"{after_player}\b{expected_start}\b", text, re.I) or re.search(
+        rf"\b{expected_before}{before_player}[^.\n]{{0,30}}\bto\s+start\b",
+        text,
+        re.I,
+    ) or re.search(
+        rf"\b{projected_selection}\b{before_player}[^.\n]{{0,50}}"
+        rf"(?:\b{role_one}\b|\bto\s+start\b)",
+        text,
+        re.I,
+    ):
+        return "role_expected_starter"
+
+    game_start_context = (
+        r"(?:week\s+\d{1,2}|this\s+week|sunday|monday|thursday|tonight|"
+        r"against\b|at\b|vs\.?\b)"
+    )
+    direct_start = (
+        rf"(?:(?:will\s+start|starts|is\s+starting)"
+        rf"(?=\s+{game_start_context}|\s*(?:$|[.,;:!?]))|"
+        rf"starting\s+{game_start_context}|"
+        r"gets?(?:\s+(?:the|week\s+\d{1,2}))?\s+start|"
+        r"is\s+set\s+to\s+start|is\s+slated\s+to\s+start)"
+    )
+    direct_role = (
+        rf"(?:(?:is|was|remains?|will\s+be)\s+(?:(?:the|their)\s+)?{role_one}|"
+        rf"(?:(?:is|was|has\s+been|had\s+been)\s+)?"
+        rf"(?:named|picked|selected)[^.\n]{{0,35}}{role_one})"
+    )
+    selected_before = (
+        r"(?:name|named|names|naming|pick|picked|picks|select|selected|selects|"
+        r"confirm|confirmed|confirms|confirming)"
+    )
+    explicit_decision = r"(?:decision|decided|chooses?|chose)\s+to\s+start"
+    if (
+        re.search(rf"{after_player}\b(?:{direct_start}|{direct_role})\b", text, re.I)
+        or re.search(
+            rf"\b{selected_before}\b{before_player}[^.\n]{{0,50}}\b{role_one}\b",
+            text,
+            re.I,
+        )
+        or re.search(
+            rf"\b{selected_before}\b{before_player}[^.\n]{{0,25}}\bto\s+start\b",
+            text,
+            re.I,
+        )
+        or re.search(rf"\b{explicit_decision}\b{before_player}", text, re.I)
+        or re.search(
+            rf"\b{role_one}\b\s+(?:is|will\s+be|was)\s+{before_player}",
+            text,
+            re.I,
+        )
+    ):
+        return "role_starter"
+
+    if re.search(
+        rf"{after_player}\b(?:(?:is|was|remains?|named)\b[^.\n]{{0,30}})?"
+        rf"\b{role_backup}\b",
+        text,
+        re.I,
+    ):
+        return "role_not_starter"
+    return ""
+
+
+def _direct_subject_medical_report(item: NewsItem) -> bool:
+    """Whether medical language is deterministically about this item subject.
+
+    The attribution helper rejects beneficiary wording such as ``Washington
+    got extra work after Jeanty injured his knee``.  This lets a model's
+    generic ``other`` label meet a corroborating ``injury`` label without
+    assigning Jeanty's condition to Washington.
+    """
+    if not item.subject_confident or not item.player_name:
+        return False
+    text = _report_text(item)
+    if not _MEDICAL_EVENT_PATTERN.search(text):
+        return False
+    # Imported lazily to keep source ingestion independent from state loading.
+    from .sources.twitter import attributed_absence_subject
+
+    return attributed_absence_subject(text, [item.player_name]) == item.player_name
+
+
+def semantic_event_type(
+    item: NewsItem,
+    event_type: str,
+    event_hint: str = "",
+) -> str:
+    """Canonical event family used only for dedupe/update decisions."""
+    normalized = _normalized_event_type(event_type)
+    if normalized in _ROLE_EVENT_TYPES and role_decision_status(item):
+        return "depth_chart"
+    if normalized == "other" and _direct_subject_medical_report(item):
+        return "injury"
+    hint = _normalized_event_type(event_hint)
+    if (
+        normalized == "other"
+        and not item.subject_confident
+        and hint in _MEDICAL_EVENT_TYPES
+        and event_fact_signature(item) != "unspecified"
+    ):
+        # The pipeline deliberately displays ambiguous multi-player reports as
+        # ``other`` and withholds actions. Preserve the model's original
+        # medical family only for dedupe, and only when deterministic concrete
+        # medical facts exist. Beneficiary reports normally carry a ``usage``
+        # hint and therefore cannot assign the starter's injury to the backup.
+        return hint
+    return normalized
+
+
+def semantic_event_status(item: NewsItem, event_type: str) -> str:
+    """Status that preserves role reversals while coalescing corroboration."""
+    normalized = semantic_event_type(item, event_type)
+    if normalized == "depth_chart":
+        role_status = role_decision_status(item)
+        if role_status:
+            return role_status
+    return event_status(item, normalized)
+
+
+def semantic_event_fact_signature(item: NewsItem, event_type: str) -> str:
+    """Facts relevant to the canonical event family.
+
+    A generic ``Week 1`` marker is meaningful for injury return/timetable
+    news, but not for five reports repeating the same Week 1 starter choice.
+    Role decisions therefore use their deterministic outcome as the complete
+    semantic fact.  Other event families retain the conservative injury fact
+    behavior unchanged.
+    """
+    normalized = semantic_event_type(item, event_type)
+    if normalized == "depth_chart":
+        role_status = role_decision_status(item)
+        if role_status:
+            return role_status.replace("role_", "role:", 1)
+    return event_fact_signature(item)
+
+
+def _semantic_window_seconds(
+    event_type: str,
+    status: str,
+    fact_signature: str,
+) -> int:
+    normalized = _normalized_event_type(event_type)
+    if normalized == "depth_chart" and fact_signature.startswith("role:"):
+        return STABLE_FACT_WINDOW_SECONDS
+    if normalized in {"injury", "inactive", "practice_report"} and (
+        fact_signature not in {"", "unspecified"}
+        or status in _DETAIL_FREE_CORROBORATION_STATUSES
+    ):
+        return STABLE_FACT_WINDOW_SECONDS
+    return SEMANTIC_WINDOW_SECONDS
 
 
 def event_status(item: NewsItem, event_type: str) -> str:
@@ -411,7 +716,12 @@ class SeenStore:
         self._semantic = {
             key: value
             for key, value in self._semantic.items()
-            if now - float(value.get("seen_at", 0)) < SEMANTIC_WINDOW_SECONDS
+            if now - float(value.get("seen_at", 0))
+            < _semantic_window_seconds(
+                key.rsplit("|", 1)[-1],
+                str(value.get("status") or ""),
+                str(value.get("fact_signature") or ""),
+            )
         }
 
         for store in (
@@ -507,11 +817,28 @@ class SeenStore:
             previous = self._semantic.get(self.semantic_key(player_name, event_type))
             if previous is None:
                 return True
-            if (time.time() - float(previous.get("seen_at", 0))) >= SEMANTIC_WINDOW_SECONDS:
+            previous_window = _semantic_window_seconds(
+                event_type,
+                str(previous.get("status") or ""),
+                str(previous.get("fact_signature") or ""),
+            )
+            if (time.time() - float(previous.get("seen_at", 0))) >= previous_window:
                 return True
 
             old_severity = previous.get("severity")
-            if severity is not None and old_severity is not None and severity > old_severity:
+            same_role_fact = (
+                _normalized_event_type(event_type) == "depth_chart"
+                and status.startswith("role_")
+                and str(previous.get("status") or "") == status
+                and fact_signature.startswith("role:")
+                and str(previous.get("fact_signature") or "") == fact_signature
+            )
+            if (
+                severity is not None
+                and old_severity is not None
+                and severity > old_severity
+                and not same_role_fact
+            ):
                 return True
             old_status = str(previous.get("status") or "")
             if fact_signature and status and old_status and status != old_status:
@@ -542,10 +869,19 @@ class SeenStore:
                 key = self.semantic_key(player_name, event_type)
                 previous = self._semantic.get(key)
                 stored_severity = severity
+                previous_window = (
+                    _semantic_window_seconds(
+                        event_type,
+                        str(previous.get("status") or ""),
+                        str(previous.get("fact_signature") or ""),
+                    )
+                    if previous is not None
+                    else SEMANTIC_WINDOW_SECONDS
+                )
                 if (
                     previous is not None
                     and now - float(previous.get("seen_at", 0))
-                    < SEMANTIC_WINDOW_SECONDS
+                    < previous_window
                     and str(previous.get("status") or "") == status
                     and fact_signature
                     and event_facts_equivalent(

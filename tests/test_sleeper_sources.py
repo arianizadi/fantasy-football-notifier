@@ -171,11 +171,15 @@ def test_fetch_league_rosters_preserves_reserve_taxi_and_nfl_status() -> None:
     assert scoring_format == "HALF"
 
 
-def test_cached_player_index_carries_cache_freshness(tmp_path) -> None:
+def test_cached_player_index_carries_cache_freshness(tmp_path, monkeypatch) -> None:
     cache = tmp_path / "sleeper-players.json"
     cache.write_text(json.dumps({"1": {"full_name": "George Kittle"}}))
     refreshed_at = datetime(2026, 8, 23, 15, 30, tzinfo=timezone.utc)
     os.utime(cache, (refreshed_at.timestamp(), refreshed_at.timestamp()))
+    monkeypatch.setattr(
+        "notifier.sources.sleeper.time.time",
+        lambda: refreshed_at.timestamp() + 60,
+    )
     session = Mock()
 
     index = load_player_index(tmp_path, session)

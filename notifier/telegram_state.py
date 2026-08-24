@@ -18,13 +18,20 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from .dedupe import event_fact_signature, event_facts_equivalent, event_status
+from .dedupe import (
+    event_facts_equivalent,
+    role_decision_status,
+    semantic_event_fact_signature,
+    semantic_event_status,
+    semantic_event_type,
+)
 from .logging_utils import structured_log
 from .matcher import compact_key
 from .models import Alert, NewsItem, report_revision_identity
 from .plays import normalized_event_type
 
 STATE_VERSION = 1
+ROLE_METADATA_MIGRATION_VERSION = 1
 MAX_FEEDBACK = 1000
 MAX_FEEDBACK_TARGETS = 2000
 ALERT_RETENTION_DAYS = 8
@@ -140,6 +147,7 @@ class TelegramState:
     def _empty() -> dict[str, Any]:
         return {
             "version": STATE_VERSION,
+            "roleMetadataMigration": ROLE_METADATA_MIGRATION_VERSION,
             "updateOffset": 0,
             "threads": {},
             "alerts": [],
@@ -156,11 +164,152 @@ class TelegramState:
             payload = json.loads(self._path.read_text())
             if payload.get("version") != STATE_VERSION:
                 raise ValueError("unsupported state version")
+            try:
+                migration_version = int(payload.get("roleMetadataMigration") or 0)
+            except (TypeError, ValueError):
+                migration_version = 0
             for key, default in self._empty().items():
                 payload.setdefault(key, default)
             self._payload = payload
+            if migration_version < ROLE_METADATA_MIGRATION_VERSION:
+                self._migrate_role_metadata_locked()
+                self._payload["roleMetadataMigration"] = (
+                    ROLE_METADATA_MIGRATION_VERSION
+                )
+                self._save_locked()
         except (json.JSONDecodeError, OSError, TypeError, ValueError) as error:
             structured_log(logging.WARNING, "telegram.state_unreadable", error=str(error))
+
+    def _migrate_role_metadata_locked(self) -> bool:
+        """Canonicalize legacy role threads before the first post-deploy alert.
+
+        Older state saved model labels and generic Week markers.  The latest
+        headline and player are enough to prove an explicit starter decision,
+        so migrate only that narrow case; all other legacy entries continue to
+        fail closed.
+        """
+        def role_metadata(
+            player: str,
+            headline: str,
+            prior_event: str,
+        ) -> dict[str, str] | None:
+            if not player or not headline:
+                return None
+            item = NewsItem(
+                source="state",
+                guid="",
+                player_name=player,
+                headline=headline,
+                body=headline,
+                url="",
+                published_at=None,
+            )
+            if not role_decision_status(item):
+                return None
+            event_type = semantic_event_type(item, prior_event)
+            if event_type != "depth_chart":
+                return None
+            return {
+                "eventType": event_type,
+                "eventStatus": semantic_event_status(item, event_type),
+                "eventFactSignature": semantic_event_fact_signature(
+                    item,
+                    event_type,
+                ),
+            }
+
+        changed = False
+        alerts = self._payload.get("alerts") or []
+        threads = self._payload.get("threads") or {}
+        now = time.time()
+        for thread_key, entry in list(threads.items()):
+            if not isinstance(entry, dict):
+                continue
+            player = str(entry.get("player") or "").strip()
+            headline = str(entry.get("latestHeadline") or "").strip()
+            prior_event = str(entry.get("eventType") or "other")
+            metadata = role_metadata(player, headline, prior_event)
+
+            message_id = entry.get("messageId")
+            token = entry.get("token")
+            if metadata is not None:
+                if any(entry.get(key) != value for key, value in metadata.items()):
+                    entry.update(metadata)
+                    changed = True
+                for digest in reversed(alerts):
+                    if not isinstance(digest, dict):
+                        continue
+                    if (
+                        digest.get("messageId") != message_id
+                        or digest.get("token") != token
+                    ):
+                        continue
+                    if any(
+                        digest.get(key) != value
+                        for key, value in metadata.items()
+                    ):
+                        digest.update(metadata)
+                        changed = True
+                    break
+                continue
+
+            # Production may have received generic commentary immediately
+            # after the real role decision, leaving the per-player pointer on
+            # an uneditable ``other`` message. Recover the newest provable role
+            # alert from the digest, but only when the current pointer itself
+            # carries no concrete fact and the candidate is still editable.
+            if (
+                normalized_event_type(prior_event) != "other"
+                or str(entry.get("eventFactSignature") or "")
+                not in {"", "unspecified"}
+            ):
+                continue
+            for digest in reversed(alerts):
+                if not isinstance(digest, dict):
+                    continue
+                candidate_player = str(digest.get("player") or "").strip()
+                candidate_headline = str(digest.get("headline") or "").strip()
+                if compact_key(candidate_player) != compact_key(player):
+                    continue
+                candidate_metadata = role_metadata(
+                    candidate_player,
+                    candidate_headline,
+                    str(digest.get("eventType") or "other"),
+                )
+                if candidate_metadata is None:
+                    continue
+                try:
+                    candidate_message_id = int(digest["messageId"])
+                    candidate_sent_at = float(digest["sentAt"])
+                    candidate_severity = int(digest["severity"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                candidate_token = str(digest.get("token") or "")
+                age = now - candidate_sent_at
+                if age < 0 or age >= EDIT_WINDOW_SECONDS or not candidate_token:
+                    continue
+                if any(
+                    digest.get(key) != value
+                    for key, value in candidate_metadata.items()
+                ):
+                    digest.update(candidate_metadata)
+                    changed = True
+                threads[thread_key] = {
+                    "messageId": candidate_message_id,
+                    "sentAt": candidate_sent_at,
+                    "player": candidate_player,
+                    "token": candidate_token,
+                    "eventType": candidate_metadata["eventType"],
+                    "severity": candidate_severity,
+                    "eventStatus": candidate_metadata["eventStatus"],
+                    "eventFactSignature": candidate_metadata[
+                        "eventFactSignature"
+                    ],
+                    "latestHeadline": candidate_headline[:220],
+                }
+                changed = True
+                break
+        return changed
 
     def _save_locked(self) -> bool:
         try:
@@ -232,9 +381,13 @@ class TelegramState:
         if not key:
             return None
         stamp = time.time() if now is None else now
-        current_event = normalized_event_type(alert.classification.event_type)
-        current_status = event_status(alert.item, current_event)
-        current_fact_signature = event_fact_signature(alert.item)
+        current_event = semantic_event_type(
+            alert.item,
+            alert.classification.event_type,
+            str(alert.classification.raw.get("event_type") or ""),
+        )
+        current_status = semantic_event_status(alert.item, current_event)
+        current_fact_signature = semantic_event_fact_signature(alert.item, current_event)
         current_severity = int(alert.classification.severity)
 
         with self._lock:
@@ -268,8 +421,6 @@ class TelegramState:
                 return None
             if current_event != previous_event:
                 return None
-            if current_severity > previous_severity:
-                return None
             if not current_status or current_status != previous_status:
                 return None
             if not event_facts_equivalent(
@@ -277,6 +428,13 @@ class TelegramState:
                 current_fact_signature,
                 status=current_status,
             ):
+                return None
+            same_role_fact = (
+                current_event == "depth_chart"
+                and current_status.startswith("role_")
+                and current_fact_signature.startswith("role:")
+            )
+            if current_severity > previous_severity and not same_role_fact:
                 return None
 
             # The digest record must be editable too. Otherwise a Telegram
@@ -321,7 +479,11 @@ class TelegramState:
         targets[token] = {
             "messageId": int(message_id),
             "player": (alert.item.player_name or "League news").strip(),
-            "eventType": normalized_event_type(alert.classification.event_type),
+            "eventType": semantic_event_type(
+                alert.item,
+                alert.classification.event_type,
+                str(alert.classification.raw.get("event_type") or ""),
+            ),
             "severity": alert.classification.severity,
             "headline": alert.item.headline[:220],
             "recordedAt": recorded_at,
@@ -356,9 +518,13 @@ class TelegramState:
         token = alert_token(alert.item)
         now = time.time()
         player = (alert.item.player_name or "League news").strip()
-        normalized_event = normalized_event_type(alert.classification.event_type)
-        status = event_status(alert.item, normalized_event)
-        fact_signature = event_fact_signature(alert.item)
+        normalized_event = semantic_event_type(
+            alert.item,
+            alert.classification.event_type,
+            str(alert.classification.raw.get("event_type") or ""),
+        )
+        status = semantic_event_status(alert.item, normalized_event)
+        fact_signature = semantic_event_fact_signature(alert.item, normalized_event)
         record = {
             "token": token,
             "messageId": int(message_id),
@@ -425,9 +591,13 @@ class TelegramState:
         if not key:
             return False
         now = time.time()
-        normalized_event = normalized_event_type(alert.classification.event_type)
-        status = event_status(alert.item, normalized_event)
-        fact_signature = event_fact_signature(alert.item)
+        normalized_event = semantic_event_type(
+            alert.item,
+            alert.classification.event_type,
+            str(alert.classification.raw.get("event_type") or ""),
+        )
+        status = semantic_event_status(alert.item, normalized_event)
+        fact_signature = semantic_event_fact_signature(alert.item, normalized_event)
         new_token = alert_token(alert.item)
         published_at = (
             alert.item.published_at.isoformat()

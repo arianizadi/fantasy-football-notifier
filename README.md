@@ -208,12 +208,13 @@ without waiting for it.
 - Local state files are written atomically. An exclusive state-directory lock
   enforces one notifier process for queue, Telegram, and dedupe decisions;
   Redis is not required.
-- A later non-urgent corroboration for the same player, event, status, and
-  condition edits the existing Telegram message within six hours instead of
-  adding chat noise. Severity increases, status or condition changes, new
-  recovery timetables, and different event types post a new alert so urgent
-  transitions are not hidden inside a silent edit. Every raw report remains in
-  the local journal either way.
+- A later corroboration of the same explicit role decision or medical fact
+  edits the existing Telegram message within six hours instead of adding chat
+  noise. Identical concrete facts remain deduplicated for 24 hours, including
+  across safe classifier-label drift. A real role reversal, injury severity
+  escalation, condition change, or recovery timetable posts a new alert so an
+  urgent transition is never hidden inside a silent edit. Every raw report
+  remains in the local journal either way.
 
 ## Saved news and feedback
 

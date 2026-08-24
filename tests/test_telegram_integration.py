@@ -8,6 +8,8 @@ from unittest.mock import Mock
 import requests
 
 import notifier.notify as notify_module
+import notifier.telegram_state as telegram_state_module
+from notifier.dedupe import semantic_event_type
 from notifier.models import Alert, Classification, NewsItem
 from notifier.notify import send_alert
 from notifier.telegram_control import TelegramControl
@@ -101,15 +103,19 @@ def _alert(
     body: str | None = None,
     event_type: str = "return",
     severity: int = 4,
+    player_name: str = "George Kittle",
+    source: str = "twitter",
+    subject_confident: bool = True,
 ) -> Alert:
     item = NewsItem(
-        source="twitter",
+        source=source,
         guid=guid,
-        player_name="George Kittle",
+        player_name=player_name,
         headline=headline,
         body=body if body is not None else headline,
         url="https://x.com/example/status/1",
         published_at=None,
+        subject_confident=subject_confident,
     )
     return Alert(
         item=item,
@@ -176,6 +182,231 @@ def test_same_event_corroboration_edits_existing_message_and_digest(tmp_path) ->
     assert first_token in persisted["feedbackTargets"]
     assert second_token in persisted["feedbackTargets"]
     assert not (tmp_path / "sent-messages.json").exists()
+
+
+def test_watson_starter_burst_collapses_across_labels_and_wording(
+    tmp_path, monkeypatch
+) -> None:
+    notify_module._TELEGRAM_STATES.clear()
+    clock = [1_000_000.0]
+    monkeypatch.setattr(telegram_state_module.time, "time", lambda: clock[0])
+    config = _config(tmp_path)
+    session = Session()
+    reports = [
+        (
+            "depth_chart",
+            "The Browns have named Deshaun Watson their Week 1 starter, per source.",
+            "twitter",
+        ),
+        (
+            "depth_chart",
+            "Browns pick Deshaun Watson as QB1 for Week 1. His experience is key.",
+            "twitter",
+        ),
+        (
+            "depth_chart",
+            "Browns notified both QBs of the decision to start Deshaun Watson for Week 1.",
+            "twitter",
+        ),
+        (
+            "other",
+            "More about the Browns naming Deshaun Watson, not Sanders, as their QB1.",
+            "twitter",
+        ),
+        (
+            "depth_chart",
+            "Some perspective on the Browns naming Deshaun Watson starting quarterback.",
+            "twitter",
+        ),
+        (
+            "other",
+            "Deshaun Watson starts Week 1; the team doesn't anticipate a week-to-week thing.",
+            "twitter",
+        ),
+        (
+            "depth_chart",
+            "The Browns named Watson their starting quarterback.",
+            "rotowire",
+        ),
+    ]
+
+    for index, (event_type, headline, source) in enumerate(reports):
+        if index:
+            clock[0] += 20 * 60
+        alert = _alert(
+            f"tweet:watson:{index}",
+            headline=headline,
+            event_type=event_type,
+            severity=4 if index == 5 else 3,
+            player_name="Deshaun Watson",
+            source=source,
+        )
+        assert send_alert(session, config, alert) == 100
+
+    assert session.urls[0].endswith("/sendMessage")
+    assert all(url.endswith("/editMessageText") for url in session.urls[1:])
+    persisted = json.loads((tmp_path / "telegram-state.json").read_text())
+    assert len(persisted["alerts"]) == 1
+    assert persisted["threads"]["deshaunwatson"]["eventType"] == "depth_chart"
+    assert persisted["threads"]["deshaunwatson"]["eventStatus"] == "role_starter"
+    assert persisted["threads"]["deshaunwatson"]["eventFactSignature"] == "role:starter"
+
+    clock[0] += 20 * 60
+    reversal = _alert(
+        "tweet:watson:benched",
+        headline="The Browns benched Deshaun Watson and named Sanders the starter.",
+        event_type="depth_chart",
+        severity=3,
+        player_name="Deshaun Watson",
+    )
+    assert send_alert(session, config, reversal) == 101
+    assert session.urls[-1].endswith("/sendMessage")
+    assert session.payloads[-1]["reply_parameters"]["message_id"] == 100
+
+
+def test_legacy_watson_role_thread_is_migrated_before_first_repeat(tmp_path) -> None:
+    path = tmp_path / "telegram-state.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "threads": {
+                    "deshaunwatson": {
+                        "messageId": 94,
+                        "sentAt": time.time(),
+                        "player": "Deshaun Watson",
+                        "token": "legacy-token",
+                        "eventType": "depth_chart",
+                        "severity": 3,
+                        "eventStatus": "depth_chart",
+                        "eventFactSignature": "season_week:1|week_to_week",
+                        "latestHeadline": (
+                            "Deshaun Watson starts Week 1; the team doesn't anticipate "
+                            "this being a week-to-week thing."
+                        ),
+                    }
+                },
+                "alerts": [
+                    {
+                        "messageId": 94,
+                        "token": "legacy-token",
+                        "eventType": "depth_chart",
+                        "severity": 3,
+                        "eventStatus": "depth_chart",
+                        "eventFactSignature": "season_week:1|week_to_week",
+                        "headline": "Deshaun Watson starts Week 1",
+                    }
+                ],
+            }
+        )
+    )
+
+    state = TelegramState(path, thread_hours=168)
+    repeat = _alert(
+        "tweet:watson:repeat",
+        headline="Browns confirm Deshaun Watson as their QB1.",
+        event_type="other",
+        severity=4,
+        player_name="Deshaun Watson",
+    )
+
+    target = state.coalescing_target(repeat)
+    assert target is not None
+    assert target.message_id == 94
+    persisted = json.loads(path.read_text())
+    thread = persisted["threads"]["deshaunwatson"]
+    assert thread["eventStatus"] == "role_starter"
+    assert thread["eventFactSignature"] == "role:starter"
+    assert persisted["alerts"][0]["eventStatus"] == "role_starter"
+
+
+def test_live_watson_state_recovers_role_target_behind_generic_commentary(
+    tmp_path,
+) -> None:
+    path = tmp_path / "telegram-state.json"
+    sent_at = time.time()
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "threads": {
+                    "deshaunwatson": {
+                        "messageId": 95,
+                        "sentAt": sent_at + 60,
+                        "player": "Deshaun Watson",
+                        "token": "commentary-token",
+                        "eventType": "other",
+                        "severity": 3,
+                        "eventStatus": "other",
+                        "eventFactSignature": "unspecified",
+                        "latestHeadline": (
+                            "Todd Monken discusses the full body of work in the QB "
+                            "battle between Deshaun Watson and Shedeur Sanders"
+                        ),
+                    }
+                },
+                "alerts": [
+                    {
+                        "messageId": 94,
+                        "sentAt": sent_at,
+                        "player": "Deshaun Watson",
+                        "token": "role-token",
+                        "eventType": "depth_chart",
+                        "severity": 3,
+                        "eventStatus": "depth_chart",
+                        "eventFactSignature": "season_week:1|week_to_week",
+                        "headline": (
+                            "Deshaun Watson starts Week 1; the team doesn't "
+                            "anticipate this being a week-to-week thing."
+                        ),
+                    },
+                    {
+                        "messageId": 95,
+                        "sentAt": sent_at + 60,
+                        "player": "Deshaun Watson",
+                        "token": "commentary-token",
+                        "eventType": "other",
+                        "severity": 3,
+                        "eventStatus": "other",
+                        "eventFactSignature": "unspecified",
+                        "headline": "Todd Monken discusses the QB battle",
+                    },
+                ],
+            }
+        )
+    )
+
+    state = TelegramState(path, thread_hours=168)
+    repeat = _alert(
+        "tweet:watson:post-deploy",
+        headline="The Browns confirm Deshaun Watson as their QB1.",
+        event_type="depth_chart",
+        severity=4,
+        player_name="Deshaun Watson",
+    )
+
+    target = state.coalescing_target(repeat)
+    assert target is not None
+    assert target.message_id == 94
+    persisted = json.loads(path.read_text())
+    thread = persisted["threads"]["deshaunwatson"]
+    assert thread["messageId"] == 94
+    assert thread["eventStatus"] == "role_starter"
+    assert persisted["roleMetadataMigration"] == 1
+
+
+def test_past_qb_battle_commentary_is_not_an_unresolved_role_decision() -> None:
+    ambiguous = _alert(
+        "tweet:watson:battle",
+        headline=(
+            "After the earlier QB battle, Watson and Sanders discussed the Browns' decision."
+        ),
+        event_type="other",
+        severity=3,
+        player_name="Deshaun Watson",
+    )
+
+    assert semantic_event_type(ambiguous.item, "other") == "other"
 
 
 def test_lower_severity_corroboration_edits_without_downgrading_original(tmp_path) -> None:
