@@ -1767,16 +1767,30 @@ class Notifier:
         if now.tzinfo is None:
             now = now.replace(tzinfo=timezone.utc)
         now = now.astimezone(timezone.utc)
+        # Waivers can process overnight. Refresh every drafted league before
+        # personalizing the morning recap instead of waiting for the later
+        # scheduled roster cron. The JIT path is failure-safe and throttled;
+        # a provider outage leaves the last good snapshot available below.
+        if not self.config.dry_run:
+            self._refresh_ownership_just_in_time()
         rows = self.events.recent(
             since=now - timedelta(hours=24),
             until=now + timedelta(seconds=1),
             limit=2000,
         )
+        # Keep roster membership and the NFL player directory from the same
+        # in-memory generation. Formatting stays network-free after the lock
+        # is released.
+        with self._state_lock:
+            snapshot = self.snapshot
+            player_index = self._player_index
         recap = format_daily_recap(
             rows,
             now=now,
             hours=24,
             timezone_name=self.config.daily_digest_timezone,
+            roster_snapshot=snapshot,
+            player_index=player_index,
         )
         return recap.parts
 

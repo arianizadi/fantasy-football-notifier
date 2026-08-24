@@ -1,5 +1,5 @@
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -186,3 +186,61 @@ def test_fantasypros_formats_follow_each_provider_leagues_draft_state() -> None:
 
     # Once Sleeper also has a roster, both provider formats become relevant.
     assert notifier._fantasypros_scoring_formats() == ("PPR", "HALF")
+
+
+def test_daily_recap_reads_one_mixed_draft_state_under_the_state_lock(
+    monkeypatch,
+) -> None:
+    snapshot, espn, sleeper = _snapshot()
+    player_index = {
+        "1": {"full_name": "Example Starter", "position": "RB", "team": "LV"}
+    }
+    now = datetime(2026, 8, 24, 15, tzinfo=timezone.utc)
+
+    class TrackingLock:
+        held = False
+
+        def __enter__(self):
+            self.held = True
+            return self
+
+        def __exit__(self, *_args):
+            self.held = False
+
+    lock = TrackingLock()
+
+    class Probe:
+        _state_lock = lock
+        _refresh_ownership_just_in_time = Mock(return_value=True)
+        events = SimpleNamespace(recent=Mock(return_value=[]))
+        config = SimpleNamespace(
+            daily_digest_timezone="America/Los_Angeles",
+            dry_run=False,
+        )
+
+        @property
+        def snapshot(self):
+            assert lock.held
+            return snapshot
+
+        @property
+        def _player_index(self):
+            assert lock.held
+            return player_index
+
+    formatter = Mock(return_value=SimpleNamespace(parts=("recap",)))
+    monkeypatch.setattr("notifier.pipeline.format_daily_recap", formatter)
+
+    assert Notifier.daily_recap_parts(Probe(), now) == ("recap",)
+
+    Probe._refresh_ownership_just_in_time.assert_called_once_with()
+    Probe.events.recent.assert_called_once_with(
+        since=now - timedelta(hours=24),
+        until=now + timedelta(seconds=1),
+        limit=2000,
+    )
+    kwargs = formatter.call_args.kwargs
+    assert kwargs["roster_snapshot"] is snapshot
+    assert kwargs["player_index"] is player_index
+    assert snapshot.drafted_leagues() == [espn]
+    assert sleeper not in snapshot.drafted_leagues()

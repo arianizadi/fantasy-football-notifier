@@ -258,6 +258,11 @@ _TRADE_TEAM_LOOKUP = {
     for team, aliases in _NFL_TEAM_ALIASES.items()
     for alias in aliases
 }
+_TEAM_ABBREVIATION_PATTERN = re.compile(
+    r"(?<![A-Za-z])(?:ARI|ATL|BAL|BUF|CAR|CHI|CIN|CLE|DAL|DEN|DET|"
+    r"GB|HOU|IND|JAX|JAC|KC|LV|LAC|LAR|MIA|MIN|NE|NO|NYG|NYJ|PHI|"
+    r"PIT|SEA|SF|TB|TEN|WAS|WSH)(?![A-Za-z])"
+)
 _TRADE_CANCELLATION_PATTERN = re.compile(
     r"\b(?:"
     r"(?:trade|deal)[^.\n]{0,100}?"
@@ -346,27 +351,32 @@ def _canonical_trade_team(value: str) -> str:
     return _TRADE_TEAM_LOOKUP.get(re.sub(r"\s+", " ", value).casefold(), "")
 
 
+def _team_mentions(fragment: str) -> list[tuple[int, int, str]]:
+    mentions = [
+        (match.start(), match.end(), _canonical_trade_team(match.group("team")))
+        for match in _TRADE_TEAM_PATTERN.finditer(fragment)
+    ]
+    occupied = [(start, end) for start, end, _team in mentions]
+    for match in _TEAM_ABBREVIATION_PATTERN.finditer(fragment):
+        if any(match.start() < end and match.end() > start for start, end in occupied):
+            continue
+        team = {"JAC": "JAX", "WAS": "WSH"}.get(match.group(0), match.group(0))
+        mentions.append((match.start(), match.end(), team))
+    return sorted(
+        (entry for entry in mentions if entry[2]),
+        key=lambda entry: entry[0],
+    )
+
+
 def _first_trade_team(fragment: str) -> str:
     match = _TRADE_TEAM_PATTERN.search(fragment)
     if match is not None:
         return _canonical_trade_team(match.group("team"))
-
-    # Short abbreviations are useful in terse transaction posts, but matching
-    # them case-insensitively would turn ordinary words such as "no" into an
-    # NFL team. Only accept their conventional all-uppercase form.
-    abbreviations = {
-        match.group(0): match.start()
-        for match in re.finditer(
-            r"(?<![A-Za-z])(?:ARI|ATL|BAL|BUF|CAR|CHI|CIN|CLE|DAL|DEN|DET|"
-            r"GB|HOU|IND|JAX|JAC|KC|LV|LAC|LAR|MIA|MIN|NE|NO|NYG|NYJ|PHI|"
-            r"PIT|SEA|SF|TB|TEN|WAS|WSH)(?![A-Za-z])",
-            fragment,
-        )
-    }
-    if not abbreviations:
+    abbreviation = _TEAM_ABBREVIATION_PATTERN.search(fragment)
+    if abbreviation is None:
         return ""
-    abbreviation = min(abbreviations, key=abbreviations.get)
-    return {"JAC": "JAX", "WAS": "WSH"}.get(abbreviation, abbreviation)
+    value = abbreviation.group(0)
+    return {"JAC": "JAX", "WAS": "WSH"}.get(value, value)
 
 
 def _trade_subject_patterns(item: NewsItem) -> tuple[re.Pattern[str], ...]:
@@ -470,6 +480,173 @@ def trade_destination(item: NewsItem) -> str:
             if team:
                 return team
     return ""
+
+
+def transaction_teams(item: NewsItem, event_type: str) -> tuple[str, ...]:
+    """Return teams explicitly tied to the subject's roster transaction.
+
+    This is intentionally narrower than returning every team mentioned in a
+    report. Draft-pick provenance and return-package details can name unrelated
+    clubs; only subject-relative release/signing/trade language is accepted.
+    """
+    normalized_event = event_type.strip().casefold().replace("-", "_")
+    if (
+        normalized_event not in {"trade", "release", "signing"}
+        or not item.subject_confident
+        or not item.player_name
+    ):
+        return ()
+
+    text = _report_text(item)
+    subjects: list[re.Match[str]] = []
+    for pattern in _trade_subject_patterns(item):
+        subjects = list(pattern.finditer(text))
+        if subjects:
+            break
+
+    teams: list[str] = []
+
+    def add(team: str) -> None:
+        if team and team not in teams:
+            teams.append(team)
+
+    if normalized_event == "trade":
+        add(trade_destination(item))
+
+    prefix_aux = (
+        r"^\s*(?:,\s*)?(?:who\s+)?"
+        r"(?:(?:have|has|had|are|is|was|were|will|would|"
+        r"now|officially|reportedly)\s+)*"
+    )
+    seller_cue = re.compile(
+        prefix_aux
+        + r"(?:sends?|sent|sending|ships?|shipped|shipping|"
+        r"deals?|dealt|dealing|moves?|moved|moving|"
+        r"trad(?:e|es|ed|ing))(?!\s+for)\b",
+        re.I,
+    )
+    acquiring_cue = re.compile(
+        prefix_aux
+        + r"(?:gets?|getting|acquir(?:e|es|ed|ing)|receiv(?:e|es|ed|ing)|"
+        r"adds?|added|adding|lands?|landed|landing|"
+        r"trad(?:e|es|ed|ing)\s+for)\b",
+        re.I,
+    )
+    release_cue = re.compile(
+        prefix_aux
+        + r"(?:releas(?:e|es|ed|ing)|waiv(?:e|es|ed|ing)|"
+        r"cuts?|cutting)\b",
+        re.I,
+    )
+    signing_cue = re.compile(
+        prefix_aux
+        + r"(?:sign(?:s|ed|ing)?|claim(?:s|ed|ing)?|"
+        r"adds?|added|adding|acquir(?:e|es|ed|ing))\b",
+        re.I,
+    )
+    trade_tail_open = re.compile(
+        r"^\s*(?:(?:is|was|were|has\s+been|have\s+been|will\s+be|"
+        r"reportedly)\s+)*(?:being\s+)?(?:"
+        r"traded|sent|dealt|shipped|moved|"
+        r"heads?|headed|goes?|went|bound|joins?|joined|lands?|landed|"
+        r"to|from)\b",
+        re.I,
+    )
+    direct_team_cue = re.compile(
+        r"(?:\b(?:to|from|with|by)\s+(?:the\s+)?|"
+        r"\b(?:joins?|joined)\s+(?:the\s+)?|"
+        r"\b(?:lands?|landed)\s+(?:with|in)\s+(?:the\s+)?)$",
+        re.I,
+    )
+    chained_team_cue = re.compile(
+        r"^\s*(?:to|from)\s+(?:the\s+)?$",
+        re.I,
+    )
+    compensation_cue = re.compile(
+        r"\b(?:for|picks?|selection|compensation|draft\s+choice|"
+        r"in\s+exchange)\b",
+        re.I,
+    )
+
+    for subject in subjects:
+        prefix_start = max(0, subject.start() - 160)
+        prefix = text[prefix_start : subject.start()]
+        # A transaction involving a draft pick in the previous sentence is
+        # not evidence about this player merely because it is nearby.
+        prefix = re.split(r"[.;\n]", prefix)[-1]
+        prefix_mentions = _team_mentions(prefix)
+        if prefix_mentions:
+            _start, end, team = prefix_mentions[-1]
+            between = prefix[end:]
+            if normalized_event == "trade" and seller_cue.search(between):
+                add(team)
+            elif normalized_event == "trade" and acquiring_cue.search(between):
+                add(team)
+            elif normalized_event == "release" and release_cue.search(between):
+                add(team)
+            elif normalized_event == "signing" and signing_cue.search(between):
+                add(team)
+
+        tail = text[subject.end() : subject.end() + 160]
+        tail_clause = re.split(r"[.;\n]", tail, maxsplit=1)[0]
+        if normalized_event == "trade":
+            # Stay inside the subject's immediate transaction clause. After
+            # the first directly attached team, only a bare "to/from TEAM"
+            # chain is accepted; compensation provenance such as "a pick
+            # acquired from Saints" therefore cannot leak into player context.
+            mentions = _team_mentions(tail_clause)
+            if trade_tail_open.search(tail_clause) and mentions:
+                start, end, team = mentions[0]
+                before_first_team = tail_clause[:start]
+                if (
+                    direct_team_cue.search(before_first_team)
+                    and not compensation_cue.search(before_first_team)
+                ):
+                    add(team)
+                    previous_end = end
+                    for start, end, team in mentions[1:]:
+                        if not chained_team_cue.fullmatch(
+                            tail_clause[previous_end:start]
+                        ):
+                            break
+                        add(team)
+                        previous_end = end
+            continue
+
+        for start, _end, team in _team_mentions(tail_clause):
+            before_team = tail_clause[:start]
+            if normalized_event == "release" and re.search(
+                r"\b(?:released|waived|cut)\s+(?:by|from)\s+(?:the\s+)?$",
+                before_team,
+                re.I,
+            ):
+                add(team)
+                break
+            elif normalized_event == "signing" and re.search(
+                r"\b(?:sign(?:s|ed|ing)?\s+with|claimed\s+by)\s+(?:the\s+)?$",
+                before_team,
+                re.I,
+            ):
+                add(team)
+                break
+
+    # Player-specific RotoWire headlines often omit the subject ("Released by
+    # Raiders" / "Signs with Texans"). The URL has already established the
+    # subject, so these narrow whole-report fallbacks remain deterministic.
+    if item.source.casefold() == "rotowire" and not subjects:
+        fallback_patterns = {
+            "release": r"\b(?:released|waived|cut)\s+(?:by|from)\s+(?:the\s+)?",
+            "signing": (
+                r"\b(?:sign(?:s|ed|ing)?\s+with|claimed\s+by)\s+(?:the\s+)?"
+            ),
+        }
+        cue = fallback_patterns.get(normalized_event)
+        if cue:
+            match = re.search(cue, text, re.I)
+            if match is not None:
+                add(_first_trade_team(text[match.end() : match.end() + 60]))
+
+    return tuple(teams)
 
 
 def _trade_is_cancelled(text: str) -> bool:

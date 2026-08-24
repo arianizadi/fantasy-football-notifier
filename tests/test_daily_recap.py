@@ -6,6 +6,7 @@ from html.parser import HTMLParser
 import pytest
 
 from notifier.daily_recap import TELEGRAM_TEXT_LIMIT, format_daily_recap
+from notifier.models import LeagueRef, RosterPlayer, RosterSnapshot
 
 
 NOW = datetime(2026, 8, 24, 18, tzinfo=timezone.utc)
@@ -74,6 +75,26 @@ def _visible_units(markup: str) -> int:
     return len("".join(parser.parts).encode("utf-16-le")) // 2
 
 
+def _roster_snapshot(
+    *players: tuple[str, str, str, str, LeagueRef],
+    leagues: list[LeagueRef] | None = None,
+) -> RosterSnapshot:
+    roster_players = [
+        RosterPlayer(
+            name=name,
+            position=position,
+            pro_team=team,
+            lineup_slot=slot,
+            on_my_team=True,
+            fantasy_team=league.my_team_name,
+            league_key=league.key,
+        )
+        for name, position, team, slot, league in players
+    ]
+    refs = leagues or list(dict.fromkeys(player[-1] for player in players))
+    return RosterSnapshot(generated_at=NOW, leagues=refs, players=roster_players)
+
+
 def test_sections_follow_severity_and_roster_relevance() -> None:
     rows = [
         _row("Roster Player", "injury", 3, tier="mine"),
@@ -99,6 +120,421 @@ def test_sections_follow_severity_and_roster_relevance() -> None:
     rendered = "\n".join(recap.parts)
     assert "Generic Chatter" not in rendered
     assert "Tiny Note" not in rendered
+
+
+def test_team_impact_connects_direct_and_position_room_news_without_duplicates() -> None:
+    espn = LeagueRef("espn", "1", "Certified Sped League", "Bak Choi Cr")
+    sleeper = LeagueRef("sleeper", "2", "Sleeper Draft", "Future Team")
+    snapshot = _roster_snapshot(
+        ("Chuba Hubbard", "RB", "CAR", "RB", espn),
+        ("Jonathan Brooks", "RB", "CAR", "BE", espn),
+        ("A.J. Brown", "WR", "PHI", "WR", espn),
+        leagues=[espn, sleeper],
+    )
+    player_index = {
+        "1": {"full_name": "Chuba Hubbard", "position": "RB", "team": "CAR"},
+        "2": {"full_name": "Miles Sanders", "position": "RB", "team": ""},
+        "3": {"full_name": "Bryce Young", "position": "QB", "team": "CAR"},
+    }
+    rows = [
+        _row(
+            "Chuba Hubbard",
+            "injury",
+            4,
+            headline="Hubbard was limited again Monday",
+        ),
+        _row(
+            "Miles Sanders",
+            "release",
+            3,
+            minutes_ago=31,
+            headline="Panthers released Miles Sanders",
+        ),
+        _row(
+            "Bryce Young",
+            "injury",
+            4,
+            minutes_ago=32,
+            headline="Young left practice early",
+        ),
+    ]
+
+    recap = format_daily_recap(
+        rows,
+        now=NOW,
+        roster_snapshot=snapshot,
+        player_index=player_index,
+    )
+    rendered = "\n".join(recap.parts)
+
+    assert [impact.item.player_name for impact in recap.team_impacts] == [
+        "Chuba Hubbard",
+        "Miles Sanders",
+    ]
+    assert [item.player_name for item in recap.big_news] == ["Bryce Young"]
+    assert rendered.count("Hubbard was limited again Monday") == 1
+    assert rendered.count("Panthers released Miles Sanders") == 1
+    assert "YOUR TEAM IMPACT" in rendered
+    assert "Bak Choi Cr · Certified Sped League</b> · 3 players" in rendered
+    assert "Sleeper Draft" not in rendered
+    assert "Your player" in rendered
+    assert "May affect Jonathan Brooks" in rendered
+    assert "May affect Chuba Hubbard" in rendered
+    assert "same CAR RB room" in rendered
+
+
+def test_trade_context_uses_explicit_origin_and_destination_not_pick_provenance() -> None:
+    espn = LeagueRef("espn", "1", "ESPN League", "My Team")
+    snapshot = _roster_snapshot(
+        ("DeMario Douglas", "WR", "NE", "BE", espn),
+        ("Nico Collins", "WR", "HOU", "WR", espn),
+        ("Chris Olave", "WR", "NO", "WR", espn),
+    )
+    rows = [
+        _row(
+            "Kayshon Boutte",
+            "trade",
+            3,
+            minutes_ago=20,
+            headline="Kayshon Boutte heads to the Texans from the Patriots",
+        ),
+        _row(
+            "Kayshon Boutte",
+            "trade",
+            3,
+            minutes_ago=10,
+            headline=(
+                "It's a 2028 seventh-rounder, the Saints one, going in the trade. "
+                "Kayshon Boutte heads to the Texans"
+            ),
+        ),
+    ]
+
+    recap = format_daily_recap(
+        rows,
+        now=NOW,
+        roster_snapshot=snapshot,
+        player_index={
+            "1": {"full_name": "Kayshon Boutte", "position": "WR", "team": "HOU"}
+        },
+    )
+    rendered = "\n".join(recap.parts)
+
+    assert len(recap.team_impacts) == 1
+    assert "May affect DeMario Douglas" in rendered
+    assert "May affect Nico Collins" in rendered
+    assert "May affect Chris Olave" not in rendered
+
+
+def test_trade_compensation_provenance_is_not_a_player_team() -> None:
+    espn = LeagueRef("espn", "1", "ESPN League", "My Team")
+    snapshot = _roster_snapshot(
+        ("Nico Collins", "WR", "HOU", "WR", espn),
+        ("Chris Olave", "WR", "NO", "WR", espn),
+    )
+
+    recap = format_daily_recap(
+        [
+            _row(
+                "Kayshon Boutte",
+                "trade",
+                3,
+                headline=(
+                    "Kayshon Boutte was traded for a seventh-round pick "
+                    "originally from the Saints to the Texans"
+                ),
+            )
+        ],
+        now=NOW,
+        roster_snapshot=snapshot,
+        player_index={
+            "1": {"full_name": "Kayshon Boutte", "position": "WR", "team": "HOU"}
+        },
+    )
+    rendered = "\n".join(recap.parts)
+
+    assert "May affect Nico Collins" in rendered
+    assert "May affect Chris Olave" not in rendered
+
+
+@pytest.mark.parametrize(
+    "headline",
+    [
+        (
+            "Saints traded a pick to the Patriots, who acquire "
+            "Kayshon Boutte from the Texans"
+        ),
+        (
+            "Saints traded a pick earlier this year. Patriots acquire "
+            "Kayshon Boutte from the Texans"
+        ),
+    ],
+)
+def test_trade_prefix_uses_nearest_subject_clause_not_an_earlier_team(
+    headline: str,
+) -> None:
+    espn = LeagueRef("espn", "1", "ESPN League", "My Team")
+    snapshot = _roster_snapshot(
+        ("DeMario Douglas", "WR", "NE", "BE", espn),
+        ("Nico Collins", "WR", "HOU", "WR", espn),
+        ("Chris Olave", "WR", "NO", "WR", espn),
+    )
+
+    recap = format_daily_recap(
+        [
+            _row(
+                "Kayshon Boutte",
+                "trade",
+                3,
+                headline=headline,
+            )
+        ],
+        now=NOW,
+        roster_snapshot=snapshot,
+        player_index={
+            "1": {"full_name": "Kayshon Boutte", "position": "WR", "team": "NE"}
+        },
+    )
+    rendered = "\n".join(recap.parts)
+
+    assert "May affect DeMario Douglas" in rendered
+    assert "May affect Nico Collins" in rendered
+    assert "May affect Chris Olave" not in rendered
+
+
+def test_release_context_survives_sleeper_clearing_the_players_team() -> None:
+    espn = LeagueRef("espn", "1", "ESPN League", "My Team")
+    snapshot = _roster_snapshot(
+        ("Jakobi Meyers", "WR", "LV", "WR", espn),
+        ("Nico Collins", "WR", "HOU", "WR", espn),
+    )
+
+    recap = format_daily_recap(
+        [
+            _row(
+                "Noah Brown",
+                "release",
+                4,
+                headline=(
+                    "Raiders released veteran WR Noah Brown. "
+                    "A different receiver was waived by the Texans"
+                ),
+            )
+        ],
+        now=NOW,
+        roster_snapshot=snapshot,
+        player_index={
+            "1": {"full_name": "Noah Brown", "position": "WR", "team": ""}
+        },
+    )
+
+    rendered = "\n".join(recap.parts)
+    assert "May affect Jakobi Meyers" in rendered
+    assert "May affect Nico Collins" not in rendered
+
+
+@pytest.mark.parametrize(
+    "headline",
+    [
+        "Signing with Texans",
+        "Texans sign Noah Brown; a different receiver signed with Saints",
+    ],
+)
+def test_signing_context_stays_in_the_subject_clause(headline: str) -> None:
+    espn = LeagueRef("espn", "1", "ESPN League", "My Team")
+    snapshot = _roster_snapshot(
+        ("Nico Collins", "WR", "HOU", "WR", espn),
+        ("Chris Olave", "WR", "NO", "WR", espn),
+    )
+
+    recap = format_daily_recap(
+        [
+            _row(
+                "Noah Brown",
+                "signing",
+                3,
+                source="rotowire",
+                headline=headline,
+            )
+        ],
+        now=NOW,
+        roster_snapshot=snapshot,
+        player_index={
+            "1": {"full_name": "Noah Brown", "position": "WR", "team": ""}
+        },
+    )
+
+    rendered = "\n".join(recap.parts)
+    assert "May affect Nico Collins" in rendered
+    assert "May affect Chris Olave" not in rendered
+
+
+def test_team_impact_keeps_direct_severity_two_news() -> None:
+    espn = LeagueRef("espn", "1", "ESPN League", "My Team")
+    snapshot = _roster_snapshot(("Puka Nacua", "WR", "LAR", "WR", espn))
+
+    recap = format_daily_recap(
+        [_row("Puka Nacua", "practice_report", 2, tier="league")],
+        now=NOW,
+        roster_snapshot=snapshot,
+        player_index={},
+    )
+
+    assert [impact.item.player_name for impact in recap.team_impacts] == ["Puka Nacua"]
+    assert recap.big_news == ()
+    assert recap.smaller_moves == ()
+    assert "Your player" in "\n".join(recap.parts)
+
+
+def test_team_impact_rejects_ambiguous_and_unrelated_room_inferences() -> None:
+    espn = LeagueRef("espn", "1", "ESPN League", "My Team")
+    snapshot = _roster_snapshot(("Puka Nacua", "WR", "LAR", "WR", espn))
+    player_index = {
+        "1": {"full_name": "League Subject", "position": "WR", "team": "LAR"},
+        "2": {"full_name": "Rams Runner", "position": "RB", "team": "LAR"},
+        "3": {"full_name": "Other Receiver", "position": "WR", "team": "SF"},
+    }
+
+    recap = format_daily_recap(
+        [
+            _row("League Subject", "injury", 4, subject_confident=False),
+            _row("Rams Runner", "injury", 4, minutes_ago=31),
+            _row("Other Receiver", "injury", 4, minutes_ago=32),
+        ],
+        now=NOW,
+        roster_snapshot=snapshot,
+        player_index=player_index,
+    )
+
+    assert recap.team_impacts == ()
+    rendered = "\n".join(recap.parts)
+    assert "No saved reports directly affecting your players" in rendered
+    assert "May affect Puka Nacua" not in rendered
+
+
+def test_team_impact_lists_one_player_across_two_drafted_leagues() -> None:
+    espn = LeagueRef("espn", "12345", "Home League", "Bak Choi Cr")
+    sleeper = LeagueRef("sleeper", "67890", "Dynasty League", "Outkast")
+    snapshot = _roster_snapshot(
+        ("George Kittle", "TE", "SF", "TE", espn),
+        ("George Kittle", "TE", "SF", "BE", sleeper),
+        leagues=[espn, sleeper],
+    )
+
+    recap = format_daily_recap(
+        [_row("George Kittle", "return", 4)],
+        now=NOW,
+        roster_snapshot=snapshot,
+        player_index={
+            "1": {"full_name": "George Kittle", "position": "TE", "team": "SF"}
+        },
+    )
+    rendered = "\n".join(recap.parts)
+
+    assert len(recap.team_impacts) == 1
+    assert "Bak Choi Cr (Home League): starter" in rendered
+    assert "Outkast (Dynasty League): bench" in rendered
+
+
+def test_position_room_matching_normalizes_provider_team_aliases() -> None:
+    espn = LeagueRef("espn", "1", "ESPN League", "My Team")
+    snapshot = _roster_snapshot(("Brian Robinson", "RB", "WSH", "RB", espn))
+
+    recap = format_daily_recap(
+        [_row("Austin Ekeler", "injury", 3)],
+        now=NOW,
+        roster_snapshot=snapshot,
+        player_index={
+            "1": {"full_name": "Austin Ekeler", "position": "RB", "team": "WAS"}
+        },
+    )
+
+    rendered = "\n".join(recap.parts)
+    assert "May affect Brian Robinson" in rendered
+    assert "same WAS RB room" in rendered
+
+
+def test_same_named_defender_does_not_mask_a_fantasy_position_record() -> None:
+    espn = LeagueRef("espn", "1", "ESPN League", "My Team")
+    snapshot = _roster_snapshot(("A.J. Brown", "WR", "PHI", "WR", espn))
+
+    recap = format_daily_recap(
+        [_row("DeVonta Smith", "injury", 3)],
+        now=NOW,
+        roster_snapshot=snapshot,
+        player_index={
+            "defense": {
+                "full_name": "Devonta Smith",
+                "position": "CB",
+                "team": "CAR",
+            },
+            "offense": {
+                "full_name": "DeVonta Smith",
+                "position": "WR",
+                "team": "PHI",
+            },
+        },
+    )
+
+    assert "May affect A.J. Brown" in "\n".join(recap.parts)
+
+
+def test_same_named_fantasy_players_in_different_rooms_are_not_inferred() -> None:
+    espn = LeagueRef("espn", "1", "ESPN League", "My Team")
+    snapshot = _roster_snapshot(("My Receiver", "WR", "PHI", "WR", espn))
+
+    recap = format_daily_recap(
+        [_row("Shared Name", "injury", 4)],
+        now=NOW,
+        roster_snapshot=snapshot,
+        player_index={
+            "one": {"full_name": "Shared Name", "position": "WR", "team": "PHI"},
+            "two": {"full_name": "Shared Name", "position": "WR", "team": "DAL"},
+        },
+    )
+
+    assert recap.team_impacts == ()
+    assert "May affect My Receiver" not in "\n".join(recap.parts)
+
+
+def test_peak_team_impact_is_capped_and_keeps_valid_telegram_parts() -> None:
+    espn = LeagueRef("espn", "1", "ESPN League", "My Team")
+    roster_players = [
+        (f"My Player {index:02d}", "WR", "LAR", "BE", espn)
+        for index in range(20)
+    ]
+    snapshot = _roster_snapshot(*roster_players)
+    rows = [
+        _row(
+            f"My Player {index:02d}",
+            "injury",
+            4,
+            minutes_ago=index + 1,
+            headline=(f"My Player {index:02d} received an injury update. " * 8),
+            body=("This is separate source-backed detail. " * 10),
+        )
+        for index in range(20)
+    ]
+
+    recap = format_daily_recap(
+        rows,
+        now=NOW,
+        roster_snapshot=snapshot,
+        player_index={},
+    )
+    rendered = "\n".join(recap.parts)
+
+    assert len(recap.team_impacts) == 12
+    assert recap.omitted_team_impacts == 8
+    assert "+ 8 more team-impact reports" in rendered
+    assert "4/5 · My Player 11" in rendered
+    assert "4/5 · My Player 12" not in rendered
+    for part in recap.parts:
+        assert _visible_units(part) <= TELEGRAM_TEXT_LIMIT
+        parser = _TagChecker()
+        parser.feed(part)
+        parser.close()
+        assert parser.stack == []
 
 
 def test_repeated_player_event_reports_collapse_to_latest_fact_and_keep_sources() -> None:

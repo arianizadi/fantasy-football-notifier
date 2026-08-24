@@ -228,6 +228,10 @@ At 8:00 AM Pacific, the bot compiles the complete saved-news journal from the
 prior rolling 24 hours, not only reports that triggered immediate alerts. It
 collapses repeated player/event coverage into one evolving fact and renders:
 
+- **Your Team Impact** first, with each drafted fantasy team and news directly
+  about its players. Severity 3+ reports about another player in the same NFL
+  team/position room are labeled conservatively as "may affect" context. An
+  empty pre-draft league is omitted until its roster appears.
 - **Big News** for major stories and roster/waiver-relevant 3/5 items.
 - **Smaller Moves** for useful practice, transaction, depth, and role notes.
 - **Learn the Game** with a short explanation of what those event types

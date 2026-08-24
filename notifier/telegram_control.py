@@ -236,7 +236,7 @@ class TelegramControl:
                 "/status - source and delivery health\n"
                 "/player Kittle - depth, status, and league ownership\n"
                 "/news Kittle - search the saved tweet/report journal\n"
-                "/digest - big news, smaller moves, and a learning note\n\n"
+                "/digest - your team impact, big news, smaller moves, and a learning note\n\n"
                 "Use the buttons under an alert to mark it useful, wrong, or too noisy."
             )
 
