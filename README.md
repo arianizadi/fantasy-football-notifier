@@ -105,6 +105,13 @@ free agent. If that refresh fails, it fails closed: the news can still alert,
 but all `ADD` and free-agent claims are hidden and the message says why.
 Delayed outbox retries re-run the same ownership check.
 
+Draft activation is league-specific. If ESPN has drafted while Sleeper is still
+pre-draft, ESPN immediately receives full roster and waiver handling while the
+empty Sleeper league is excluded from ownership and free-agent calculations.
+Just-in-time refreshes skip providers that have no drafted league, so a
+pre-draft Sleeper outage cannot suppress a valid ESPN pickup check. Sleeper is
+added automatically after its own roster appears.
+
 Each X post is handled as one report, even when it names several players. If
 the notifier cannot confidently attribute an injury or absence to one player,
 it keeps the news alert neutral and withholds automatic pickup and lineup
@@ -149,14 +156,15 @@ Sleeper depth order does not confirm workload or touch share.
 The alert path never calls the FantasyPros API. X remains the fast trigger,
 Sleeper generates the nearest depth options, and a just-in-time ESPN/Sleeper
 roster refresh determines whether each option is actually free. The background
-cache downloads four bulk datasets—WAIVER and ROS for the two configured
-scoring formats—every two hours. With one PPR and one half-PPR league that is
-48 requests per day regardless of tweet volume. A persistent rolling-24-hour
-cap defaults to 425, leaving headroom below the account's stated 500-request
-plan. Requests are globally spaced by at least one second and reserved in the
-ledger before network I/O, so restarts cannot forget quota use. Repeated failed
-batches back off from 15 minutes to a six-hour maximum instead of burning the
-daily budget.
+cache downloads WAIVER and ROS for each scoring format currently used by a
+drafted league every two hours. During the current mixed state, the drafted PPR
+ESPN league needs two datasets, or 24 requests per day. Once the half-PPR
+Sleeper league drafts, four datasets require 48 requests per day, regardless of
+tweet volume. A persistent rolling-24-hour cap defaults to 425, leaving
+headroom below the account's stated 500-request plan. Requests are globally
+spaced by at least one second and reserved in the ledger before network I/O, so
+restarts cannot forget quota use. Repeated failed batches back off from 15
+minutes to a six-hour maximum instead of burning the daily budget.
 
 FantasyPros freshness uses the provider's `last_updated_ts`, not local fetch
 time. Data older than `FANTASYPROS_MAX_AGE_HOURS` is omitted. A missing key,
@@ -178,8 +186,10 @@ Preseason mode is active while no configured league has a roster for the user.
 The classifier is explicitly told that the league is pre-draft, and action text
 is draft advice rather than lineup instructions such as "activate" or "start."
 Players inside Sleeper's top 250 generate alerts at severity 3/5 and above.
-The notifier exits preseason mode as provider drafts complete and their rosters
-are refreshed.
+The notifier exits global preseason mode when the first provider roster
+appears. If another league is still pre-draft, that league stays excluded from
+roster actions until its own draft completes; already drafted leagues continue
+without waiting for it.
 
 ## Delivery reliability
 

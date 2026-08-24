@@ -1,16 +1,19 @@
 """Build and read the cached multi-league roster snapshot.
 
 The notifier normally reads the atomic local snapshot. Scheduled jobs refresh
-it twice daily, and any alert eligible to recommend a waiver addition calls
-refresh_snapshot() just in time before naming an available player.
+it twice daily. Any alert eligible to recommend a waiver addition refreshes
+only leagues that have drafted, so a still-pre-draft provider cannot block a
+live ownership check for an active league.
 """
 
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import os
 import tempfile
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -340,7 +343,10 @@ def _load_espn(
 
 
 def _load_sleeper(
-    config: Config, session: requests.Session
+    config: Config,
+    session: requests.Session,
+    *,
+    league_ids: set[str] | None = None,
 ) -> list[tuple[LeagueRef, list[RosterPlayer], RosterCapacity, str]]:
     from .sources import sleeper, sleeper_league
 
@@ -351,6 +357,12 @@ def _load_sleeper(
     if config.sleeper_league_ids:
         allowed = set(config.sleeper_league_ids)
         leagues = [lg for lg in leagues if str(lg.get("league_id")) in allowed]
+    if league_ids is not None:
+        leagues = [
+            league
+            for league in leagues
+            if str(league.get("league_id")) in league_ids
+        ]
 
     results = []
     for league in leagues:
@@ -412,7 +424,146 @@ def refresh_snapshot(config: Config) -> RosterSnapshot:
     return snapshot
 
 
+def refresh_drafted_snapshot(
+    config: Config,
+    previous: RosterSnapshot,
+) -> tuple[RosterSnapshot, int]:
+    """Refresh ownership only for leagues already active in ``previous``.
+
+    A pre-draft league has no trustworthy free-agent pool yet. It therefore
+    must not participate in a just-in-time ownership refresh, and an outage at
+    that provider must not suppress a valid pickup in a league that has
+    drafted. Metadata for skipped leagues is carried forward unchanged; the
+    scheduled full refresh and hourly draft discovery remain responsible for
+    noticing their eventual draft completion.
+    """
+    drafted = previous.drafted_leagues()
+    target_keys = {league.key for league in drafted}
+    if not target_keys:
+        return previous, snapshot_mtime(config)
+
+    refreshed: dict[
+        str,
+        tuple[LeagueRef, list[RosterPlayer], RosterCapacity, str],
+    ] = {}
+    session = requests.Session()
+    try:
+        espn_keys = {
+            league.key for league in drafted if league.provider == "espn"
+        }
+        if espn_keys:
+            result = _load_espn(config, session)
+            refreshed[result[0].key] = result
+
+        sleeper_ids = {
+            league.league_id
+            for league in drafted
+            if league.provider == "sleeper"
+        }
+        if sleeper_ids:
+            for result in _load_sleeper(
+                config,
+                session,
+                league_ids=sleeper_ids,
+            ):
+                refreshed[result[0].key] = result
+    finally:
+        session.close()
+
+    missing = target_keys - set(refreshed)
+    if missing:
+        raise NotifierError(
+            "Drafted league ownership refresh omitted: "
+            + ", ".join(sorted(missing))
+        )
+
+    for league_key in target_keys:
+        _, players, _, _ = refreshed[league_key]
+        if not any(player.on_my_team for player in players):
+            raise NotifierError(
+                f"Drafted league ownership refresh returned an empty roster: {league_key}"
+            )
+
+    path = roster_path(config)
+    with _snapshot_write_lock(path):
+        # A scheduled/full refresh may have completed while the drafted-only
+        # network calls were in flight. Merge against that atomic result so a
+        # newly drafted league is never overwritten with the older pre-draft
+        # copy captured by the daemon worker.
+        base = load_snapshot(config) if path.exists() else previous
+        snapshot = _merge_drafted_refresh(base, target_keys, refreshed)
+        _write_snapshot_unlocked(path, snapshot)
+        # Capture the exact version while no other writer can replace it.
+        # The daemon must not pair this snapshot with the mtime of a newer full
+        # refresh that lands after the lock is released.
+        written_version = path.stat().st_mtime_ns
+
+    structured_log(
+        logging.INFO,
+        "roster.drafted_snapshot_refreshed",
+        refreshedLeagueKeys=sorted(target_keys),
+        preservedLeagueKeys=sorted(
+            league.key for league in base.leagues if league.key not in target_keys
+        ),
+        playerCount=len(snapshot.players),
+    )
+    return snapshot, written_version
+
+
+def _merge_drafted_refresh(
+    base: RosterSnapshot,
+    target_keys: set[str],
+    refreshed: dict[
+        str,
+        tuple[LeagueRef, list[RosterPlayer], RosterCapacity, str],
+    ],
+) -> RosterSnapshot:
+    """Overlay refreshed active leagues while retaining every other league."""
+    leagues = [
+        refreshed[league.key][0] if league.key in refreshed else league
+        for league in base.leagues
+    ]
+    players = [
+        player for player in base.players if player.league_key not in target_keys
+    ]
+    capacities = dict(base.capacities)
+    scoring_formats = dict(base.scoring_formats)
+    for league_key in target_keys:
+        _, fresh_players, capacity, scoring_format = refreshed[league_key]
+        players.extend(fresh_players)
+        capacities[league_key] = capacity
+        if scoring_format:
+            scoring_formats[league_key] = scoring_format
+        else:
+            scoring_formats.pop(league_key, None)
+
+    return RosterSnapshot(
+        generated_at=datetime.now(timezone.utc),
+        leagues=leagues,
+        players=players,
+        capacities=capacities,
+        scoring_formats=scoring_formats,
+    )
+
+
+@contextmanager
+def _snapshot_write_lock(path: Path):
+    """Serialize cross-process roster writes and JIT read/merge/write cycles."""
+    lock_path = path.with_name(f".{path.name}.lock")
+    with lock_path.open("a+") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 def _write_snapshot(path: Path, snapshot: RosterSnapshot) -> None:
+    with _snapshot_write_lock(path):
+        _write_snapshot_unlocked(path, snapshot)
+
+
+def _write_snapshot_unlocked(path: Path, snapshot: RosterSnapshot) -> None:
     payload = {
         "version": SNAPSHOT_VERSION,
         "generatedAt": snapshot.generated_at.isoformat() if snapshot.generated_at else None,
@@ -523,6 +674,6 @@ def load_snapshot(config: Config) -> RosterSnapshot:
     )
 
 
-def snapshot_mtime(config: Config) -> float:
+def snapshot_mtime(config: Config) -> int:
     path = roster_path(config)
-    return path.stat().st_mtime if path.exists() else 0.0
+    return path.stat().st_mtime_ns if path.exists() else 0

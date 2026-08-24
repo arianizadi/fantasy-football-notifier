@@ -39,7 +39,7 @@ from .notify import retry_after_seconds, send_alert, send_plain, telegram_state
 from .outbox import DeliveryOutbox, PendingDelivery
 from .player_lookup import format_player_lookup
 from .plays import DepthCharts, LeaguePlays, plays_context_for_model, plays_for_event
-from .roster import load_snapshot, refresh_snapshot, snapshot_mtime
+from .roster import load_snapshot, refresh_drafted_snapshot, snapshot_mtime
 from .sources import rotowire, sleeper
 from .sources.fantasypros import FantasyProsCache
 from .sources.twitter import TwitterStream
@@ -411,7 +411,7 @@ class Notifier:
             )
 
     def _refresh_ownership_just_in_time(self) -> bool:
-        """Refresh all league ownership before evaluating a waiver candidate."""
+        """Refresh drafted-league ownership before evaluating a waiver candidate."""
         now = time.time()
         if now - self._last_jit_roster_success < JIT_ROSTER_REFRESH_MIN_SECONDS:
             return True
@@ -424,10 +424,15 @@ class Notifier:
             if now - self._last_jit_roster_refresh < JIT_ROSTER_REFRESH_MIN_SECONDS:
                 return False
             # Throttle failures as well as successes; an outage should not make
-            # every simultaneous breaking-news worker hammer both providers.
+            # every simultaneous breaking-news worker hammer active providers.
             self._last_jit_roster_refresh = now
             try:
-                snapshot = refresh_snapshot(self.config)
+                with self._state_lock:
+                    previous = self.snapshot
+                snapshot, written_version = refresh_drafted_snapshot(
+                    self.config,
+                    previous,
+                )
             except Exception as error:  # noqa: BLE001 - keep the alert path alive
                 HEALTH.mark("roster", ok=False, detail=str(error))
                 structured_log(logging.WARNING, "roster.jit_refresh_failed", error=str(error))
@@ -435,7 +440,7 @@ class Notifier:
 
             with self._state_lock:
                 self.snapshot = snapshot
-                self._snapshot_mtime = snapshot_mtime(self.config)
+                self._snapshot_mtime = written_version
                 self.preseason = not snapshot.drafted_leagues()
                 self.depth = DepthCharts(self._player_index, snapshot)
                 self._last_jit_roster_success = time.time()
@@ -455,7 +460,13 @@ class Notifier:
     def _fantasypros_scoring_formats(self) -> tuple[str, ...]:
         """Scoring formats actually used by drafted provider leagues."""
         with self._state_lock:
-            values = set(self.snapshot.scoring_formats.values())
+            snapshot = self.snapshot
+            drafted_keys = {league.key for league in snapshot.drafted_leagues()}
+            values = {
+                scoring
+                for league_key, scoring in snapshot.scoring_formats.items()
+                if league_key in drafted_keys
+            }
         order = ("PPR", "HALF", "STD")
         return tuple(scoring for scoring in order if scoring in values)
 

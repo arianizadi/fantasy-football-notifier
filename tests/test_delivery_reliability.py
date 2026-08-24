@@ -917,16 +917,21 @@ def test_recent_successful_jit_roster_refresh_is_reused(monkeypatch) -> None:
     notifier._last_jit_roster_success = 0.0
     notifier._snapshot_mtime = 0.0
     notifier._player_index = {}
+    notifier.snapshot = RosterSnapshot(generated_at=datetime.now(timezone.utc))
     fresh = RosterSnapshot(generated_at=datetime.now(timezone.utc))
-    refresh = Mock(return_value=fresh)
-    monkeypatch.setattr("notifier.pipeline.refresh_snapshot", refresh)
-    monkeypatch.setattr("notifier.pipeline.snapshot_mtime", Mock(return_value=123.0))
+    refresh = Mock(return_value=(fresh, 123))
+    monkeypatch.setattr("notifier.pipeline.refresh_drafted_snapshot", refresh)
+    current_mtime = Mock(return_value=456)
+    monkeypatch.setattr("notifier.pipeline.snapshot_mtime", current_mtime)
 
     assert notifier._refresh_ownership_just_in_time() is True
     assert notifier._refresh_ownership_just_in_time() is True
     assert refresh.call_count == 1
     assert notifier.snapshot is fresh
-    assert notifier._snapshot_mtime == 123.0
+    assert notifier._snapshot_mtime == 123
+    # A full refresh written after the helper returned stays newer than the
+    # exact JIT version, so the next normal reload can still observe it.
+    current_mtime.assert_not_called()
 
 
 def test_failed_jit_refresh_fails_closed_without_add_or_free_agent_claim(
