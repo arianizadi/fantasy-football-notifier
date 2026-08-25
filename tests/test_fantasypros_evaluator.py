@@ -132,6 +132,8 @@ def _source_signatures(state_dir: Path) -> dict[str, tuple[int, int, bytes]]:
 
 
 def test_query_categories_are_explicit_weak_labels() -> None:
+    assert evaluator.DEFAULT_CORPUS_LIMIT >= 5_100
+    assert evaluator.MAX_CORPUS_LIMIT >= evaluator.DEFAULT_CORPUS_LIMIT
     assert evaluator.query_category(_query("injury")) == (True, "injury")
     assert evaluator.query_category(_query("all")) == (True, None)
     assert evaluator.query_category(_query("opinion")) == (False, None)

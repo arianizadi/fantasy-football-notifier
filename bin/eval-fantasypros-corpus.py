@@ -33,8 +33,11 @@ from notifier.event_store import read_fantasypros_corpus_snapshot  # noqa: E402
 
 WEAK_LABELS = frozenset({"injury", "recap", "transaction", "rumor", "breaking"})
 EXPECTED_API_DOCS_URL = "https://api.fantasypros.com/public/v2/docs"
-DEFAULT_CORPUS_LIMIT = 5_000
-MAX_CORPUS_LIMIT = 5_000
+# Ingestion commits one provider response atomically, so a 5,000-row target can
+# legitimately finish with up to 99 extra rows. Audit the whole standard corpus
+# by default; larger configured targets remain available through the CLI.
+DEFAULT_CORPUS_LIMIT = 6_000
+MAX_CORPUS_LIMIT = 50_000
 DEFAULT_SAMPLE_LIMIT = 128
 MAX_SAMPLE_LIMIT = 512
 DEFAULT_CANDIDATE_LIMIT = 512
