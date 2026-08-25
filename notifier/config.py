@@ -23,6 +23,7 @@ DEFAULT_FANTASYPROS_CORPUS_LIVE_RESERVE = 75
 DEFAULT_FANTASYPROS_CORPUS_PLAYER_LIMIT = 250
 DEFAULT_FANTASYPROS_CORPUS_EMBEDDING_BUDGET_USD = 0.25
 DEFAULT_FANTASYPROS_CORPUS_EMBEDDING_PRICE_PER_MILLION_USD = 0.01
+DEFAULT_FANTASYPROS_CORPUS_EMBEDDING_TIMEOUT_SECONDS = 30
 DEFAULT_DAILY_RECAP_HOUR = 8
 DEFAULT_WAIVER_REPORT_LEAD_HOURS = 8
 DEFAULT_EMBEDDING_MODEL = "qwen/qwen3-embedding-8b"
@@ -72,6 +73,7 @@ class Config:
     fantasypros_corpus_player_limit: int
     fantasypros_corpus_embedding_budget_usd: float
     fantasypros_corpus_embedding_price_per_million_usd: float
+    fantasypros_corpus_embedding_timeout_seconds: int
     poll_seconds: int
     poll_seconds_idle: int
     min_severity: int
@@ -306,6 +308,12 @@ def load_config() -> Config:
             DEFAULT_FANTASYPROS_CORPUS_EMBEDDING_PRICE_PER_MILLION_USD,
             0.000001,
             100.0,
+        ),
+        fantasypros_corpus_embedding_timeout_seconds=optional_int(
+            "FANTASYPROS_CORPUS_EMBEDDING_TIMEOUT_SECONDS",
+            DEFAULT_FANTASYPROS_CORPUS_EMBEDDING_TIMEOUT_SECONDS,
+            5,
+            120,
         ),
         poll_seconds=optional_int("POLL_SECONDS", DEFAULT_POLL_SECONDS, 10, 900),
         poll_seconds_idle=optional_int(

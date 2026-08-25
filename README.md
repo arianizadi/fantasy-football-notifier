@@ -417,7 +417,7 @@ Important configuration:
 | `FANTASYPROS_REFRESH_HOURS`, `FANTASYPROS_MAX_AGE_HOURS` | Ranking refresh cadence and provider-data freshness limit. |
 | `FANTASYPROS_CORPUS_ENABLED`, `FANTASYPROS_CORPUS_TARGET` | Opt-in, reference-only FantasyPros news corpus; default target `5000`. Corpus rows never enter alerts, recaps, search, dedupe, or automatic urgency decisions. |
 | `FANTASYPROS_CORPUS_MAX_REQUESTS`, `FANTASYPROS_CORPUS_LIVE_RESERVE`, `FANTASYPROS_CORPUS_PLAYER_LIMIT` | Bootstrap controls; defaults `300`, `75`, and `250`. The shared persistent request ledger remains authoritative. |
-| `FANTASYPROS_CORPUS_EMBEDDING_BUDGET_USD`, `FANTASYPROS_CORPUS_EMBEDDING_PRICE_PER_MILLION_USD` | Durable lifetime spend fuse and pinned input-price assumption for the configured corpus embedding model; defaults `$0.25` and `$0.01/M` tokens. A non-default model requires an explicit price. |
+| `FANTASYPROS_CORPUS_EMBEDDING_BUDGET_USD`, `FANTASYPROS_CORPUS_EMBEDDING_PRICE_PER_MILLION_USD`, `FANTASYPROS_CORPUS_EMBEDDING_TIMEOUT_SECONDS` | Durable lifetime spend fuse, pinned input-price assumption, and corpus-only provider timeout; defaults `$0.25`, `$0.01/M` tokens, and 30 seconds. A non-default model requires an explicit price. |
 | `MIN_SEVERITY`, `MIN_SEVERITY_OTHER` | Alert floors for your roster vs other news. |
 | `POLL_SECONDS`, `POLL_SECONDS_IDLE`, `ADAPTIVE_POLLING` | RotoWire polling cadence. |
 | `TELEGRAM_CONTROLS_ENABLED` | Opt in to commands and feedback only when this service exclusively owns the bot's `getUpdates`; default `false`. |

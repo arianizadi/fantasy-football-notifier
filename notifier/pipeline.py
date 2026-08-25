@@ -405,7 +405,11 @@ class Notifier:
                 getattr(config, "embedding_dimensions", 512)
             ),
             embedding_timeout_seconds=int(
-                getattr(config, "embedding_timeout_seconds", 8)
+                getattr(
+                    config,
+                    "fantasypros_corpus_embedding_timeout_seconds",
+                    30,
+                )
             ),
             target_items=int(
                 getattr(config, "fantasypros_corpus_target", 5000)

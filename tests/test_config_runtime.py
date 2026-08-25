@@ -60,6 +60,7 @@ def test_dry_run_config_does_not_create_state_directory(tmp_path, monkeypatch) -
     assert config.fantasypros_corpus_embedding_price_per_million_usd == pytest.approx(
         0.01
     )
+    assert config.fantasypros_corpus_embedding_timeout_seconds == 30
     assert not state_dir.exists()
 
 
