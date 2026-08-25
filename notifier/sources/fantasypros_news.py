@@ -341,7 +341,13 @@ def parse_news_response(
             if not title:
                 raise ValueError("missing title")
             raw_categories = raw.get("categories")
-            if not isinstance(raw_categories, list):
+            # The live public API returns JSON null for uncategorized rows,
+            # including many results inside a documented category-filtered
+            # response. Preserve the query category as an observation label,
+            # while representing absent item metadata as an empty list.
+            if raw_categories is None:
+                raw_categories = []
+            elif not isinstance(raw_categories, list):
                 raise ValueError("invalid categories")
             categories = _clean_categories(raw_categories)
             description = clean_reference_text(raw.get("desc"))

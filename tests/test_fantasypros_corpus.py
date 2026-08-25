@@ -205,6 +205,18 @@ def test_response_parser_keeps_attribution_and_canonical_clean_text() -> None:
     assert error.value.code == "invalid_response"
 
 
+def test_response_parser_accepts_documented_query_rows_with_null_categories() -> None:
+    query = FantasyProsNewsQuery(category="breaking")
+    item = _item()
+    item["categories"] = None
+
+    rows = parse_news_response(_payload(item), query=query, fetched_at=NOW)
+
+    assert len(rows) == 1
+    assert rows[0]["categories"] == []
+    assert "breaking" not in rows[0]["canonical_text"].casefold()
+
+
 def test_reference_rows_are_isolated_deduped_and_update_invalidates_vector(
     tmp_path: Path,
 ) -> None:
