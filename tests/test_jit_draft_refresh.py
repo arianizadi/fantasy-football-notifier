@@ -1,4 +1,5 @@
 import threading
+import time
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -474,3 +475,74 @@ def test_jit_merge_preserves_league_that_drafted_during_network_refresh(
     persisted = load_snapshot(config)
     assert persisted.drafted_leagues() == [espn, drafted_sleeper]
     assert persisted.capacities[drafted_sleeper.key] == completed_capacity
+
+
+def test_slow_jit_refresh_times_out_then_finishes_and_reuses_success(
+    monkeypatch,
+) -> None:
+    league = LeagueRef("espn", "1", "ESPN League", "Mine")
+    player = _player("My Running Back", league, mine=True, fantasy_team="Mine")
+    original = RosterSnapshot(
+        generated_at=datetime.now(timezone.utc),
+        leagues=[league],
+        players=[player],
+    )
+    fresh = RosterSnapshot(
+        generated_at=datetime.now(timezone.utc),
+        leagues=[league],
+        players=[player],
+    )
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_refresh(config, previous, *, league_keys):
+        started.set()
+        assert release.wait(1.0)
+        return fresh, 123.0
+
+    refresh = Mock(side_effect=slow_refresh)
+    wait_seconds = 0.05
+    monkeypatch.setattr("notifier.pipeline.refresh_drafted_snapshot", refresh)
+    monkeypatch.setattr(
+        "notifier.pipeline.JIT_ROSTER_WAIT_SECONDS",
+        wait_seconds,
+    )
+
+    notifier = Notifier.__new__(Notifier)
+    notifier.config = SimpleNamespace()
+    notifier._state_lock = threading.RLock()
+    notifier._jit_roster_lock = threading.Lock()
+    notifier._last_jit_roster_refresh = 0.0
+    notifier._last_jit_roster_success = 0.0
+    notifier._last_jit_roster_attempt_keys = frozenset()
+    notifier._last_jit_roster_success_keys = frozenset()
+    notifier._snapshot_mtime = 0.0
+    notifier._player_index = {}
+    notifier.snapshot = original
+
+    before = time.monotonic()
+    try:
+        assert notifier._refresh_ownership_just_in_time() is False
+        elapsed = time.monotonic() - before
+
+        assert elapsed < wait_seconds + 0.2
+        assert started.wait(1.0)
+        assert not notifier._jit_roster_future.done()
+
+        release.set()
+        assert notifier._jit_roster_future.result(timeout=1.0) is True
+        assert notifier._refresh_ownership_just_in_time() is True
+
+        assert refresh.call_count == 1
+        refresh.assert_called_once_with(
+            notifier.config,
+            original,
+            league_keys={league.key},
+        )
+        assert notifier.snapshot is fresh
+        assert notifier._snapshot_mtime == 123.0
+    finally:
+        release.set()
+        executor = getattr(notifier, "_jit_roster_executor", None)
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)

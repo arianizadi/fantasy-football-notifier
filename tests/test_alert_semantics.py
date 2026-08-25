@@ -543,7 +543,16 @@ def test_only_active_bench_players_can_be_start_suggestions() -> None:
         generated_at=None,
         leagues=[league],
         players=[
-            RosterPlayer("George Kittle", "TE", "SF", "TE", True, "Mine", league.key),
+            RosterPlayer(
+                "George Kittle",
+                "TE",
+                "SF",
+                "NFL_INACTIVE",
+                True,
+                "Mine",
+                league.key,
+                fantasy_starter=True,
+            ),
             RosterPlayer("Active Bench", "TE", "DET", "BE", True, "Mine", league.key),
             RosterPlayer("ESPN IR", "TE", "MIN", "IR", True, "Mine", league.key),
             RosterPlayer("Sleeper Reserve", "TE", "NYG", "RESERVE", True, "Mine", league.key),
@@ -556,6 +565,8 @@ def test_only_active_bench_players_can_be_start_suggestions() -> None:
     charts = DepthCharts(_kittle_index(), snapshot)
     _, plays = charts.build(subject_names=("George Kittle",), snapshot=snapshot)
     assert plays[0].bench_options == ["Active Bench"]
+    assert plays[0].subject_lineup_slot == "NFL_INACTIVE"
+    assert plays[0].subject_is_starter is True
 
 
 def test_duplicate_league_names_are_disambiguated_by_provider_and_id() -> None:

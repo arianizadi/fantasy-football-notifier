@@ -10,6 +10,7 @@ from unittest.mock import Mock
 
 import pytest
 
+import notifier.notify as notify_module
 from notifier.classify import _fallback
 from notifier.dedupe import (
     SeenStore,
@@ -30,7 +31,7 @@ from notifier.models import (
     RosterPlayer,
     RosterSnapshot,
 )
-from notifier.outbox import DeliveryOutbox, _news_item
+from notifier.outbox import DeliveryOutbox, PendingDelivery, _news_item
 from notifier.pipeline import Notifier, _alert_supersedes
 from notifier.notify import format_alert
 from notifier.plays import Beneficiary, DepthEntry, LeaguePlays, TeamContext
@@ -140,6 +141,46 @@ def test_failed_send_stays_in_durable_outbox_and_dedupe_is_unmodified(
     assert len(DeliveryOutbox(tmp_path)) == 1
 
 
+def test_initial_telegram_state_failure_keeps_outbox_and_dedupe_unmodified(
+    tmp_path, monkeypatch
+) -> None:
+    notify_module._TELEGRAM_STATES.clear()
+    notifier = _notifier(tmp_path)
+    notifier.config = SimpleNamespace(
+        dry_run=False,
+        state_dir=tmp_path,
+        telegram_bot_token="fake-token",
+        telegram_chat_id="123",
+        telegram_controls_enabled=True,
+        player_thread_hours=168,
+    )
+    response = Mock(ok=True, status_code=200)
+    response.raise_for_status.return_value = None
+    response.json.return_value = {"ok": True, "result": {"message_id": 77}}
+    notifier.session = Mock()
+    notifier.session.post.return_value = response
+    state = notify_module.telegram_state(notifier.config)
+    monkeypatch.setattr(state, "_save_locked", Mock(return_value=False))
+    item = _item("twitter:state-commit-failure")
+    alert = _alert(item)
+
+    assert notifier._claim_item(item)
+    assert notifier._complete_evaluation(item, alert) == 0
+
+    assert notifier.session.post.call_count == 1
+    assert notifier.seen.is_new(item)
+    assert notifier.seen.is_semantically_new(
+        item.player_name,
+        alert.classification.event_type,
+        alert.classification.severity,
+        event_status(item, alert.classification.event_type),
+    )
+    assert len(notifier.outbox) == 1
+    assert len(DeliveryOutbox(tmp_path)) == 1
+    assert state.previous_message_id(item.player_name) is None
+    assert not (tmp_path / "telegram-state.json").exists()
+
+
 def test_pending_raw_revision_survives_subject_attribution_upgrade(tmp_path) -> None:
     raw = replace(
         _item(guid="rotowire:beneficiary", source="rotowire"),
@@ -209,6 +250,70 @@ def test_zero_attempt_restart_revalidates_beneficiary_before_replay(
     notifier._revalidate_delayed_alert.assert_called_once_with(pending)
     assert send.call_args.args[2].delivery_delayed is True
     assert len(notifier.outbox) == 0
+
+
+def test_deliver_pending_revalidates_before_taking_delivery_lock(tmp_path) -> None:
+    notifier = _notifier(tmp_path)
+    pending = notifier.outbox.add(_alert(_item("twitter:delayed-lock")))
+    delivery_lock = threading.Lock()
+    revalidated = replace(pending.alert, delivery_delayed=True)
+    notifier._delivery_lock = delivery_lock
+
+    def revalidate(current):
+        assert current is pending
+        assert delivery_lock.locked() is False
+        return revalidated
+
+    def attempt(current, **kwargs):
+        assert current is pending
+        assert delivery_lock.locked() is True
+        assert kwargs == {
+            "replay": True,
+            "revalidated_alert": revalidated,
+        }
+        return 0
+
+    notifier._revalidate_delayed_alert = Mock(side_effect=revalidate)
+    notifier._attempt_pending_locked = Mock(side_effect=attempt)
+
+    assert notifier.deliver_pending() == 0
+    notifier._revalidate_delayed_alert.assert_called_once_with(pending)
+    notifier._attempt_pending_locked.assert_called_once()
+
+
+def test_delayed_mine_alert_refreshes_lineup_even_without_beneficiaries() -> None:
+    notifier = Notifier.__new__(Notifier)
+    league = LeagueRef("espn", "1", "Home", "Mine")
+    alert = Alert(
+        item=_item("twitter:mine-practice", headline="Example Player was limited"),
+        classification=Classification(
+            "practice_report",
+            3,
+            "Monitor availability",
+            True,
+            {"direction": "mixed"},
+        ),
+        tier="mine",
+        per_league=[
+            LeaguePlays(
+                league=league,
+                subject_state="mine",
+                subject_owner="Mine",
+                subject_lineup_slot="WR",
+            )
+        ],
+    )
+    pending = PendingDelivery("pending", alert, queued_at=1.0)
+    notifier.config = SimpleNamespace(dry_run=False)
+    notifier._refresh_ownership_just_in_time = Mock(return_value=False)
+
+    refreshed = notifier._revalidate_delayed_alert(pending)
+
+    notifier._refresh_ownership_just_in_time.assert_called_once_with({league.key})
+    assert refreshed.delivery_delayed is True
+    assert refreshed.availability_refresh_failed is True
+    assert refreshed.urgency is not None
+    assert refreshed.urgency.level == "monitor"
 
 
 def test_removed_due_snapshot_entry_cannot_send_or_reschedule(
@@ -602,6 +707,8 @@ def test_outbox_round_trips_full_context(tmp_path) -> None:
         subject_state="mine",
         subject_owner="Mine",
         subject_depth_order=2,
+        subject_lineup_slot="NFL_INACTIVE",
+        subject_fantasy_starter=True,
         beneficiaries=[
             Beneficiary(
                 "Backup",
@@ -641,6 +748,9 @@ def test_outbox_round_trips_full_context(tmp_path) -> None:
     assert restored.context.same_position[0].sleeper_injury_status == "Questionable"
     assert restored.per_league[0].capacity == plays.capacity
     assert restored.per_league[0].subject_depth_order == 2
+    assert restored.per_league[0].subject_lineup_slot == "NFL_INACTIVE"
+    assert restored.per_league[0].subject_fantasy_starter is True
+    assert restored.per_league[0].subject_is_starter is True
     assert restored.per_league[0].beneficiaries[0].named_in_report is True
     assert restored.per_league[0].beneficiaries[0].pro_team == "ARI"
     assert restored.per_league[0].beneficiaries[0].fantasypros_waiver_rank == 34
@@ -1852,7 +1962,7 @@ def test_failed_jit_refresh_fails_closed_without_add_or_free_agent_claim(
     alert = notifier._evaluate(_item())
 
     assert alert is not None
-    notifier._refresh_ownership_just_in_time.assert_called_once_with()
+    notifier._refresh_ownership_just_in_time.assert_called_once_with({league.key})
     assert alert.availability_refresh_failed is True
     assert all(not entry.claimable for entry in alert.per_league)
     rendered = format_alert(alert)

@@ -17,12 +17,22 @@ DEFAULT_MIN_SEVERITY_OTHER = 3
 DEFAULT_FANTASYPROS_REQUEST_LIMIT = 425
 DEFAULT_FANTASYPROS_REFRESH_HOURS = 2
 DEFAULT_FANTASYPROS_MAX_AGE_HOURS = 12
+DEFAULT_FANTASYPROS_CORPUS_TARGET = 5000
+DEFAULT_FANTASYPROS_CORPUS_MAX_REQUESTS = 300
+DEFAULT_FANTASYPROS_CORPUS_LIVE_RESERVE = 75
+DEFAULT_FANTASYPROS_CORPUS_PLAYER_LIMIT = 250
+DEFAULT_FANTASYPROS_CORPUS_EMBEDDING_BUDGET_USD = 0.25
+DEFAULT_FANTASYPROS_CORPUS_EMBEDDING_PRICE_PER_MILLION_USD = 0.01
 DEFAULT_DAILY_RECAP_HOUR = 8
 DEFAULT_WAIVER_REPORT_LEAD_HOURS = 8
 DEFAULT_EMBEDDING_MODEL = "qwen/qwen3-embedding-8b"
 DEFAULT_EMBEDDING_DIMENSIONS = 512
 DEFAULT_EMBEDDING_SIMILARITY_THRESHOLD = 0.90
 DEFAULT_EMBEDDING_WINDOW_HOURS = 6
+DEFAULT_URGENCY_EMBEDDING_THRESHOLD = 0.70
+DEFAULT_URGENCY_EMBEDDING_MIN_NEIGHBORS = 2
+DEFAULT_URGENCY_EMBEDDING_HISTORY_DAYS = 365
+DEFAULT_URGENCY_EMBEDDING_LIFT_ENABLED = False
 
 
 @dataclass(frozen=True)
@@ -38,6 +48,10 @@ class Config:
     embedding_window_hours: int
     embedding_timeout_seconds: int
     embedding_wait_ms: int
+    urgency_embedding_threshold: float
+    urgency_embedding_min_neighbors: int
+    urgency_embedding_history_days: int
+    urgency_embedding_lift_enabled: bool
     espn_enabled: bool
     espn_league_id: int
     espn_year: int
@@ -51,6 +65,13 @@ class Config:
     fantasypros_request_limit: int
     fantasypros_refresh_hours: int
     fantasypros_max_age_hours: int
+    fantasypros_corpus_enabled: bool
+    fantasypros_corpus_target: int
+    fantasypros_corpus_max_requests: int
+    fantasypros_corpus_live_reserve: int
+    fantasypros_corpus_player_limit: int
+    fantasypros_corpus_embedding_budget_usd: float
+    fantasypros_corpus_embedding_price_per_million_usd: float
     poll_seconds: int
     poll_seconds_idle: int
     min_severity: int
@@ -188,6 +209,28 @@ def load_config() -> Config:
             0,
             2000,
         ),
+        urgency_embedding_threshold=optional_float(
+            "URGENCY_EMBEDDING_THRESHOLD",
+            DEFAULT_URGENCY_EMBEDDING_THRESHOLD,
+            0.5,
+            1.0,
+        ),
+        urgency_embedding_min_neighbors=optional_int(
+            "URGENCY_EMBEDDING_MIN_NEIGHBORS",
+            DEFAULT_URGENCY_EMBEDDING_MIN_NEIGHBORS,
+            2,
+            10,
+        ),
+        urgency_embedding_history_days=optional_int(
+            "URGENCY_EMBEDDING_HISTORY_DAYS",
+            DEFAULT_URGENCY_EMBEDDING_HISTORY_DAYS,
+            7,
+            730,
+        ),
+        urgency_embedding_lift_enabled=optional_bool(
+            "URGENCY_EMBEDDING_LIFT_ENABLED",
+            DEFAULT_URGENCY_EMBEDDING_LIFT_ENABLED,
+        ),
         espn_enabled=bool(os.environ.get("ESPN_LEAGUE_ID", "").strip()),
         espn_league_id=int(os.environ.get("ESPN_LEAGUE_ID", "0").strip() or 0),
         espn_year=optional_int("ESPN_YEAR", 2026, 2015, 2100),
@@ -221,6 +264,48 @@ def load_config() -> Config:
             DEFAULT_FANTASYPROS_MAX_AGE_HOURS,
             1,
             72,
+        ),
+        # Historical provider news is collected into its own reference-only
+        # table. It cannot become an alert, recap item, dedupe candidate, or
+        # automatic urgency lift merely because collection is enabled.
+        fantasypros_corpus_enabled=(
+            not dry_run and optional_bool("FANTASYPROS_CORPUS_ENABLED", False)
+        ),
+        fantasypros_corpus_target=optional_int(
+            "FANTASYPROS_CORPUS_TARGET",
+            DEFAULT_FANTASYPROS_CORPUS_TARGET,
+            100,
+            50_000,
+        ),
+        fantasypros_corpus_max_requests=optional_int(
+            "FANTASYPROS_CORPUS_MAX_REQUESTS",
+            DEFAULT_FANTASYPROS_CORPUS_MAX_REQUESTS,
+            1,
+            400,
+        ),
+        fantasypros_corpus_live_reserve=optional_int(
+            "FANTASYPROS_CORPUS_LIVE_RESERVE",
+            DEFAULT_FANTASYPROS_CORPUS_LIVE_RESERVE,
+            1,
+            400,
+        ),
+        fantasypros_corpus_player_limit=optional_int(
+            "FANTASYPROS_CORPUS_PLAYER_LIMIT",
+            DEFAULT_FANTASYPROS_CORPUS_PLAYER_LIMIT,
+            1,
+            500,
+        ),
+        fantasypros_corpus_embedding_budget_usd=optional_float(
+            "FANTASYPROS_CORPUS_EMBEDDING_BUDGET_USD",
+            DEFAULT_FANTASYPROS_CORPUS_EMBEDDING_BUDGET_USD,
+            0.01,
+            5.0,
+        ),
+        fantasypros_corpus_embedding_price_per_million_usd=optional_float(
+            "FANTASYPROS_CORPUS_EMBEDDING_PRICE_PER_MILLION_USD",
+            DEFAULT_FANTASYPROS_CORPUS_EMBEDDING_PRICE_PER_MILLION_USD,
+            0.000001,
+            100.0,
         ),
         poll_seconds=optional_int("POLL_SECONDS", DEFAULT_POLL_SECONDS, 10, 900),
         poll_seconds_idle=optional_int(
@@ -265,6 +350,35 @@ def load_config() -> Config:
         )
     if config.espn_enabled and not (config.espn_swid and config.espn_s2):
         raise NotifierError("ESPN_LEAGUE_ID is set, so ESPN_SWID and ESPN_S2 are required.")
+    if (
+        config.fantasypros_corpus_enabled
+        and not config.fantasypros_api_key
+    ):
+        raise NotifierError(
+            "FANTASYPROS_CORPUS_ENABLED requires FANTASYPROS_API_KEY."
+        )
+    if (
+        config.fantasypros_corpus_enabled
+        and config.embedding_model != DEFAULT_EMBEDDING_MODEL
+        and not os.environ.get(
+            "FANTASYPROS_CORPUS_EMBEDDING_PRICE_PER_MILLION_USD", ""
+        ).strip()
+    ):
+        raise NotifierError(
+            "A non-default EMBEDDING_MODEL requires an explicit "
+            "FANTASYPROS_CORPUS_EMBEDDING_PRICE_PER_MILLION_USD."
+        )
+    if (
+        config.fantasypros_corpus_enabled
+        and config.fantasypros_corpus_max_requests
+        + config.fantasypros_corpus_live_reserve
+        > config.fantasypros_request_limit
+    ):
+        raise NotifierError(
+            "FANTASYPROS_CORPUS_MAX_REQUESTS plus "
+            "FANTASYPROS_CORPUS_LIVE_RESERVE must not exceed "
+            "FANTASYPROS_REQUEST_LIMIT."
+        )
 
     if os.environ.get("ESPN_DEBUG", "false").strip().lower() == "true":
         # Matches sync.py: raw ESPN payloads carry private member data.

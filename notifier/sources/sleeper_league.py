@@ -18,8 +18,9 @@ BASE_URL = "https://api.sleeper.app/v1"
 REQUEST_TIMEOUT = 20
 
 # Sleeper returns starters as an ordered list; index maps to a lineup slot only
-# loosely. Reserve/taxi/NFL-inactive state is encoded in the same field so it
-# survives the provider-neutral roster snapshot without a schema migration.
+# loosely. Reserve/taxi/NFL-inactive state is encoded in the eligibility field;
+# raw fantasy starter membership is persisted separately in the additive
+# provider-neutral snapshot field.
 STARTER_SLOT = "ST"
 BENCH_SLOT = "BE"
 RESERVE_SLOT = "RESERVE"
@@ -138,7 +139,8 @@ def fetch_league_rosters(
         reserve = _player_ids(roster.get("reserve"))
         taxi = _player_ids(roster.get("taxi"))
         for player_id in roster.get("players") or []:
-            record = player_index.get(str(player_id))
+            player_key = str(player_id)
+            record = player_index.get(player_key)
             if not record or not record.get("full_name"):
                 continue
             players.append(
@@ -147,7 +149,7 @@ def fetch_league_rosters(
                     position=record.get("position") or "",
                     pro_team=record.get("team") or "",
                     lineup_slot=roster_slot(
-                        str(player_id),
+                        player_key,
                         starters=starters,
                         reserve=reserve,
                         taxi=taxi,
@@ -156,6 +158,14 @@ def fetch_league_rosters(
                     on_my_team=is_mine,
                     fantasy_team=fantasy_team,
                     league_key=ref.key,
+                    # Reserve/taxi membership wins inconsistent provider data,
+                    # but daily-cached NFL status does not erase the raw fantasy
+                    # lineup fact used to assess replacement urgency.
+                    fantasy_starter=(
+                        player_key in starters
+                        and player_key not in reserve
+                        and player_key not in taxi
+                    ),
                 )
             )
 

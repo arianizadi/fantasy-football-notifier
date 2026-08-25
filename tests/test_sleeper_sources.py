@@ -116,7 +116,9 @@ def test_fetch_league_rosters_preserves_reserve_taxi_and_nfl_status() -> None:
             "owner_id": "me",
             "roster_id": 1,
             "players": ["1", "2", "3", "4", "5"],
-            "starters": ["1"],
+            # Exercise defensive precedence: reserve/taxi status must win even
+            # if an inconsistent provider payload also lists those IDs here.
+            "starters": ["1", "3", "4"],
             "reserve": ["3"],
             "taxi": ["4"],
         }
@@ -125,7 +127,9 @@ def test_fetch_league_rosters_preserves_reserve_taxi_and_nfl_status() -> None:
     session = Mock()
     session.get.side_effect = [Response(rosters), Response(users)]
     index = {
-        "1": {"full_name": "Starter", "position": "TE", "team": "SF", "status": "Active"},
+        # The daily player index can lag an activation even while the live
+        # fantasy roster still says this player occupies a starting slot.
+        "1": {"full_name": "Starter", "position": "TE", "team": "SF", "status": "PUP"},
         "2": {"full_name": "Bench", "position": "TE", "team": "SF", "status": "Active"},
         "3": {"full_name": "Reserve", "position": "TE", "team": "SF", "status": "Active"},
         "4": {"full_name": "Taxi", "position": "TE", "team": "SF", "status": "Active"},
@@ -156,13 +160,23 @@ def test_fetch_league_rosters_preserves_reserve_taxi_and_nfl_status() -> None:
     )
     slots = {player.name: player.lineup_slot for player in players}
     assert slots == {
-        "Starter": STARTER_SLOT,
+        "Starter": NFL_INACTIVE_SLOT,
         "Bench": BENCH_SLOT,
         "Reserve": RESERVE_SLOT,
         "Taxi": TAXI_SLOT,
         "Inactive": NFL_INACTIVE_SLOT,
     }
-    # The PUP player still occupies a normal bench slot in Sleeper's raw
+    starter_membership = {
+        player.name: player.is_fantasy_starter for player in players
+    }
+    assert starter_membership == {
+        "Starter": True,
+        "Bench": False,
+        "Reserve": False,
+        "Taxi": False,
+        "Inactive": False,
+    }
+    # The other PUP player still occupies a normal bench slot in Sleeper's raw
     # roster even though lineup safety labels him NFL_INACTIVE.
     assert capacity.bench_used == 2
     assert capacity.bench_limit == 5

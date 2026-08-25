@@ -20,7 +20,8 @@ import os
 import tempfile
 import threading
 import time
-from collections.abc import Callable, Iterable
+from collections import Counter
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -43,6 +44,7 @@ DEFAULT_MAX_STALE_SECONDS = 12 * 60 * 60
 MIN_REQUEST_INTERVAL_SECONDS = 1.05
 ROLLING_WINDOW_SECONDS = 24 * 60 * 60
 REQUEST_TIMEOUT_SECONDS = 20
+CORPUS_REQUEST_BUCKET = "corpus"
 
 SUPPORTED_SCORING = ("PPR", "HALF", "STD")
 DEFAULT_SCORING = ("PPR", "HALF")
@@ -172,12 +174,34 @@ class FantasyProsStatus:
     next_refresh_in_seconds: float
 
 
-class _RefreshFailure(RuntimeError):
-    """An intentionally sanitized refresh failure."""
+_REQUEST_ERROR_CODES = frozenset(
+    {
+        "budget_exhausted",
+        "budget_reserved",
+        "cache_write_failed",
+        "closed",
+        "dataset_unavailable",
+        "invalid_request",
+        "invalid_response",
+        "ledger_untrusted",
+        "request_failed",
+        "request_limit",
+    }
+)
 
-    def __init__(self, code: str) -> None:
-        super().__init__(code)
-        self.code = code
+
+class FantasyProsRequestError(RuntimeError):
+    """A public provider error that contains only a stable, secret-free code."""
+
+    def __init__(self, code: str, *, request_reserved: bool = False) -> None:
+        safe_code = code if code in _REQUEST_ERROR_CODES else "request_failed"
+        super().__init__(safe_code)
+        self.code = safe_code
+        self.request_reserved = bool(request_reserved)
+
+
+class _RefreshFailure(FantasyProsRequestError):
+    """An intentionally sanitized refresh failure."""
 
 
 class _DatasetUnavailable(ValueError):
@@ -237,6 +261,21 @@ def _optional_float(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def _request_bucket_name(value: Any) -> str | None:
+    """Return one safe persistent-ledger bucket name, or ``None``."""
+    if not isinstance(value, str) or not 1 <= len(value) <= 64:
+        return None
+    if not value[0].isascii() or not value[0].isalnum():
+        return None
+    if not all(
+        character.isascii()
+        and (character.isalnum() or character in {"_", "-", "."})
+        for character in value
+    ):
+        return None
+    return value
+
+
 def _utc_datetime(timestamp: float) -> datetime:
     return datetime.fromtimestamp(timestamp, timezone.utc)
 
@@ -294,6 +333,7 @@ class FantasyProsCache:
         self._refresh_lock = threading.Lock()
         self._datasets: dict[str, dict[str, Any]] = {}
         self._request_times: list[float] = []
+        self._request_buckets: dict[str, list[float]] = {}
         self._ledger_trusted = True
         self._refreshing = False
         self._closed = False
@@ -317,6 +357,14 @@ class FantasyProsCache:
     def _recent_requests(self, now: float) -> list[float]:
         cutoff = now - ROLLING_WINDOW_SECONDS
         return [timestamp for timestamp in self._request_times if timestamp > cutoff]
+
+    def _recent_bucket_requests(self, bucket: str, now: float) -> list[float]:
+        cutoff = now - ROLLING_WINDOW_SECONDS
+        return [
+            timestamp
+            for timestamp in self._request_buckets.get(bucket, ())
+            if timestamp > cutoff
+        ]
 
     def _load_cache(self) -> None:
         if not self.cache_path.exists():
@@ -345,11 +393,11 @@ class FantasyProsCache:
 
         now = self._clock()
         raw_requests = payload.get("requests")
+        parsed_requests: list[float] = []
         if not isinstance(raw_requests, list):
             self._ledger_trusted = False
             self._last_error = "ledger_invalid"
         else:
-            parsed_requests: list[float] = []
             for raw_timestamp in raw_requests:
                 timestamp = _optional_float(raw_timestamp)
                 if timestamp is None or timestamp <= 0 or timestamp > now + 60:
@@ -364,6 +412,46 @@ class FantasyProsCache:
                     for timestamp in parsed_requests
                     if timestamp > now - ROLLING_WINDOW_SECONDS
                 )
+
+        # Version-1 ledgers predate named request buckets, so a missing field is
+        # an empty, valid bucket map.  Once present, every bucket reservation
+        # must also exist in the authoritative global request ledger.
+        raw_buckets = payload.get("request_buckets", {})
+        parsed_buckets: dict[str, list[float]] = {}
+        if not isinstance(raw_buckets, dict):
+            self._ledger_trusted = False
+            self._last_error = "ledger_invalid"
+        elif self._ledger_trusted:
+            global_counts = Counter(parsed_requests)
+            bucket_counts: Counter[float] = Counter()
+            for raw_name, raw_timestamps in raw_buckets.items():
+                bucket_name = _request_bucket_name(raw_name)
+                if bucket_name is None or not isinstance(raw_timestamps, list):
+                    self._ledger_trusted = False
+                    self._last_error = "ledger_invalid"
+                    break
+                timestamps: list[float] = []
+                for raw_timestamp in raw_timestamps:
+                    timestamp = _optional_float(raw_timestamp)
+                    if timestamp is None or timestamp <= 0 or timestamp > now + 60:
+                        self._ledger_trusted = False
+                        self._last_error = "ledger_invalid"
+                        break
+                    timestamps.append(timestamp)
+                    bucket_counts[timestamp] += 1
+                    if bucket_counts[timestamp] > global_counts[timestamp]:
+                        self._ledger_trusted = False
+                        self._last_error = "ledger_invalid"
+                        break
+                if not self._ledger_trusted:
+                    break
+                parsed_buckets[bucket_name] = sorted(
+                    timestamp
+                    for timestamp in timestamps
+                    if timestamp > now - ROLLING_WINDOW_SECONDS
+                )
+            if self._ledger_trusted:
+                self._request_buckets = parsed_buckets
 
         raw_datasets = payload.get("datasets")
         if isinstance(raw_datasets, dict):
@@ -457,10 +545,19 @@ class FantasyProsCache:
         *,
         datasets: dict[str, dict[str, Any]] | None = None,
         requests_: list[float] | None = None,
+        request_buckets_: dict[str, list[float]] | None = None,
     ) -> dict[str, Any]:
         return {
             "version": CACHE_VERSION,
             "requests": list(self._request_times if requests_ is None else requests_),
+            "request_buckets": {
+                name: list(timestamps)
+                for name, timestamps in (
+                    self._request_buckets
+                    if request_buckets_ is None
+                    else request_buckets_
+                ).items()
+            },
             "datasets": dict(self._datasets if datasets is None else datasets),
         }
 
@@ -469,6 +566,7 @@ class FantasyProsCache:
         *,
         datasets: dict[str, dict[str, Any]] | None = None,
         requests_: list[float] | None = None,
+        request_buckets_: dict[str, list[float]] | None = None,
     ) -> None:
         """Atomically persist sanitized state.  Caller must hold state lock."""
         self.cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -482,7 +580,11 @@ class FantasyProsCache:
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
                 json.dump(
-                    self._state_payload(datasets=datasets, requests_=requests_),
+                    self._state_payload(
+                        datasets=datasets,
+                        requests_=requests_,
+                        request_buckets_=request_buckets_,
+                    ),
                     handle,
                     sort_keys=True,
                     separators=(",", ":"),
@@ -497,8 +599,14 @@ class FantasyProsCache:
         with self._state_lock:
             self._last_error = code
 
-    def _reserve_request(self) -> float:
-        """Pace and durably reserve one request before sending it."""
+    def _reserve_request(
+        self,
+        *,
+        request_ceiling: int | None = None,
+        request_bucket: str = "",
+        request_bucket_limit: int | None = None,
+    ) -> float:
+        """Pace and durably reserve one global and optional bucket request."""
         while True:
             with self._state_lock:
                 if self._closed:
@@ -509,6 +617,18 @@ class FantasyProsCache:
                 recent = self._recent_requests(now)
                 if len(recent) >= self._app_daily_cap:
                     raise _RefreshFailure("budget_exhausted")
+                if request_ceiling is not None and len(recent) >= request_ceiling:
+                    raise _RefreshFailure("budget_reserved")
+                recent_bucket = (
+                    self._recent_bucket_requests(request_bucket, now)
+                    if request_bucket
+                    else []
+                )
+                if (
+                    request_bucket_limit is not None
+                    and len(recent_bucket) >= request_bucket_limit
+                ):
+                    raise _RefreshFailure("request_limit")
                 last_request = max(recent, default=None)
                 delay = (
                     self._min_request_interval - (now - last_request)
@@ -518,17 +638,146 @@ class FantasyProsCache:
                 if delay <= 0:
                     reservation = now
                     reserved = [*recent, reservation]
+                    reserved_buckets = {
+                        name: timestamps
+                        for name in self._request_buckets
+                        if (
+                            timestamps := self._recent_bucket_requests(name, now)
+                        )
+                    }
+                    if request_bucket:
+                        reserved_buckets[request_bucket] = [
+                            *recent_bucket,
+                            reservation,
+                        ]
                     try:
-                        self._write_state_locked(requests_=reserved)
+                        self._write_state_locked(
+                            requests_=reserved,
+                            request_buckets_=reserved_buckets,
+                        )
                     except OSError:
                         raise _RefreshFailure("cache_write_failed") from None
                     self._request_times = reserved
+                    self._request_buckets = reserved_buckets
                     return reservation
             # Epoch floats have sub-microsecond resolution.  A calculated
             # remainder smaller than that resolution would otherwise sleep
             # without advancing the clock and spin forever.  One millisecond
             # of safety margin is negligible relative to the 1.05 s policy.
             self._sleep(max(delay, 0.001))
+
+    def get_json(
+        self,
+        relative_path: str,
+        *,
+        params: Mapping[str, Any] | None = None,
+        request_ceiling: int | None = None,
+        request_bucket: str = "",
+        request_bucket_limit: int | None = None,
+    ) -> Any:
+        """Perform one serialized, budgeted GET against the FantasyPros API.
+
+        ``relative_path`` is deliberately confined to ``BASE_URL`` so callers
+        cannot redirect the API-key header to another host. The request uses
+        the same lock, durable rolling ledger, daily cap, and minimum cadence
+        as ranking refreshes. Optional global and named-bucket ceilings are
+        checked in the same critical section that persists the reservation.
+        Provider and transport exception text is never propagated because it
+        may contain request headers or credentials.
+        """
+        try:
+            path = str(relative_path or "").strip()
+        except Exception:
+            raise FantasyProsRequestError("invalid_request") from None
+        segments = path.split("/")
+        if (
+            not path
+            or path.startswith("/")
+            or any(segment in {"", ".", ".."} for segment in segments)
+            or not all(
+                character.isascii()
+                and (character.isalnum() or character in {"/", "_", "-", "."})
+                for character in path
+            )
+        ):
+            raise FantasyProsRequestError("invalid_request")
+        try:
+            request_params = dict(params or {})
+        except Exception:
+            raise FantasyProsRequestError("invalid_request") from None
+        normalized_ceiling = (
+            _optional_int(request_ceiling, positive=True)
+            if request_ceiling is not None
+            else None
+        )
+        normalized_bucket = ""
+        if isinstance(request_bucket, str) and request_bucket:
+            normalized_bucket = _request_bucket_name(request_bucket) or ""
+        normalized_bucket_limit = (
+            _optional_int(request_bucket_limit, positive=True)
+            if request_bucket_limit is not None
+            else None
+        )
+        if (
+            (request_ceiling is not None and normalized_ceiling is None)
+            or (
+                normalized_ceiling is not None
+                and normalized_ceiling > self._app_daily_cap
+            )
+            or not isinstance(request_bucket, str)
+            or (request_bucket and not normalized_bucket)
+            or (request_bucket_limit is not None and normalized_bucket_limit is None)
+            or (normalized_bucket_limit is not None and not normalized_bucket)
+        ):
+            raise FantasyProsRequestError("invalid_request")
+
+        # Serialize every provider GET with ranking refreshes. This preserves
+        # one request-start cadence and lets close() wait for active work.
+        with self._refresh_lock:
+            with self._state_lock:
+                if self._closed or not self._api_key:
+                    raise FantasyProsRequestError("closed")
+            try:
+                self._reserve_request(
+                    request_ceiling=normalized_ceiling,
+                    request_bucket=normalized_bucket,
+                    request_bucket_limit=normalized_bucket_limit,
+                )
+            except _RefreshFailure as error:
+                raise FantasyProsRequestError(error.code) from None
+            except Exception:
+                raise FantasyProsRequestError("request_failed") from None
+
+            # Read transport details only after the durable reservation. They
+            # remain local variables and are never copied into state or errors.
+            with self._state_lock:
+                if self._closed or not self._api_key:
+                    raise FantasyProsRequestError("closed", request_reserved=True)
+                api_key = self._api_key
+                session = self._session
+                timeout = self._request_timeout
+            try:
+                response = session.get(
+                    f"{BASE_URL}/{path}",
+                    headers={"x-api-key": api_key},
+                    params=request_params,
+                    timeout=timeout,
+                )
+                status_code = int(getattr(response, "status_code", 200))
+            except Exception:
+                raise FantasyProsRequestError(
+                    "request_failed", request_reserved=True
+                ) from None
+            if not 200 <= status_code < 300:
+                raise FantasyProsRequestError(
+                    "request_failed", request_reserved=True
+                )
+            try:
+                return response.json()
+            except Exception:
+                raise FantasyProsRequestError(
+                    "invalid_response", request_reserved=True
+                ) from None
 
     def _fetch_dataset(self, scoring: str, ranking_type: str) -> dict[str, Any]:
         self._reserve_request()
@@ -1019,9 +1268,16 @@ class FantasyProsCache:
             source_url=identity.source_url,
         )
 
-    def request_usage(self) -> int:
+    def request_usage(self, *, bucket: str = "") -> int:
+        """Return rolling global usage or one safe named-bucket count."""
         with self._state_lock:
-            return len(self._recent_requests(self._clock()))
+            now = self._clock()
+            if not bucket:
+                return len(self._recent_requests(now))
+            normalized = _request_bucket_name(bucket)
+            if normalized is None:
+                raise ValueError("Invalid FantasyPros request bucket")
+            return len(self._recent_bucket_requests(normalized, now))
 
     def seconds_until_refresh(
         self,

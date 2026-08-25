@@ -20,7 +20,9 @@ RotoWire RSS (adaptive polling) ────────────┘
                                                  │
                     cached FantasyPros WAIVER/ROS context (optional)
                                                  │
-                    cross-source semantic dedupe + severity/tier gate
+                    severity/tier gate + league-aware action urgency
+                                                 │
+                    guarded embedding history + semantic dedupe
                               │                  │
                     local news journal     retry-safe Telegram delivery
 ```
@@ -36,6 +38,17 @@ summary, and whether it is actionable. Code owns the depth chart, roster availab
 event label, and add/start/bench rules. Positive returns therefore cannot be
 formatted as injuries or trigger a backup claim merely because the subject was
 previously hurt.
+
+Importance and action urgency are intentionally separate. `[4/5]` answers how
+important the football news is; `ACT NOW`, `ACT TODAY`, and `MONITOR` answer how
+quickly this manager should respond inside the configured leagues. Live roster
+slot, current ownership, and rechecked pickup options set the rule level.
+Embeddings corroborate it only after multiple independent, context-compatible
+player stories agree. They do not change the action band in the default
+production policy; the optional lift mode stays off until enough live,
+context-rich reports have been manually audited. They never lower urgency,
+create `ACT NOW`, suppress an alert, or override an event/status change. Preseason and
+uncertain-subject news are capped at `MONITOR`.
 
 ## Alert tiers and events
 
@@ -184,6 +197,22 @@ or suppress it. A valid response that is empty or falls back to a different
 ranking family is marked unavailable and never relabeled as WAIVER or ROS.
 Displayed rankings are explicitly attributed to FantasyPros.
 
+When `FANTASYPROS_CORPUS_ENABLED=true`, a separate low-priority worker builds
+a reference-only news corpus. It first requests the documented NFL player
+index, then uses 100-item global, category, and player queries until it reaches
+the configured unique-item target. The crawl is resumable by provider item ID
+and query checkpoint. It may use at most 300 calls per rolling day and stops
+before the shared ledger's final 75 calls, so ranking refreshes and diagnostics
+retain headroom. Once the target is reached, maintenance is only one six-query
+global/category sweep per UTC day.
+
+Corpus text is embedded in batches with a conservative `$0.25` lifetime fuse
+for the configured vector space. The source rows, query observations, vector
+model, dimensions, content hash, and attribution are stored in dedicated
+tables. Provider query categories are weak evaluation labels, not human truth;
+they cannot by themselves raise a live alert's urgency. Use
+`bin/eval-fantasypros-corpus.py` for the held-out lexical-versus-vector report.
+
 Bench and IR limits are read separately from each league's provider settings;
 the current ESPN and Sleeper leagues can therefore both show `5` bench and `1`
 IR without hard-coding those values globally. The IR number is occupancy only:
@@ -305,12 +334,29 @@ report. Reversals such as "returned to practice" followed by "released"
 therefore remain separate even when their text is highly similar. Every raw
 report remains searchable in SQLite regardless of the alert result.
 
+Urgency assessments are stored beside each classified report with both the
+deterministic rule level and final displayed level, reason codes, live-action
+flags, policy version, and any supporting report ids/scores. Historical rows
+whose old live roster context no longer exists receive conservative
+`archive_replay` labels; they help similarity and invariant testing but are
+forbidden from voting for an urgency lift. As new reports accumulate,
+independently assessed live events become eligible evidence for a later,
+audited policy change.
+
 Backfill and evaluate the complete saved archive without sending messages:
 
 ```bash
 ./.venv/bin/python bin/backfill-embeddings.py
 ./.venv/bin/python bin/eval-embeddings.py --strict
+./.venv/bin/python bin/backfill-urgency.py
+./.venv/bin/python bin/eval-urgency.py --strict
 ```
+
+The urgency evaluator proves archive coverage, provenance, and safety
+invariants; it does not treat the classifier's own old labels as accuracy
+ground truth. `--strict` also requires enough new live, context-rich reports,
+so a fresh deployment can correctly report `NOT READY` while corroboration
+continues operating safely.
 
 `EMBEDDING_MODE=shadow` stores and scores vectors without changing delivery.
 `EMBEDDING_MODE=coalesce` enables guarded same-message edits. The default is
@@ -361,6 +407,7 @@ Important configuration:
 | `OPENROUTER_API_KEY`, `OPENROUTER_MODEL` | Pinned classifier provider/model. |
 | `EMBEDDING_MODE`, `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS` | Optional OpenRouter vector archive and guarded coalescing (`off`, `shadow`, or `coalesce`). |
 | `EMBEDDING_SIMILARITY_THRESHOLD`, `EMBEDDING_WINDOW_HOURS` | Similarity gate and same-player comparison window; defaults `0.90` and six hours. |
+| `URGENCY_EMBEDDING_THRESHOLD`, `URGENCY_EMBEDDING_MIN_NEIGHBORS`, `URGENCY_EMBEDDING_HISTORY_DAYS`, `URGENCY_EMBEDDING_LIFT_ENABLED` | Conservative, context-matched history gate for urgency corroboration; defaults `0.70`, two independent players, 365 days, and no automatic band lift. |
 | `ESPN_LEAGUE_ID`, `ESPN_YEAR`, `ESPN_SWID`, `ESPN_S2` | Private ESPN league access. |
 | `ESPN_TEAM_ID` | Optional team-selection override. |
 | `SLEEPER_USERNAME`, `SLEEPER_LEAGUE_IDS` | Sleeper league discovery/filter. |
@@ -368,6 +415,9 @@ Important configuration:
 | `FANTASYPROS_API_KEY` | Optional cached FantasyPros WAIVER/ROS context; never used in the breaking-alert path. |
 | `FANTASYPROS_REQUEST_LIMIT` | Persistent rolling-24h application cap; default `425`, maximum `450`. |
 | `FANTASYPROS_REFRESH_HOURS`, `FANTASYPROS_MAX_AGE_HOURS` | Ranking refresh cadence and provider-data freshness limit. |
+| `FANTASYPROS_CORPUS_ENABLED`, `FANTASYPROS_CORPUS_TARGET` | Opt-in, reference-only FantasyPros news corpus; default target `5000`. Corpus rows never enter alerts, recaps, search, dedupe, or automatic urgency decisions. |
+| `FANTASYPROS_CORPUS_MAX_REQUESTS`, `FANTASYPROS_CORPUS_LIVE_RESERVE`, `FANTASYPROS_CORPUS_PLAYER_LIMIT` | Bootstrap controls; defaults `300`, `75`, and `250`. The shared persistent request ledger remains authoritative. |
+| `FANTASYPROS_CORPUS_EMBEDDING_BUDGET_USD`, `FANTASYPROS_CORPUS_EMBEDDING_PRICE_PER_MILLION_USD` | Durable lifetime spend fuse and pinned input-price assumption for the configured corpus embedding model; defaults `$0.25` and `$0.01/M` tokens. A non-default model requires an explicit price. |
 | `MIN_SEVERITY`, `MIN_SEVERITY_OTHER` | Alert floors for your roster vs other news. |
 | `POLL_SECONDS`, `POLL_SECONDS_IDLE`, `ADAPTIVE_POLLING` | RotoWire polling cadence. |
 | `TELEGRAM_CONTROLS_ENABLED` | Opt in to commands and feedback only when this service exclusively owns the bot's `getUpdates`; default `false`. |

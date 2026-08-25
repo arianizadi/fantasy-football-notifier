@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import os
 import sqlite3
+import threading
+import time
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
-from notifier.event_store import EventStore
+from notifier.event_store import EventStore, read_all_reports
 from notifier.models import Classification, NewsItem, report_revision_identity
 
 
@@ -426,6 +429,157 @@ def test_in_memory_store_does_not_create_state_directory(tmp_path) -> None:
     assert store.path is None
     assert not state_dir.exists()
     store.close()
+
+
+def test_read_all_reports_preserves_active_wal_and_reads_its_rows(tmp_path) -> None:
+    store = EventStore(tmp_path)
+    item = _item()
+    store.record_received(item)
+    database = tmp_path / "news-events.sqlite3"
+    source_files = (
+        database,
+        tmp_path / "news-events.sqlite3-wal",
+        tmp_path / "news-events.sqlite3-shm",
+    )
+    assert all(path.is_file() for path in source_files)
+    before = {
+        path.name: (
+            path.stat().st_size,
+            path.stat().st_mtime_ns,
+            path.stat().st_ctime_ns,
+            path.read_bytes(),
+        )
+        for path in source_files
+    }
+
+    rows = read_all_reports(tmp_path)
+
+    after = {
+        path.name: (
+            path.stat().st_size,
+            path.stat().st_mtime_ns,
+            path.stat().st_ctime_ns,
+            path.read_bytes(),
+        )
+        for path in source_files
+    }
+    assert [row["guid"] for row in rows] == [item.guid]
+    assert after == before
+    store.close()
+
+
+def test_read_all_reports_works_on_locked_down_closed_wal_archive(tmp_path) -> None:
+    store = EventStore(tmp_path)
+    item = _item()
+    store.record_received(item)
+    store.close()
+    database = tmp_path / "news-events.sqlite3"
+    wal = tmp_path / "news-events.sqlite3-wal"
+    shm = tmp_path / "news-events.sqlite3-shm"
+    assert not wal.exists()
+    assert not shm.exists()
+    before = database.read_bytes()
+    original_mode = tmp_path.stat().st_mode & 0o777
+
+    os.chmod(tmp_path, 0o555)
+    try:
+        rows = read_all_reports(tmp_path)
+    finally:
+        os.chmod(tmp_path, original_mode)
+
+    assert [row["guid"] for row in rows] == [item.guid]
+    assert database.read_bytes() == before
+    assert not wal.exists()
+    assert not shm.exists()
+
+
+def test_concurrent_initializers_serialize_schema_migration(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    database = tmp_path / "news-events.sqlite3"
+    connection = sqlite3.connect(database)
+    connection.execute(
+        """
+        CREATE TABLE news_events (
+            id INTEGER PRIMARY KEY,
+            report_id TEXT NOT NULL UNIQUE,
+            guid TEXT NOT NULL,
+            alert_token TEXT NOT NULL UNIQUE,
+            source TEXT NOT NULL,
+            player_name TEXT NOT NULL DEFAULT '',
+            headline TEXT NOT NULL DEFAULT '',
+            body TEXT NOT NULL DEFAULT '',
+            url TEXT NOT NULL DEFAULT '',
+            published_at TEXT,
+            received_at TEXT NOT NULL,
+            event_type TEXT,
+            direction TEXT,
+            severity INTEGER,
+            summary TEXT,
+            is_actionable INTEGER,
+            tier TEXT,
+            outcome TEXT NOT NULL DEFAULT 'received',
+            telegram_message_id INTEGER,
+            feedback TEXT,
+            feedback_at TEXT,
+            embedding_model TEXT,
+            embedding BLOB,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    original = EventStore._migrate_embedding_schema_locked
+    counter_lock = threading.Lock()
+    active = 0
+    maximum_active = 0
+
+    def observed_migration(store) -> None:
+        nonlocal active, maximum_active
+        with counter_lock:
+            active += 1
+            maximum_active = max(maximum_active, active)
+        try:
+            time.sleep(0.03)
+            original(store)
+        finally:
+            with counter_lock:
+                active -= 1
+
+    monkeypatch.setattr(
+        EventStore,
+        "_migrate_embedding_schema_locked",
+        observed_migration,
+    )
+    worker_count = 8
+    barrier = threading.Barrier(worker_count)
+    errors: list[BaseException] = []
+
+    def initialize() -> None:
+        try:
+            barrier.wait()
+            store = EventStore(tmp_path)
+            store.close()
+        except BaseException as error:
+            with counter_lock:
+                errors.append(error)
+
+    threads = [threading.Thread(target=initialize) for _ in range(worker_count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert not any(thread.is_alive() for thread in threads)
+    assert errors == []
+    assert maximum_active == 1
+    verify = sqlite3.connect(database)
+    columns = {row[1] for row in verify.execute("PRAGMA table_info(news_events)")}
+    verify.close()
+    assert "urgency_reason_codes" in columns
 
 
 def test_recent_player_context_can_exclude_current_report(tmp_path) -> None:

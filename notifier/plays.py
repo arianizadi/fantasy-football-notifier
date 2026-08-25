@@ -22,7 +22,12 @@ from datetime import datetime
 from typing import Any
 
 from .matcher import compact_key, player_name_in_text
-from .models import LeagueRef, RosterCapacity, RosterSnapshot
+from .models import (
+    LeagueRef,
+    RosterCapacity,
+    RosterSnapshot,
+    lineup_slot_is_starter,
+)
 
 SKILL_POSITIONS = frozenset({"QB", "RB", "WR", "TE"})
 # Sleeper overall rank. Applied only to DEEPER candidates: the immediate next
@@ -129,6 +134,14 @@ class LeaguePlays:
     subject_state: str  # "mine" | "rostered" | "free_agent"
     subject_owner: str
     subject_depth_order: int | None = None
+    # Provider-normalized slot for the user's copy of the subject. Empty for
+    # another manager's player or when the provider omitted the slot.
+    subject_lineup_slot: str = ""
+    # Raw provider lineup membership. Sleeper's daily NFL-status cache may mark
+    # a fantasy starter PUP/inactive, so this fact cannot be inferred solely
+    # from the eligibility-oriented synthetic slot. ``None`` supports pending
+    # alerts serialized before this field existed.
+    subject_fantasy_starter: bool | None = None
     beneficiaries: list[Beneficiary] = field(default_factory=list)
     bench_options: list[str] = field(default_factory=list)
     capacity: RosterCapacity | None = None
@@ -171,6 +184,14 @@ class LeaguePlays:
 
     def has_action_for(self, event_type: str, severity: int) -> bool:
         return self.for_event(event_type, severity).has_action
+
+    @property
+    def subject_is_starter(self) -> bool:
+        if self.subject_state != "mine":
+            return False
+        if self.subject_fantasy_starter is not None:
+            return self.subject_fantasy_starter
+        return lineup_slot_is_starter(self.subject_lineup_slot)
 
 
 def plays_for_event(
@@ -228,11 +249,20 @@ class DepthCharts:
 
         # league_key -> compact name -> (state, fantasy_team)
         self._ownership: dict[str, dict[str, tuple[str, str]]] = {}
+        self._my_lineup_slots: dict[str, dict[str, str]] = {}
+        self._my_starter_membership: dict[str, dict[str, bool]] = {}
         for player in snapshot.players:
             self._ownership.setdefault(player.league_key, {})[compact_key(player.name)] = (
                 "mine" if player.on_my_team else "rostered",
                 player.fantasy_team,
             )
+            if player.on_my_team:
+                self._my_lineup_slots.setdefault(player.league_key, {})[
+                    compact_key(player.name)
+                ] = player.lineup_slot
+                self._my_starter_membership.setdefault(player.league_key, {})[
+                    compact_key(player.name)
+                ] = player.is_fantasy_starter
 
     @staticmethod
     def _is_active(record: dict[str, Any]) -> bool:
@@ -409,6 +439,12 @@ class DepthCharts:
                 subject_state=state,
                 subject_owner=owner,
                 subject_depth_order=order,
+                subject_lineup_slot=self._my_lineup_slots.get(league.key, {}).get(
+                    compact_key(subject_name), ""
+                ),
+                subject_fantasy_starter=self._my_starter_membership.get(
+                    league.key, {}
+                ).get(compact_key(subject_name)),
                 capacity=snapshot.capacities.get(league.key),
                 scoring_format=snapshot.scoring_formats.get(league.key, ""),
             )

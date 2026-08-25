@@ -15,7 +15,12 @@ import math
 import queue
 import threading
 import time
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import (
+    Future,
+    ThreadPoolExecutor,
+    TimeoutError as FutureTimeoutError,
+    as_completed,
+)
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -34,6 +39,7 @@ from .dedupe import (
 from .daily_recap import format_daily_recap
 from .embeddings import INPUT_VERSION, EmbeddingService
 from .event_store import EventStore
+from .fantasypros_corpus import FantasyProsCorpusManager
 from .health import HEALTH, age_label, duration_label
 from .logging_utils import NotifierError, structured_log
 from .matcher import compact_key, name_from_rotowire_url
@@ -47,6 +53,12 @@ from .sources import rotowire, sleeper
 from .sources.fantasypros import FantasyProsCache
 from .sources.twitter import TwitterStream
 from .telegram_control import TelegramControl
+from .urgency import (
+    POLICY_VERSION,
+    UrgencyService,
+    assess_rule_urgency,
+    canonical_urgency_event,
+)
 from .waiver_schedule import WaiverReportCoordinator
 
 # X is the origin for most breaking news; RotoWire writes it up 1-5 minutes
@@ -73,6 +85,10 @@ ROSTER_STALE_HOURS = 36
 PLAYER_INDEX_REFRESH_SECONDS = sleeper.PLAYER_INDEX_TTL_SECONDS
 PLAYER_INDEX_RETRY_SECONDS = 15 * 60
 JIT_ROSTER_REFRESH_MIN_SECONDS = 60
+# Live ownership normally returns well inside this budget. If a provider is
+# degraded, deliver the news without stale ADD/START advice while the isolated
+# refresh finishes in the background for the next report.
+JIT_ROSTER_WAIT_SECONDS = 5.0
 FANTASYPROS_RETRY_BASE_SECONDS = 15 * 60
 FANTASYPROS_RETRY_MAX_SECONDS = 6 * 60 * 60
 FANTASYPROS_ENRICHMENT_ERROR_LOG_SECONDS = 5 * 60
@@ -296,6 +312,43 @@ def _is_active_window(now: datetime) -> bool:
     return stamp.hour in ACTIVE_WINDOWS.get(stamp.weekday(), range(0))
 
 
+def _canonicalize_classification(
+    item: NewsItem,
+    classification: Classification,
+) -> Classification:
+    """Apply deterministic transaction/clearance semantics to model labels."""
+    canonical = canonical_urgency_event(item, classification)
+    forced_direction = (
+        "positive"
+        if canonical == "return"
+        or (
+            canonical == "signing"
+            and classification.event_type == "release"
+        )
+        else "negative"
+        if canonical in {"injury", "inactive", "release", "suspension"}
+        else ""
+    )
+    current_direction = str(classification.raw.get("direction") or "unknown")
+    if (
+        canonical == classification.event_type
+        and (not forced_direction or forced_direction == current_direction)
+    ):
+        return classification
+    direction = forced_direction or current_direction
+    return replace(
+        classification,
+        event_type=canonical,
+        raw={
+            **classification.raw,
+            "model_event_type": classification.event_type,
+            "event_type": canonical,
+            "direction": direction,
+            "event_correction": "deterministic",
+        },
+    )
+
+
 class Notifier:
     def __init__(self, config: Config) -> None:
         self.config = config
@@ -318,6 +371,11 @@ class Notifier:
         self.outbox = DeliveryOutbox(config.state_dir)
         self.events = EventStore(config.state_dir, in_memory=config.dry_run)
         self.embeddings = EmbeddingService.from_config(self.events, config)
+        self.urgency = UrgencyService.from_config(
+            self.events,
+            self.embeddings,
+            config,
+        )
         self.fantasypros = FantasyProsCache(
             config.state_dir,
             "" if config.dry_run else getattr(config, "fantasypros_api_key", ""),
@@ -331,12 +389,64 @@ class Notifier:
             ),
         )
         self._fantasypros_thread: threading.Thread | None = None
+        self.fantasypros_corpus = FantasyProsCorpusManager(
+            self.events,
+            self.fantasypros,
+            enabled=bool(
+                getattr(config, "fantasypros_corpus_enabled", False)
+            ),
+            openrouter_api_key=str(
+                getattr(config, "openrouter_api_key", "")
+            ),
+            embedding_model=str(
+                getattr(config, "embedding_model", "qwen/qwen3-embedding-8b")
+            ),
+            embedding_dimensions=int(
+                getattr(config, "embedding_dimensions", 512)
+            ),
+            embedding_timeout_seconds=int(
+                getattr(config, "embedding_timeout_seconds", 8)
+            ),
+            target_items=int(
+                getattr(config, "fantasypros_corpus_target", 5000)
+            ),
+            max_requests=int(
+                getattr(config, "fantasypros_corpus_max_requests", 300)
+            ),
+            live_request_reserve=int(
+                getattr(config, "fantasypros_corpus_live_reserve", 75)
+            ),
+            player_limit=int(
+                getattr(config, "fantasypros_corpus_player_limit", 250)
+            ),
+            embedding_budget_usd=float(
+                getattr(
+                    config,
+                    "fantasypros_corpus_embedding_budget_usd",
+                    0.25,
+                )
+            ),
+            embedding_price_per_million_usd=float(
+                getattr(
+                    config,
+                    "fantasypros_corpus_embedding_price_per_million_usd",
+                    0.01,
+                )
+            ),
+        )
+        self._fantasypros_corpus_thread: threading.Thread | None = None
         self._state_lock = threading.RLock()
         self._delivery_lock = threading.RLock()
         self._inflight_items: dict[NewsItem, float] = {}
         self.snapshot: RosterSnapshot = load_snapshot(config)
         self._snapshot_mtime = snapshot_mtime(config)
         self._jit_roster_lock = threading.Lock()
+        self._jit_roster_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="roster-jit",
+        )
+        self._jit_roster_future: Future[bool] | None = None
+        self._jit_roster_future_keys: frozenset[str] = frozenset()
         self._last_jit_roster_refresh = 0.0
         self._last_jit_roster_success = 0.0
         self._last_jit_roster_attempt_keys: frozenset[str] = frozenset()
@@ -467,7 +577,7 @@ class Notifier:
         self,
         league_keys: set[str] | None = None,
     ) -> bool:
-        """Refresh drafted-league ownership before evaluating a waiver candidate."""
+        """Refresh drafted ownership within a bounded breaking-news budget."""
         with self._state_lock:
             drafted_keys = {league.key for league in self.snapshot.drafted_leagues()}
         requested_keys = frozenset(
@@ -475,80 +585,160 @@ class Notifier:
         )
         if not requested_keys:
             return False
-        now = time.time()
-        if (
-            now - self._last_jit_roster_success < JIT_ROSTER_REFRESH_MIN_SECONDS
-            and requested_keys.issubset(self._last_jit_roster_success_keys)
-        ):
-            return True
-        if (
-            now - self._last_jit_roster_refresh < JIT_ROSTER_REFRESH_MIN_SECONDS
-            and requested_keys.issubset(self._last_jit_roster_attempt_keys)
-        ):
-            return False
         with self._jit_roster_lock:
             now = time.time()
             if (
-                now - self._last_jit_roster_success < JIT_ROSTER_REFRESH_MIN_SECONDS
-                and requested_keys.issubset(self._last_jit_roster_success_keys)
+                now - getattr(self, "_last_jit_roster_success", 0.0)
+                < JIT_ROSTER_REFRESH_MIN_SECONDS
+                and requested_keys.issubset(
+                    getattr(self, "_last_jit_roster_success_keys", frozenset())
+                )
             ):
                 return True
+
+            active = getattr(self, "_jit_roster_future", None)
+            if active is not None and not active.done():
+                if not requested_keys.issubset(
+                    getattr(self, "_jit_roster_future_keys", frozenset())
+                ):
+                    # One isolated provider refresh is already in progress.
+                    # Do not queue unrelated news behind it; fail closed and
+                    # let the next report use the completed snapshot.
+                    return False
+                future = active
+            else:
+                future = None
+
             if (
-                now - self._last_jit_roster_refresh < JIT_ROSTER_REFRESH_MIN_SECONDS
-                and requested_keys.issubset(self._last_jit_roster_attempt_keys)
+                future is None
+                and now - getattr(self, "_last_jit_roster_refresh", 0.0)
+                < JIT_ROSTER_REFRESH_MIN_SECONDS
+                and requested_keys.issubset(
+                    getattr(self, "_last_jit_roster_attempt_keys", frozenset())
+                )
             ):
                 return False
-            # Throttle failures as well as successes; an outage should not make
-            # every simultaneous breaking-news worker hammer active providers.
-            if now - self._last_jit_roster_refresh < JIT_ROSTER_REFRESH_MIN_SECONDS:
-                self._last_jit_roster_attempt_keys = frozenset(
-                    set(self._last_jit_roster_attempt_keys) | set(requested_keys)
-                )
-            else:
-                self._last_jit_roster_attempt_keys = requested_keys
-            self._last_jit_roster_refresh = now
-            try:
-                with self._state_lock:
-                    previous = self.snapshot
-                snapshot, written_version = refresh_drafted_snapshot(
-                    self.config,
-                    previous,
-                    league_keys=set(requested_keys),
-                )
-            except Exception as error:  # noqa: BLE001 - keep the alert path alive
-                HEALTH.mark("roster", ok=False, detail=str(error))
-                structured_log(logging.WARNING, "roster.jit_refresh_failed", error=str(error))
-                return False
 
-            with self._state_lock:
-                self.snapshot = snapshot
-                self._snapshot_mtime = written_version
-                self.preseason = not snapshot.drafted_leagues()
-                self.depth = DepthCharts(self._player_index, snapshot)
-                succeeded_at = time.time()
+            if future is None:
+                # Throttle failures as well as successes; an outage should not
+                # make every simultaneous worker hammer active providers.
                 if (
-                    succeeded_at - self._last_jit_roster_success
+                    now - getattr(self, "_last_jit_roster_refresh", 0.0)
                     < JIT_ROSTER_REFRESH_MIN_SECONDS
                 ):
-                    self._last_jit_roster_success_keys = frozenset(
-                        set(self._last_jit_roster_success_keys)
+                    self._last_jit_roster_attempt_keys = frozenset(
+                        set(
+                            getattr(
+                                self,
+                                "_last_jit_roster_attempt_keys",
+                                frozenset(),
+                            )
+                        )
                         | set(requested_keys)
                     )
                 else:
-                    self._last_jit_roster_success_keys = requested_keys
-                self._last_jit_roster_success = succeeded_at
+                    self._last_jit_roster_attempt_keys = requested_keys
+                self._last_jit_roster_refresh = now
+                self._jit_roster_future_keys = requested_keys
+                try:
+                    executor = getattr(self, "_jit_roster_executor", None)
+                    if executor is None:
+                        executor = ThreadPoolExecutor(
+                            max_workers=1,
+                            thread_name_prefix="roster-jit",
+                        )
+                        self._jit_roster_executor = executor
+                    future = executor.submit(
+                        self._perform_jit_roster_refresh,
+                        requested_keys,
+                    )
+                except RuntimeError:
+                    return False
+                self._jit_roster_future = future
+
+        try:
+            return bool(future.result(timeout=JIT_ROSTER_WAIT_SECONDS))
+        except FutureTimeoutError:
             HEALTH.mark(
                 "roster",
-                ok=True,
-                detail=f"just-in-time; {len(snapshot.leagues)} leagues",
+                ok=False,
+                detail="just-in-time refresh still pending; actions withheld",
             )
             structured_log(
-                logging.INFO,
-                "roster.jit_refreshed",
-                leagueCount=len(snapshot.leagues),
-                playerCount=len(snapshot.players),
+                logging.WARNING,
+                "roster.jit_refresh_timed_out",
+                waitSeconds=JIT_ROSTER_WAIT_SECONDS,
             )
-            return True
+            return False
+        except Exception as error:  # noqa: BLE001 - fail closed on worker failure
+            HEALTH.mark("roster", ok=False, detail=type(error).__name__)
+            structured_log(
+                logging.WARNING,
+                "roster.jit_refresh_failed",
+                errorType=type(error).__name__,
+            )
+            return False
+
+    def _perform_jit_roster_refresh(
+        self,
+        requested_keys: frozenset[str],
+    ) -> bool:
+        """Fetch and atomically install one provider-scoped roster snapshot."""
+        try:
+            with self._state_lock:
+                previous = self.snapshot
+            snapshot, written_version = refresh_drafted_snapshot(
+                self.config,
+                previous,
+                league_keys=set(requested_keys),
+            )
+        except Exception as error:  # noqa: BLE001 - keep the alert path alive
+            HEALTH.mark("roster", ok=False, detail=type(error).__name__)
+            structured_log(
+                logging.WARNING,
+                "roster.jit_refresh_failed",
+                errorType=type(error).__name__,
+            )
+            return False
+
+        with self._state_lock:
+            self.snapshot = snapshot
+            self._snapshot_mtime = written_version
+            self.preseason = not snapshot.drafted_leagues()
+            self.depth = DepthCharts(self._player_index, snapshot)
+
+        with self._jit_roster_lock:
+            succeeded_at = time.time()
+            if (
+                succeeded_at - getattr(self, "_last_jit_roster_success", 0.0)
+                < JIT_ROSTER_REFRESH_MIN_SECONDS
+            ):
+                self._last_jit_roster_success_keys = frozenset(
+                    set(
+                        getattr(
+                            self,
+                            "_last_jit_roster_success_keys",
+                            frozenset(),
+                        )
+                    )
+                    | set(requested_keys)
+                )
+            else:
+                self._last_jit_roster_success_keys = requested_keys
+            self._last_jit_roster_success = succeeded_at
+
+        HEALTH.mark(
+            "roster",
+            ok=True,
+            detail=f"just-in-time; {len(snapshot.leagues)} leagues",
+        )
+        structured_log(
+            logging.INFO,
+            "roster.jit_refreshed",
+            leagueCount=len(snapshot.leagues),
+            playerCount=len(snapshot.players),
+        )
+        return True
 
     def _waiver_snapshot(self) -> RosterSnapshot:
         with self._state_lock:
@@ -698,6 +888,23 @@ class Notifier:
         )
         self._fantasypros_thread.start()
 
+    def _start_fantasypros_corpus_worker(self) -> None:
+        """Grow the reference corpus without entering the alert hot path."""
+        if not self.fantasypros_corpus.enabled or not self.fantasypros.enabled:
+            return
+        if (
+            self._fantasypros_corpus_thread is not None
+            and self._fantasypros_corpus_thread.is_alive()
+        ):
+            return
+        self._fantasypros_corpus_thread = threading.Thread(
+            target=self.fantasypros_corpus.run_forever,
+            args=(self._stop,),
+            name="fantasypros-corpus",
+            daemon=True,
+        )
+        self._fantasypros_corpus_thread.start()
+
     # ---------- evaluation ----------
 
     @staticmethod
@@ -768,6 +975,40 @@ class Notifier:
             )
         except Exception as error:  # noqa: BLE001 - journal must not block alerts
             structured_log(logging.WARNING, "events.outcome_failed", error=str(error))
+
+    def _journal_urgency(self, alert: Alert) -> None:
+        if (
+            alert.urgency is None
+            or getattr(self.config, "dry_run", False)
+            or not hasattr(self, "events")
+        ):
+            return
+        try:
+            self.events.record_urgency(alert.item, alert.urgency)
+        except Exception as error:  # noqa: BLE001 - urgency cannot block alerts
+            structured_log(
+                logging.WARNING,
+                "events.urgency_failed",
+                errorType=type(error).__name__,
+            )
+
+    def _assess_alert_urgency(self, alert: Alert) -> Alert:
+        """Attach rule urgency plus optional historical vector support."""
+        service = getattr(self, "urgency", None)
+        if service is None:
+            assessed = replace(alert, urgency=assess_rule_urgency(alert))
+        else:
+            try:
+                assessed = service.assess(alert)
+            except Exception as error:  # noqa: BLE001 - rules are the fallback
+                structured_log(
+                    logging.WARNING,
+                    "urgency.assessment_failed",
+                    errorType=type(error).__name__,
+                )
+                assessed = replace(alert, urgency=assess_rule_urgency(alert))
+        self._journal_urgency(assessed)
+        return assessed
 
     def _recent_news_context(self, item: NewsItem) -> str:
         """Compact, structured history for trajectory-aware classification."""
@@ -863,10 +1104,12 @@ class Notifier:
                     "subject_attribution": "uncertain",
                 },
             )
+        else:
+            classification = _canonicalize_classification(item, classification)
 
         per_league = plays_for_event(
             per_league,
-            classification.event_type,
+            canonical_urgency_event(item, classification),
             classification.severity,
         )
         if not item.subject_confident:
@@ -878,11 +1121,18 @@ class Notifier:
                 for plays in per_league
             ]
         availability_refresh_failed = False
-        # Refresh whenever this event has a next-man-up candidate, even when
-        # the cached snapshot says that candidate is rostered. A player may
-        # have been dropped since the scheduled snapshot and become claimable.
-        if any(plays.beneficiaries for plays in per_league) and not self.config.dry_run:
-            if self._refresh_ownership_just_in_time():
+        # Urgency depends on both live claimability and whether the subject is
+        # currently in this manager's starting lineup. Refresh either case;
+        # the provider-aware helper is throttled and touches drafted leagues
+        # only, so a pre-draft Sleeper league cannot block an active ESPN one.
+        refresh_league_keys = {
+            plays.league.key
+            for plays in per_league
+            if item.subject_confident
+            and (plays.subject_state == "mine" or plays.beneficiaries)
+        }
+        if refresh_league_keys and not self.config.dry_run:
+            if self._refresh_ownership_just_in_time(refresh_league_keys):
                 # Rebuild from one coherent, just-fetched state pair before an
                 # ADD line or free-agent tag can be emitted.
                 with self._state_lock:
@@ -896,7 +1146,7 @@ class Notifier:
                     )
                     per_league = plays_for_event(
                         refreshed_plays,
-                        classification.event_type,
+                        canonical_urgency_event(item, classification),
                         classification.severity,
                     )
                 else:
@@ -905,14 +1155,41 @@ class Notifier:
                 availability_refresh_failed = True
 
             if availability_refresh_failed:
-                # Fail closed. The report itself can still alert, and owned
-                # players may still have a safe bench substitution, but stale
-                # ownership can never produce ADD/FA advice.
-                per_league = [replace(plays, beneficiaries=[]) for plays in per_league]
+                # Fail closed. The report itself can still alert, but stale
+                # ownership/lineup data cannot produce ADD or START advice.
+                per_league = [
+                    replace(plays, beneficiaries=[], bench_options=[])
+                    for plays in per_league
+                ]
         # Cache-only enrichment happens after the live ownership rebuild. It
         # cannot delay, suppress, or create a pickup recommendation.
         per_league = self._enrich_fantasypros(per_league)
         tier = self._tier_for(per_league) if per_league else "league"
+
+        # Build and assess before the alert threshold so the searchable
+        # archive learns from lower-priority reports too. Urgency never changes
+        # whether a report passes the existing severity/noise gate.
+        relevant = [
+            plays
+            for plays in per_league
+            if plays.has_action or plays.subject_state == "mine"
+        ]
+        context = (
+            depth.team_context(record, snapshot)
+            if depth is not None and record is not None
+            else None
+        )
+        alert = self._assess_alert_urgency(
+            Alert(
+                item=item,
+                classification=classification,
+                tier=tier,
+                per_league=relevant,
+                context=context,
+                all_leagues=snapshot.drafted_leagues(),
+                availability_refresh_failed=availability_refresh_failed,
+            )
+        )
 
         threshold = self._threshold_for(
             tier,
@@ -934,27 +1211,6 @@ class Notifier:
                 threshold=threshold,
             )
             return None
-
-        # Only show leagues where there is something to do or something at stake.
-        relevant = [
-            plays
-            for plays in per_league
-            if plays.has_action or plays.subject_state == "mine"
-        ]
-        context = (
-            depth.team_context(record, snapshot)
-            if depth is not None and record is not None
-            else None
-        )
-        alert = Alert(
-            item=item,
-            classification=classification,
-            tier=tier,
-            per_league=relevant,
-            context=context,
-            all_leagues=snapshot.drafted_leagues(),
-            availability_refresh_failed=availability_refresh_failed,
-        )
         self._journal_classification(
             item,
             classification,
@@ -1011,6 +1267,20 @@ class Notifier:
                     "subject_attribution": "uncertain",
                 },
             )
+        else:
+            classification = _canonicalize_classification(item, classification)
+        alert = self._assess_alert_urgency(
+            Alert(
+                item=item,
+                classification=classification,
+                tier="preseason",
+                per_league=[],
+                context=depth.team_context(record, snapshot)
+                if depth is not None
+                else None,
+                all_leagues=snapshot.drafted_leagues(),
+            )
+        )
         if classification.severity < PRESEASON_MIN_SEVERITY:
             self._journal_classification(
                 item,
@@ -1019,17 +1289,6 @@ class Notifier:
                 outcome="filtered_threshold",
             )
             return None
-
-        alert = Alert(
-            item=item,
-            classification=classification,
-            tier="preseason",
-            per_league=[],
-            context=depth.team_context(record, snapshot)
-            if depth is not None
-            else None,
-            all_leagues=snapshot.drafted_leagues(),
-        )
         self._journal_classification(
             item,
             classification,
@@ -1296,26 +1555,42 @@ class Notifier:
         """Refresh backup eligibility before retrying a persisted alert."""
         alert = replace(pending.alert, delivery_delayed=True)
         needs_ownership = alert.availability_refresh_failed or any(
-            plays.beneficiaries for plays in alert.per_league
+            plays.subject_state == "mine" or plays.beneficiaries
+            for plays in alert.per_league
         )
         if not needs_ownership:
-            return alert
+            return self._assess_alert_urgency(alert)
 
-        if not self._refresh_ownership_just_in_time():
-            return replace(
-                alert,
-                per_league=[replace(plays, beneficiaries=[]) for plays in alert.per_league],
-                availability_refresh_failed=True,
+        refresh_league_keys = {
+            plays.league.key
+            for plays in alert.per_league
+            if plays.subject_state == "mine" or plays.beneficiaries
+        }
+        if not self._refresh_ownership_just_in_time(refresh_league_keys or None):
+            return self._assess_alert_urgency(
+                replace(
+                    alert,
+                    per_league=[
+                        replace(plays, beneficiaries=[], bench_options=[])
+                        for plays in alert.per_league
+                    ],
+                    availability_refresh_failed=True,
+                )
             )
 
         with self._state_lock:
             snapshot = self.snapshot
             depth = self.depth
         if depth is None:
-            return replace(
-                alert,
-                per_league=[replace(plays, beneficiaries=[]) for plays in alert.per_league],
-                availability_refresh_failed=True,
+            return self._assess_alert_urgency(
+                replace(
+                    alert,
+                    per_league=[
+                        replace(plays, beneficiaries=[], bench_options=[])
+                        for plays in alert.per_league
+                    ],
+                    availability_refresh_failed=True,
+                )
             )
 
         names = (
@@ -1329,7 +1604,7 @@ class Notifier:
         )
         per_league = plays_for_event(
             per_league,
-            alert.classification.event_type,
+            canonical_urgency_event(alert.item, alert.classification),
             alert.classification.severity,
         )
         per_league = self._enrich_fantasypros(per_league)
@@ -1339,13 +1614,15 @@ class Notifier:
             if plays.has_action or plays.subject_state == "mine"
         ]
         context = depth.team_context(record, snapshot) if record is not None else None
-        return replace(
-            alert,
-            tier=self._tier_for(per_league) if per_league else "league",
-            per_league=relevant,
-            context=context,
-            all_leagues=snapshot.drafted_leagues(),
-            availability_refresh_failed=False,
+        return self._assess_alert_urgency(
+            replace(
+                alert,
+                tier=self._tier_for(per_league) if per_league else "league",
+                per_league=relevant,
+                context=context,
+                all_leagues=snapshot.drafted_leagues(),
+                availability_refresh_failed=False,
+            )
         )
 
     def _attempt_pending_locked(
@@ -1354,6 +1631,7 @@ class Notifier:
         *,
         force_semantic: bool = False,
         replay: bool = False,
+        revalidated_alert: Alert | None = None,
     ) -> int:
         """Try one persisted alert. Caller serializes delivery decisions."""
         current = self.outbox.get(pending.delivery_id)
@@ -1363,6 +1641,11 @@ class Notifier:
             # detached object or attempt to reschedule it.
             return 0
         pending = current
+        if revalidated_alert is not None:
+            # Retry roster I/O happens before taking the global delivery lock.
+            # Refetching above proves this intent still exists; update the live
+            # object so a failed send persists the revalidated safe version.
+            pending.alert = revalidated_alert
         superseding = self._pending_superseding_alert(pending)
         if superseding is not None:
             newer, was_delivered = superseding
@@ -1377,7 +1660,7 @@ class Notifier:
                     tier=pending.alert.tier,
                 )
             return 0
-        if pending.attempts > 0 or replay:
+        if revalidated_alert is None and (pending.attempts > 0 or replay):
             pending.alert = self._revalidate_delayed_alert(pending)
 
         alert = pending.alert
@@ -1460,6 +1743,11 @@ class Notifier:
                         alert,
                         active_message_id=(active_target or (0, ""))[0],
                         active_alert_token=(active_target or (0, ""))[1],
+                        # Urgency already consumed this report's one bounded
+                        # wait for the shared in-flight vector. Coalescing may
+                        # reuse a completed/cache hit, but it must not spend a
+                        # second EMBEDDING_WAIT_MS on the same alert.
+                        wait_for_vector=False,
                     )
                 except Exception as error:  # noqa: BLE001 - delivery fails open
                     structured_log(
@@ -1513,8 +1801,19 @@ class Notifier:
             return 0
         sent = 0
         for pending in self.outbox.due():
+            current = self.outbox.get(pending.delivery_id)
+            if current is None:
+                continue
+            # Provider refresh can take seconds during an outage. It must not
+            # hold the one lock that serializes Telegram sends and semantic
+            # commits for otherwise unrelated breaking news.
+            revalidated = self._revalidate_delayed_alert(current)
             with self._delivery_lock:
-                sent += self._attempt_pending_locked(pending, replay=True)
+                sent += self._attempt_pending_locked(
+                    current,
+                    replay=True,
+                    revalidated_alert=revalidated,
+                )
         return sent
 
     def _evaluate_future(self, item: NewsItem, future: Future) -> int:
@@ -1686,6 +1985,17 @@ class Notifier:
                 f"{embedding_status.failures} failures"
             )
 
+        urgency_status = self.urgency.status()
+        urgency_mode = (
+            "corroborate+lift" if self.urgency.allow_lift else "corroborate"
+        )
+        lines.append(
+            f"Urgency: {POLICY_VERSION} {urgency_mode} · "
+            f"{urgency_status.assessed} assessed · "
+            f"{urgency_status.corroborated} history-supported · "
+            f"{urgency_status.lifted} lifted · {urgency_status.failures} failures"
+        )
+
         fantasypros = self.fantasypros.status()
         if not fantasypros.enabled:
             fp_label = (
@@ -1707,6 +2017,18 @@ class Notifier:
                 f"FantasyPros cache: {state} · {len(fantasypros.datasets_fresh)} "
                 f"fresh · {fantasypros.requests_used}/{fantasypros.request_cap} "
                 f"requests/24h · last fetch {last}"
+            )
+
+        corpus_manager = getattr(self, "fantasypros_corpus", None)
+        corpus = corpus_manager.status() if corpus_manager is not None else None
+        if corpus is not None and corpus.enabled:
+            corpus_state = "SYNCING" if corpus.running else (
+                "ERROR" if corpus.last_error else "OK"
+            )
+            lines.append(
+                f"FantasyPros corpus: {corpus_state} · "
+                f"{corpus.corpus_items} reports · {corpus.embedded_items} vectors · "
+                f"est. ${corpus.estimated_cost_usd:.4f}"
             )
 
         sleeper_stamp = getattr(player_index, "refreshed_at", None)
@@ -1877,6 +2199,14 @@ class Notifier:
         self.fantasypros.close()
         if self._fantasypros_thread is not None:
             self._fantasypros_thread.join(timeout=2)
+        if self._fantasypros_corpus_thread is not None:
+            self._fantasypros_corpus_thread.join(
+                timeout=max(
+                    5,
+                    int(getattr(self.config, "embedding_timeout_seconds", 8))
+                    + 3,
+                )
+            )
         if self.twitter is not None:
             self.twitter.stop()
         if self._twitter_dispatcher is not None:
@@ -1886,6 +2216,7 @@ class Notifier:
         # write against a closed connection.
         self._pool.shutdown(wait=True, cancel_futures=True)
         self._twitter_pool.shutdown(wait=True, cancel_futures=True)
+        self._jit_roster_executor.shutdown(wait=True, cancel_futures=True)
         self.embeddings.close()
         self.session.close()
         try:
@@ -1905,6 +2236,7 @@ class Notifier:
 
     def run_forever(self) -> None:
         embedding_service = getattr(self, "embeddings", None)
+        urgency_service = getattr(self, "urgency", None)
         structured_log(
             logging.INFO,
             "notifier.started",
@@ -1921,9 +2253,19 @@ class Notifier:
                 if embedding_service is not None and embedding_service.enabled
                 else "disabled"
             ),
+            urgencyPolicy=POLICY_VERSION,
+            urgencyEmbeddingLift=bool(
+                getattr(urgency_service, "allow_lift", False)
+            ),
             fantasyProsEnabled=self.fantasypros.enabled,
+            fantasyProsCorpusEnabled=bool(
+                getattr(getattr(self, "fantasypros_corpus", None), "enabled", False)
+            ),
         )
         self._start_fantasypros_refresher()
+        corpus_starter = getattr(self, "_start_fantasypros_corpus_worker", None)
+        if corpus_starter is not None:
+            corpus_starter()
         if (
             (
                 self.config.telegram_controls_enabled

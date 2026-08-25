@@ -467,9 +467,11 @@ class EmbeddingService:
             text = canonical_embedding_text(item)
             if (
                 row.get("embedding_model") != self.model
+                or not str(row.get("embedding_provider") or "").strip()
                 or int(row.get("embedding_dimensions") or 0) != self.dimensions
                 or row.get("embedding_input_version") != INPUT_VERSION
                 or row.get("embedding_input_hash") != embedding_input_hash(text)
+                or not str(row.get("embedding_at") or "").strip()
             ):
                 return None
             values = unpack_vector(bytes(row["embedding"]), dimensions=self.dimensions)
@@ -477,7 +479,7 @@ class EmbeddingService:
             return None
         return EmbeddingVector(
             model=self.model,
-            provider=str(row.get("embedding_provider") or "openrouter"),
+            provider=str(row["embedding_provider"]).strip(),
             dimensions=self.dimensions,
             input_version=INPUT_VERSION,
             input_hash=embedding_input_hash(text),
@@ -546,7 +548,18 @@ class EmbeddingService:
                 if self._futures.get(report_id) is future:
                     self._futures.pop(report_id, None)
 
-    def _current_vector(self, item: NewsItem) -> EmbeddingVector | None:
+    def current_vector(
+        self,
+        item: NewsItem,
+        *,
+        wait_for_result: bool = True,
+    ) -> EmbeddingVector | None:
+        """Return the archived/in-flight vector without making it mandatory.
+
+        Duplicate coalescing and urgency analysis share this one request and
+        cache. A timeout or provider failure returns ``None`` so both features
+        abstain without delaying or suppressing the notification.
+        """
         cached = self._row_vector(item)
         if cached is not None:
             return cached
@@ -554,13 +567,19 @@ class EmbeddingService:
         with self._lock:
             future = self._futures.get(report_id)
         if future is None:
+            if not wait_for_result:
+                return None
             self.enqueue(item)
             with self._lock:
                 future = self._futures.get(report_id)
         if future is None:
             return None
+        if not wait_for_result and not future.done():
+            return None
         try:
-            return future.result(timeout=self.wait_seconds)
+            return future.result(
+                timeout=self.wait_seconds if wait_for_result else 0
+            )
         except Exception:  # noqa: BLE001 - optional similarity fails open
             return None
 
@@ -570,6 +589,7 @@ class EmbeddingService:
         *,
         active_message_id: int = 0,
         active_alert_token: str = "",
+        wait_for_vector: bool = True,
     ) -> Alert:
         """Attach an edit hint when the vector and structured guard both agree."""
         if (
@@ -578,7 +598,10 @@ class EmbeddingService:
             or not active_alert_token
         ):
             return alert
-        current = self._current_vector(alert.item)
+        current = self.current_vector(
+            alert.item,
+            wait_for_result=wait_for_vector,
+        )
         if current is None:
             return alert
         try:

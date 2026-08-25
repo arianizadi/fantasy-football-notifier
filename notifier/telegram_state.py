@@ -64,6 +64,7 @@ class TelegramEditTarget:
     message_id: int
     token: str
     severity: int
+    urgency_level: str = ""
 
 
 def alert_token(report: NewsItem | str) -> str:
@@ -321,6 +322,7 @@ class TelegramState:
                     "token": candidate_token,
                     "eventType": candidate_metadata["eventType"],
                     "severity": candidate_severity,
+                    "urgencyLevel": str(digest.get("urgencyLevel") or ""),
                     "eventStatus": candidate_metadata["eventStatus"],
                     "eventFactSignature": candidate_metadata[
                         "eventFactSignature"
@@ -559,6 +561,7 @@ class TelegramState:
                 message_id=message_id,
                 token=token,
                 severity=previous_severity,
+                urgency_level=str(entry.get("urgencyLevel") or ""),
             )
 
     def _register_feedback_target_locked(
@@ -580,6 +583,7 @@ class TelegramState:
                 str(alert.classification.raw.get("event_type") or ""),
             ),
             "severity": alert.classification.severity,
+            "urgencyLevel": alert.urgency.level if alert.urgency is not None else "",
             "headline": alert.item.headline[:220],
             "recordedAt": recorded_at,
         }
@@ -608,8 +612,14 @@ class TelegramState:
             targets = {key: targets[key] for key in keep}
         self._payload["feedbackTargets"] = targets
 
-    def record_sent(self, alert: Alert, message_id: int) -> str:
-        """Advance a player's reply chain and add the alert to the daily digest."""
+    def record_sent(self, alert: Alert, message_id: int) -> str | None:
+        """Commit a sent alert to local state, returning its token on success.
+
+        Telegram has already accepted the message when this runs. Returning
+        ``None`` tells delivery to retain its durable outbox intent and retry;
+        local reply, digest, and feedback state must not advance only in memory
+        when the atomic state-file write failed.
+        """
         token = alert_token(alert.item)
         now = time.time()
         player = (alert.item.player_name or "League news").strip()
@@ -627,6 +637,7 @@ class TelegramState:
             "player": player,
             "eventType": normalized_event,
             "severity": alert.classification.severity,
+            "urgencyLevel": alert.urgency.level if alert.urgency is not None else "",
             "eventStatus": status,
             "eventFactSignature": fact_signature,
             "tier": alert.tier,
@@ -639,6 +650,7 @@ class TelegramState:
             ),
         }
         with self._lock:
+            previous_payload = copy.deepcopy(self._payload)
             key = compact_key(alert.item.player_name)
             if key:
                 self._payload["threads"][key] = {
@@ -648,6 +660,9 @@ class TelegramState:
                     "token": token,
                     "eventType": normalized_event,
                     "severity": alert.classification.severity,
+                    "urgencyLevel": (
+                        alert.urgency.level if alert.urgency is not None else ""
+                    ),
                     "eventStatus": status,
                     "eventFactSignature": fact_signature,
                     "latestHeadline": alert.item.headline[:220],
@@ -667,7 +682,18 @@ class TelegramState:
                 if float(entry.get("sentAt") or 0) >= cutoff
             ]
             self._payload["lastTelegramSuccess"] = now
-            self._save_locked()
+            try:
+                saved = self._save_locked()
+            except Exception as error:  # noqa: BLE001 - roll back in-memory state
+                structured_log(
+                    logging.WARNING,
+                    "telegram.sent_state_write_failed",
+                    errorType=type(error).__name__,
+                )
+                saved = False
+            if not saved:
+                self._payload = previous_payload
+                return None
         return token
 
     def record_edited(
@@ -738,6 +764,9 @@ class TelegramState:
                     "token": new_token,
                     "eventType": normalized_event,
                     "severity": alert.classification.severity,
+                    "urgencyLevel": (
+                        alert.urgency.level if alert.urgency is not None else ""
+                    ),
                     "eventStatus": status,
                     "eventFactSignature": fact_signature,
                     "latestHeadline": alert.item.headline[:220],
@@ -750,6 +779,9 @@ class TelegramState:
                     "player": (alert.item.player_name or "League news").strip(),
                     "eventType": normalized_event,
                     "severity": alert.classification.severity,
+                    "urgencyLevel": (
+                        alert.urgency.level if alert.urgency is not None else ""
+                    ),
                     "eventStatus": status,
                     "eventFactSignature": fact_signature,
                     "tier": alert.tier,

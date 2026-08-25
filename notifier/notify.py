@@ -26,6 +26,7 @@ from .telegram_state import (
     feedback_markup,
     feedback_markup_for_token,
 )
+from .urgency import urgency_rank, urgency_reason
 
 API_BASE = "https://api.telegram.org"
 REQUEST_TIMEOUT = 15
@@ -62,6 +63,12 @@ EVENT_LABEL = {
     "depth_chart": "DEPTH CHART",
     "usage": "ROLE / USAGE",
     "other": "UPDATE",
+}
+
+URGENCY_DISPLAY = {
+    "act_now": ("🚨", "ACT NOW"),
+    "act_today": ("⏰", "ACT TODAY"),
+    "monitor": ("👀", "MONITOR"),
 }
 
 def _escape(value: str) -> str:
@@ -646,6 +653,15 @@ def format_alert(alert: Alert) -> str:
     head += "</b>"
 
     lines = [head, f"<b>{_escape(event)}</b> · {_escape(item.headline)}"]
+    urgency = alert.urgency
+    urgency_display = URGENCY_DISPLAY.get(urgency.level if urgency is not None else "")
+    if urgency is not None and urgency_display is not None:
+        urgency_icon, urgency_label = urgency_display
+        reason = urgency_reason(urgency)
+        urgency_line = f"{urgency_icon} <b>{urgency_label}</b>"
+        if reason:
+            urgency_line += f" · {_escape(reason)}"
+        lines.append(urgency_line)
     warning_lines: list[str] = []
     if alert.delivery_delayed:
         warning_lines.append(
@@ -771,6 +787,32 @@ def format_alert(alert: Alert) -> str:
         lines += ["", f"🔗 {source_line}"]
 
     return _fit_telegram_limit("\n".join(lines).strip())
+
+
+def _preserve_unverified_edit_urgency(
+    alert: Alert,
+    prior_level: str,
+) -> Alert:
+    """Keep an existing stronger banner only when live facts are unavailable.
+
+    A provider outage is not evidence that an earlier action stopped being
+    urgent. Genuine roster or status resolution is different: those updates
+    arrive with verified availability and must be allowed to lower urgency.
+    ``coalescing_target`` has already proved that this is the same event,
+    status, and concrete fact before this helper is called.
+    """
+    urgency = alert.urgency
+    previous = (prior_level or "").strip().lower()
+    if (
+        urgency is None
+        or not alert.availability_refresh_failed
+        or urgency.availability_verified
+        or "availability_unverified" not in urgency.reason_codes
+        or previous not in URGENCY_DISPLAY
+        or urgency_rank(previous) <= urgency_rank(urgency.level)
+    ):
+        return alert
+    return replace(alert, urgency=replace(urgency, level=previous))
 
 
 _TELEGRAM_STATES: dict[str, TelegramState] = {}
@@ -929,8 +971,15 @@ def send_alert(session: requests.Session, config: Config, alert: Alert) -> int |
     payload: dict = {
         "text": text,
         "link_preview_options": {"is_disabled": True},
-        # Severity 1-2 lands silently; 3+ buzzes the phone.
-        "disable_notification": alert.classification.severity <= 2,
+        # Severity 1-2 normally lands silently, but a verified league action
+        # should still buzz even when the underlying football report is mild.
+        "disable_notification": bool(
+            alert.classification.severity <= 2
+            and (
+                alert.urgency is None
+                or alert.urgency.level not in {"act_now", "act_today"}
+            )
+        ),
     }
     controls_enabled = bool(getattr(config, "telegram_controls_enabled", False))
     if controls_enabled:
@@ -938,14 +987,18 @@ def send_alert(session: requests.Session, config: Config, alert: Alert) -> int |
 
     edit_target = state.coalescing_target(alert)
     if edit_target is not None:
-        # A lower-urgency corroboration may improve the facts but must never
-        # visually downgrade the original alert's severity.
-        display_alert = alert
+        # Preserve the stronger displayed severity for corroboration. Urgency
+        # is preserved much more narrowly: only an unavailable provider may
+        # not erase a still-unresolved warning.
+        display_alert = _preserve_unverified_edit_urgency(
+            alert,
+            edit_target.urgency_level,
+        )
         if alert.classification.severity < edit_target.severity:
             display_alert = replace(
-                alert,
+                display_alert,
                 classification=replace(
-                    alert.classification,
+                    display_alert.classification,
                     severity=edit_target.severity,
                 ),
             )
@@ -988,6 +1041,11 @@ def send_alert(session: requests.Session, config: Config, alert: Alert) -> int |
                 player=alert.item.player_name,
                 tier=alert.tier,
                 severity=alert.classification.severity,
+                urgency=(
+                    display_alert.urgency.level
+                    if display_alert.urgency is not None
+                    else ""
+                ),
                 eventType=alert.classification.event_type,
             )
             return edit_target.message_id
@@ -1003,13 +1061,23 @@ def send_alert(session: requests.Session, config: Config, alert: Alert) -> int |
 
     message_id = _post(session, config, payload)
     if message_id is not None:
-        state.record_sent(alert, message_id)
+        token = state.record_sent(alert, message_id)
+        if token is None:
+            structured_log(
+                logging.ERROR,
+                "notify.sent_not_committed",
+                player=alert.item.player_name,
+                eventType=alert.classification.event_type,
+                messageId=message_id,
+            )
+            return None
         structured_log(
             logging.INFO,
             "notify.sent",
             player=alert.item.player_name,
             tier=alert.tier,
             severity=alert.classification.severity,
+            urgency=(alert.urgency.level if alert.urgency is not None else ""),
             eventType=alert.classification.event_type,
         )
     return message_id

@@ -8,6 +8,27 @@ from datetime import datetime
 from typing import Any
 
 
+NON_STARTER_LINEUP_SLOTS = frozenset(
+    {
+        "BE",
+        "BN",
+        "BENCH",
+        "IR",
+        "RESERVE",
+        "TAXI",
+        "NFL_INACTIVE",
+        "ER",
+        "ROOKIE",
+    }
+)
+
+
+def lineup_slot_is_starter(lineup_slot: str) -> bool:
+    """Best-effort starter inference for snapshots predating the raw fact."""
+    slot = (lineup_slot or "").strip().upper()
+    return bool(slot) and slot not in NON_STARTER_LINEUP_SLOTS
+
+
 @dataclass(frozen=True)
 class NewsItem:
     """A single piece of raw news from an upstream source."""
@@ -82,6 +103,17 @@ class RosterPlayer:
     on_my_team: bool
     fantasy_team: str
     league_key: str
+    # Provider-owned fantasy lineup membership. This is deliberately separate
+    # from ``lineup_slot``: Sleeper can still list a PUP/inactive player in the
+    # user's starting lineup even though that player is not an eligible bench
+    # substitute. ``None`` keeps pre-feature snapshots backward compatible.
+    fantasy_starter: bool | None = None
+
+    @property
+    def is_fantasy_starter(self) -> bool:
+        if self.fantasy_starter is not None:
+            return self.fantasy_starter
+        return lineup_slot_is_starter(self.lineup_slot)
 
     @property
     def can_be_started_from_bench(self) -> bool:
@@ -153,6 +185,39 @@ class Classification:
 
 
 @dataclass(frozen=True)
+class ActionUrgency:
+    """How quickly this manager should review or act on one alert.
+
+    Severity describes the football importance of the report. Urgency is a
+    separate, league-aware decision based on roster role and a currently
+    available action. ``rule_level`` is retained beside the final ``level`` so
+    embedding-assisted history can never recursively train on its own lifts.
+    """
+
+    rule_level: str
+    level: str
+    reason_codes: tuple[str, ...] = ()
+    basis: str = "rules"
+    embedding_delta: int = 0
+    embedding_score: float | None = None
+    embedding_support_count: int = 0
+    embedding_report_ids: tuple[str, ...] = ()
+    policy_version: str = "urgency-v1"
+    action_available: bool = False
+    roster_relevant: bool = False
+    availability_verified: bool = True
+    # Canonical matching fields are persisted separately from the classifier's
+    # raw label so corrected activation/release semantics remain queryable.
+    canonical_event_type: str = ""
+    direction: str = "unknown"
+    event_status: str = ""
+    # Roster context is deliberately outside the embedding input. Persisting
+    # it prevents a starter's urgency label leaking onto a bench stash.
+    action_context: str = ""
+    subject_is_starter: bool = False
+
+
+@dataclass(frozen=True)
 class Alert:
     item: NewsItem
     classification: Classification
@@ -176,3 +241,4 @@ class Alert:
     embedding_match_token: str = ""
     embedding_similarity: float | None = None
     embedding_model: str = ""
+    urgency: ActionUrgency | None = None

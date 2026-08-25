@@ -20,6 +20,7 @@ from typing import Any
 
 from .logging_utils import structured_log
 from .models import (
+    ActionUrgency,
     Alert,
     Classification,
     LeagueRef,
@@ -123,6 +124,38 @@ def _optional_float(value: Any) -> float | None:
         return None
 
 
+def _urgency(payload: Any) -> ActionUrgency | None:
+    if not isinstance(payload, dict):
+        return None
+    rule_level = str(payload.get("rule_level") or "").strip()
+    level = str(payload.get("level") or "").strip()
+    if not rule_level or not level:
+        return None
+    return ActionUrgency(
+        rule_level=rule_level,
+        level=level,
+        reason_codes=tuple(str(value) for value in payload.get("reason_codes") or ()),
+        basis=str(payload.get("basis") or "rules"),
+        embedding_delta=int(payload.get("embedding_delta") or 0),
+        embedding_score=_optional_float(payload.get("embedding_score")),
+        embedding_support_count=int(payload.get("embedding_support_count") or 0),
+        embedding_report_ids=tuple(
+            str(value) for value in payload.get("embedding_report_ids") or ()
+        ),
+        policy_version=str(payload.get("policy_version") or "urgency-v1"),
+        action_available=bool(payload.get("action_available", False)),
+        roster_relevant=bool(payload.get("roster_relevant", False)),
+        availability_verified=bool(
+            payload.get("availability_verified", True)
+        ),
+        canonical_event_type=str(payload.get("canonical_event_type") or ""),
+        direction=str(payload.get("direction") or "unknown"),
+        event_status=str(payload.get("event_status") or ""),
+        action_context=str(payload.get("action_context") or ""),
+        subject_is_starter=bool(payload.get("subject_is_starter", False)),
+    )
+
+
 def _beneficiary(payload: dict[str, Any]) -> Beneficiary:
     return Beneficiary(
         name=str(payload.get("name") or ""),
@@ -180,6 +213,12 @@ def _league_plays(payload: dict[str, Any]) -> LeaguePlays:
         subject_state=str(payload.get("subject_state") or "free_agent"),
         subject_owner=str(payload.get("subject_owner") or ""),
         subject_depth_order=_optional_int(payload.get("subject_depth_order")),
+        subject_lineup_slot=str(payload.get("subject_lineup_slot") or ""),
+        subject_fantasy_starter=(
+            bool(payload.get("subject_fantasy_starter"))
+            if payload.get("subject_fantasy_starter") is not None
+            else None
+        ),
         beneficiaries=[_beneficiary(value) for value in payload.get("beneficiaries", [])],
         bench_options=[str(value) for value in payload.get("bench_options", [])],
         capacity=capacity,
@@ -220,6 +259,7 @@ def _alert_from_dict(payload: dict[str, Any]) -> Alert:
         embedding_match_token=str(payload.get("embedding_match_token") or ""),
         embedding_similarity=_optional_float(payload.get("embedding_similarity")),
         embedding_model=str(payload.get("embedding_model") or ""),
+        urgency=_urgency(payload.get("urgency")),
     )
 
 

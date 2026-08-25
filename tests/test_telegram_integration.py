@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -11,7 +12,7 @@ import requests
 import notifier.notify as notify_module
 import notifier.telegram_state as telegram_state_module
 from notifier.dedupe import semantic_event_type
-from notifier.models import Alert, Classification, NewsItem
+from notifier.models import ActionUrgency, Alert, Classification, NewsItem
 from notifier.notify import TELEGRAM_TEXT_LIMIT, _visible_units, send_alert
 from notifier.telegram_control import ScheduledReport, TelegramControl
 from notifier.telegram_state import TelegramState, alert_token
@@ -202,6 +203,106 @@ def test_same_event_corroboration_edits_existing_message_and_digest(tmp_path) ->
     assert first_token in persisted["feedbackTargets"]
     assert second_token in persisted["feedbackTargets"]
     assert not (tmp_path / "sent-messages.json").exists()
+
+
+def test_same_story_edit_uses_revalidated_action_urgency(tmp_path) -> None:
+    notify_module._TELEGRAM_STATES.clear()
+    config = _config(tmp_path)
+    session = Session()
+    first = replace(
+        _alert("tweet:urgent", severity=4),
+        urgency=ActionUrgency("act_today", "act_today"),
+    )
+    update = replace(
+        _alert(
+            "tweet:urgent-update",
+            headline="49ers confirm George Kittle was activated and returned to practice",
+            severity=3,
+        ),
+        urgency=ActionUrgency("monitor", "monitor"),
+    )
+
+    assert send_alert(session, config, first) == 100
+    assert send_alert(session, config, update) == 100
+
+    assert session.urls[-1].endswith("/editMessageText")
+    assert "⏰ <b>ACT TODAY</b>" not in session.payloads[-1]["text"]
+    assert "👀 <b>MONITOR</b>" in session.payloads[-1]["text"]
+    persisted = json.loads((tmp_path / "telegram-state.json").read_text())
+    assert persisted["threads"]["georgekittle"]["urgencyLevel"] == "monitor"
+
+
+def test_same_story_edit_does_not_downgrade_urgency_on_provider_failure(
+    tmp_path,
+) -> None:
+    notify_module._TELEGRAM_STATES.clear()
+    config = _config(tmp_path)
+    session = Session()
+    headline = "The 49ers ruled out George Kittle for Week 1"
+    first = replace(
+        _alert(
+            "tweet:urgent-out",
+            headline=headline,
+            event_type="injury",
+            severity=4,
+        ),
+        urgency=ActionUrgency(
+            "act_now",
+            "act_now",
+            reason_codes=("starter_unavailable",),
+            action_available=True,
+            roster_relevant=True,
+        ),
+    )
+    unverified_update = replace(
+        _alert(
+            "rotowire:urgent-out",
+            headline=headline,
+            event_type="injury",
+            severity=3,
+            source="rotowire",
+        ),
+        availability_refresh_failed=True,
+        urgency=ActionUrgency(
+            "monitor",
+            "monitor",
+            reason_codes=("availability_unverified",),
+            action_available=False,
+            roster_relevant=True,
+            availability_verified=False,
+        ),
+    )
+
+    assert send_alert(session, config, first) == 100
+    assert send_alert(session, config, unverified_update) == 100
+
+    assert session.urls[-1].endswith("/editMessageText")
+    edited_text = session.payloads[-1]["text"]
+    assert "🚨 <b>ACT NOW</b>" in edited_text
+    assert "👀 <b>MONITOR</b>" not in edited_text
+    assert "League availability could not be refreshed" in edited_text
+    persisted = json.loads((tmp_path / "telegram-state.json").read_text())
+    assert persisted["threads"]["georgekittle"]["urgencyLevel"] == "act_now"
+
+
+def test_low_severity_verified_action_buzzes_but_monitor_stays_silent(tmp_path) -> None:
+    notify_module._TELEGRAM_STATES.clear()
+    config = _config(tmp_path)
+    session = Session()
+    today = replace(
+        _alert("tweet:today", severity=2, player_name="Player One"),
+        urgency=ActionUrgency("act_today", "act_today"),
+    )
+    monitor = replace(
+        _alert("tweet:monitor", severity=2, player_name="Player Two"),
+        urgency=ActionUrgency("monitor", "monitor"),
+    )
+
+    assert send_alert(session, config, today) == 100
+    assert send_alert(session, config, monitor) == 101
+
+    assert session.payloads[0]["disable_notification"] is False
+    assert session.payloads[1]["disable_notification"] is True
 
 
 def test_exact_completed_trade_burst_edits_one_message(
@@ -879,6 +980,40 @@ def test_successful_telegram_edit_is_retryable_when_state_commit_fails(
         updated.item
     )
     assert persisted["alerts"][0]["headline"] == updated.item.headline
+
+
+def test_successful_telegram_send_is_retryable_when_state_commit_fails(
+    tmp_path, monkeypatch
+) -> None:
+    notify_module._TELEGRAM_STATES.clear()
+    config = _config(tmp_path)
+    session = Session()
+    state = notify_module.telegram_state(config)
+    real_save = state._save_locked
+    save_attempts = 0
+
+    def flaky_save() -> bool:
+        nonlocal save_attempts
+        save_attempts += 1
+        return False if save_attempts == 1 else real_save()
+
+    monkeypatch.setattr(state, "_save_locked", flaky_save)
+    alert = _alert("tweet:initial-state-failure")
+
+    assert send_alert(session, config, alert) is None
+    assert [url.rsplit("/", 1)[-1] for url in session.urls] == ["sendMessage"]
+    assert state.previous_message_id(alert.item.player_name) is None
+    assert not (tmp_path / "telegram-state.json").exists()
+
+    assert send_alert(session, config, alert) == 101
+    assert [url.rsplit("/", 1)[-1] for url in session.urls] == [
+        "sendMessage",
+        "sendMessage",
+    ]
+    persisted = json.loads((tmp_path / "telegram-state.json").read_text())
+    assert persisted["threads"]["georgekittle"]["messageId"] == 101
+    assert persisted["threads"]["georgekittle"]["token"] == alert_token(alert.item)
+    assert len(persisted["alerts"]) == 1
 
 
 def test_edit_failure_falls_back_to_normal_send(tmp_path) -> None:

@@ -23,7 +23,13 @@ import requests
 
 from .config import Config, roster_path
 from .logging_utils import NotifierError, structured_log
-from .models import LeagueRef, RosterCapacity, RosterPlayer, RosterSnapshot
+from .models import (
+    LeagueRef,
+    RosterCapacity,
+    RosterPlayer,
+    RosterSnapshot,
+    lineup_slot_is_starter,
+)
 
 SNAPSHOT_VERSION = 2
 
@@ -319,15 +325,17 @@ def _load_espn(
             name = str(player.get("fullName") or "").strip()
             if not name:
                 continue
+            lineup_slot = _espn_lineup_slot(entry)
             players.append(
                 RosterPlayer(
                     name=name,
                     position=_espn_position(player),
                     pro_team=ESPN_PRO_TEAMS.get(_as_int(player.get("proTeamId")), ""),
-                    lineup_slot=_espn_lineup_slot(entry),
+                    lineup_slot=lineup_slot,
                     on_my_team=team_id == my_team_id,
                     fantasy_team=team_name,
                     league_key=ref.key,
+                    fantasy_starter=lineup_slot_is_starter(lineup_slot),
                 )
             )
 
@@ -601,6 +609,7 @@ def _write_snapshot_unlocked(path: Path, snapshot: RosterSnapshot) -> None:
                 "onMyTeam": p.on_my_team,
                 "fantasyTeam": p.fantasy_team,
                 "leagueKey": p.league_key,
+                "fantasyStarter": p.fantasy_starter,
             }
             for p in snapshot.players
         ],
@@ -656,6 +665,11 @@ def load_snapshot(config: Config) -> RosterSnapshot:
                 on_my_team=bool(e.get("onMyTeam")),
                 fantasy_team=str(e.get("fantasyTeam") or ""),
                 league_key=str(e.get("leagueKey") or ""),
+                fantasy_starter=(
+                    bool(e.get("fantasyStarter"))
+                    if e.get("fantasyStarter") is not None
+                    else None
+                ),
             )
             for e in payload.get("players", [])
         ],
