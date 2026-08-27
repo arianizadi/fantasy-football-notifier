@@ -40,8 +40,13 @@ def test_dry_run_config_does_not_create_state_directory(tmp_path, monkeypatch) -
     assert config.dry_run is True
     assert config.telegram_controls_enabled is False
     assert config.fantasypros_refresh_hours == 2
+    assert config.fantasypros_news_enabled is False
+    assert config.fantasypros_news_poll_seconds == 300
+    assert config.fantasypros_news_idle_poll_seconds == 1200
+    assert config.fantasypros_news_request_limit == 240
+    assert config.fantasypros_news_request_reserve == 75
     assert config.daily_digest_hour == 8
-    assert config.waiver_report_enabled is True
+    assert config.waiver_report_enabled is False
     assert config.waiver_report_lead_hours == 8
     assert config.embedding_mode == "off"
     assert config.embedding_model == "qwen/qwen3-embedding-8b"
@@ -86,6 +91,34 @@ def test_fantasypros_corpus_request_budget_must_leave_live_reserve(
         monkeypatch.setenv(name, value)
 
     with pytest.raises(NotifierError, match="must not exceed"):
+        load_config()
+
+
+def test_fantasypros_live_news_requires_key_and_budget_reserve(
+    tmp_path, monkeypatch
+) -> None:
+    base = {
+        "TELEGRAM_BOT_TOKEN": "fake-token",
+        "TELEGRAM_CHAT_ID": "123",
+        "OPENROUTER_API_KEY": "fake-key",
+        "SLEEPER_USERNAME": "example",
+        "ESPN_LEAGUE_ID": "",
+        "ESPN_DEBUG": "false",
+        "NOTIFIER_STATE_DIR": str(tmp_path / "state"),
+        "DRY_RUN": "false",
+        "FANTASYPROS_NEWS_ENABLED": "true",
+    }
+    for name, value in base.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("FANTASYPROS_API_KEY", raising=False)
+
+    with pytest.raises(NotifierError, match="requires FANTASYPROS_API_KEY"):
+        load_config()
+
+    monkeypatch.setenv("FANTASYPROS_API_KEY", "fake-fp-key")
+    monkeypatch.setenv("FANTASYPROS_REQUEST_LIMIT", "100")
+    monkeypatch.setenv("FANTASYPROS_NEWS_REQUEST_RESERVE", "100")
+    with pytest.raises(NotifierError, match="must be below"):
         load_config()
 
 

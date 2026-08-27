@@ -2,15 +2,16 @@
 
 NFL news filtered through your fantasy leagues, delivered to Telegram with
 event-aware roster and draft context. The service watches an optional X
-reporter stream plus RotoWire RSS, joins each report to Sleeper's NFL player
-data and depth chart, and checks ownership across ESPN and Sleeper leagues.
+reporter stream, RotoWire RSS, and a budgeted FantasyPros news backstop; joins
+each report to Sleeper's NFL player data and depth chart; and checks ownership
+across ESPN and Sleeper leagues.
 
 ## Current pipeline
 
 ```text
 X filtered stream ──> immediate work queue ─┐
-                                            ├─> source-id dedupe
-RotoWire RSS (adaptive polling) ────────────┘
+RotoWire RSS (adaptive polling) ────────────┼─> source-id dedupe
+FantasyPros news (budgeted polling) ────────┘
                                                  │
                     player match + Sleeper depth/availability context
                                                  │
@@ -29,9 +30,10 @@ RotoWire RSS (adaptive polling) ────────────┘
 
 X uses a long-lived filtered-stream connection. Its queue wakes the processing
 loop directly; it does not wait for the next RSS poll. RotoWire remains a
-separate fallback source. Source IDs suppress literal repeats, while semantic
-dedupe recognizes a later corroboration of the same player event so Telegram
-can update the existing alert.
+separate fallback and FantasyPros supplies a slower independent backstop.
+Source IDs suppress literal repeats, while semantic dedupe recognizes a later
+corroboration of the same player event so Telegram can update the existing
+alert.
 
 The model classifies the event type, fantasy direction, severity, impact
 summary, and whether it is actionable. Code owns the depth chart, roster availability,
@@ -172,22 +174,26 @@ Pickup options · choose one
 Choose one option. Sleeper depth order does not confirm workload or touches.
 ```
 
-The alert path never calls the FantasyPros API. X remains the fast trigger,
-Sleeper generates the nearest depth options, and a just-in-time ESPN/Sleeper
-roster refresh determines whether each option is actually free. The background
-cache downloads WAIVER and ROS for each scoring format currently used by a
-drafted league every two hours. During the current mixed state, the drafted PPR
-ESPN league needs two datasets, or 24 requests per day. Once the half-PPR
-Sleeper league drafts, four datasets require 48 requests per day, regardless of
-tweet volume. A persistent rolling-24-hour cap defaults to 425, leaving
-headroom below the account's stated 500-request plan. Requests are globally
-spaced by at least one second and reserved in the ledger before network I/O, so
-restarts cannot forget quota use. Hard failures back off from 15 minutes to a
-six-hour maximum. A valid but not-yet-published seasonal dataset is also
-rechecked only every six hours, so the current PPR-only mixed-draft state uses
-about eight requests/day while data is unavailable. Once published, the
-healthy two-hour cadence resumes; after both PPR and half-PPR leagues draft,
-that is about 48 requests/day.
+X remains the fastest trigger, Sleeper generates the nearest depth options, and
+a just-in-time ESPN/Sleeper roster refresh determines whether each option is
+actually free. FantasyPros has two separately budgeted roles: its WAIVER/ROS
+cache is a second opinion, while the live-news backstop can independently
+enter the same dedupe, classification, roster, and Telegram pipeline. It polls
+every five minutes from 6 AM through 10 PM Pacific and every twenty minutes
+overnight, for at most about 216 calls/day. The news worker has a 240-call
+bucket and stops before the shared ledger's final 75 calls. Its first successful
+page is primed without alerts, preventing a backlog burst on deployment.
+
+The background rankings cache downloads WAIVER and ROS for each scoring format
+currently used by a drafted league every two hours. Two scoring datasets use
+about 24 calls/day; four use about 48. Together with six daily corpus
+maintenance calls after bootstrap, the normal maximum is about 270 calls/day.
+A persistent rolling-24-hour application cap defaults to 425, leaving roughly
+155 calls of internal headroom and 75 below the account's stated 500-request
+plan. Requests are globally spaced by at least one second and reserved in the
+ledger before network I/O, so restarts cannot forget quota use. Hard failures
+back off from 15 minutes to a six-hour maximum. A valid but not-yet-published
+seasonal ranking dataset is also rechecked only every six hours.
 
 FantasyPros freshness uses the provider's `last_updated_ts`, not local fetch
 time. Data older than `FANTASYPROS_MAX_AGE_HOURS` is omitted. A missing key,
@@ -202,9 +208,11 @@ a reference-only news corpus. It first requests the documented NFL player
 index, then uses 100-item global, category, and player queries until it reaches
 the configured unique-item target. The crawl is resumable by provider item ID
 and query checkpoint. It may use at most 300 calls per rolling day and stops
-before the shared ledger's final 75 calls, so ranking refreshes and diagnostics
-retain headroom. Once the target is reached, maintenance is only one six-query
-global/category sweep per UTC day.
+before the shared ledger reserve. When live news is enabled, that reserve is
+raised automatically to protect the live-news bucket plus its safety reserve;
+corpus bootstrap pauses before it can starve alerts or rankings. Once the
+target is reached, maintenance is only one six-query global/category sweep per
+UTC day.
 
 Corpus text is embedded in batches with a conservative `$0.25` lifetime fuse
 for the configured vector space. The source rows, query observations, vector
@@ -218,57 +226,28 @@ the current ESPN and Sleeper leagues can therefore both show `5` bench and `1`
 IR without hard-coding those values globally. The IR number is occupancy only:
 an open spot does not establish that the injured player is IR-eligible. The
 immediate breaking alert also does not choose a drop candidate for a full
-bench. The scheduled waiver report below performs a separate, evidence-based
-swap comparison.
-
-### Deadline-aware waiver report
-
-The notifier sends one longer, scan-first report for each drafted league eight
-hours before that league's actual waiver processing timestamp. It does not
-assume every league runs on Tuesday. ESPN's live player pool supplies the
-dominant broad-pool `waiverProcessDate`; Sleeper's configured "day after"
-setting is translated to its 12:05 AM Pacific processing time. A lone player's
-drop timer is never mistaken for the weekly league deadline.
-
-Immediately before the report is built, ownership is refreshed again. Each
-league receives its own list because an ESPN free agent may be rostered in
-Sleeper. A still-pre-draft league is not queried for availability and cannot
-block an already-active league; it begins receiving reports only after its own
-roster appears.
-
-The evidence window begins at the previous processing cohort, not an arbitrary
-seven days before report generation. Candidates are scored from confirmed role/opportunity, fresh news and
-corroboration, scoring-specific FantasyPros cache data when available, live
-Sleeper market movement, provider player-quality data, and the user's roster
-construction. The report penalizes an unnecessary backup quarterback when
-Lamar Jackson is healthy. With five full bench spots, a claim must clear a
-meaningful swap threshold over an expendable bench player; otherwise it is
-shown as a watch, not forced into a recommendation. Traditional-priority
-leagues do not receive FAAB advice, and "hold" is a valid result when nobody
-is a real upgrade.
-
-Multipart reports are stored before delivery. Each accepted Telegram part is
-committed separately, so a restart resumes at the next part instead of
-repeating the beginning of the report.
+bench. Scheduled long-form waiver-wire reports are disabled. Immediate injury,
+inactive, role-change, and next-man-up alerts remain enabled so actionable
+pickup windows still arrive in real time.
 
 ### Morning football recap
 
-At 8:00 AM Pacific, the bot compiles the complete saved-news journal from the
+At 8:00 AM Pacific, the bot reads the complete saved-news journal from the
 prior rolling 24 hours, not only reports that triggered immediate alerts. It
-collapses repeated player/event coverage into one evolving fact and renders:
+collapses repeated player/event coverage into one evolving fact, filters that
+journal down to the highest-yield information, and renders:
 
-- **Your Team Impact** first, with each drafted fantasy team and news directly
+- **Your Team** first, with each drafted fantasy team and news directly
   about its players. Severity 3+ reports about another player in the same NFL
   team/position room are labeled conservatively as "may affect" context. An
-  empty pre-draft league is omitted until its roster appears.
-- **Big News** for major stories and roster/waiver-relevant 3/5 items.
-- **Smaller Moves** for useful practice, transaction, depth, and role notes.
-- **Learn the Game** with a short explanation of what those event types
-  usually mean.
+  empty pre-draft league and teams with no relevant update are omitted.
+- **High-Impact News** for the most important stories and actionable 3/5+
+  items, capped at eight concise entries.
 
-The recap is delivered silently; breaking news remains immediate. Source links
-and report times remain attached, and model-authored roster instructions are
-never replayed from the archive.
+The recap omits smaller moves, article-body excerpts, roster inventories, and
+generic teaching text. It is delivered silently; breaking news remains
+immediate. Up to two source links and report times remain attached, and
+model-authored roster instructions are never replayed from the archive.
 
 ### Preseason mode
 
@@ -308,7 +287,8 @@ without waiting for it.
 
 ## Saved news and feedback
 
-Every newly claimed live X post or RotoWire report is saved locally in
+Every newly claimed live X post, RotoWire report, or FantasyPros live-news item
+is saved locally in
 `state/news-events.sqlite3`. Raw text, URL, matched player, source time, and
 filter/delivery outcome are retained for every saved report. Event type,
 positive/negative/mixed direction, severity, and summary are added when a
@@ -412,9 +392,11 @@ Important configuration:
 | `ESPN_TEAM_ID` | Optional team-selection override. |
 | `SLEEPER_USERNAME`, `SLEEPER_LEAGUE_IDS` | Sleeper league discovery/filter. |
 | `TWITTER_BEARER_TOKEN` | Optional usage-billed X filtered stream. |
-| `FANTASYPROS_API_KEY` | Optional cached FantasyPros WAIVER/ROS context; never used in the breaking-alert path. |
+| `FANTASYPROS_API_KEY` | Optional FantasyPros live-news backstop, cached WAIVER/ROS context, and reference corpus. |
 | `FANTASYPROS_REQUEST_LIMIT` | Persistent rolling-24h application cap; default `425`, maximum `450`. |
 | `FANTASYPROS_REFRESH_HOURS`, `FANTASYPROS_MAX_AGE_HOURS` | Ranking refresh cadence and provider-data freshness limit. |
+| `FANTASYPROS_NEWS_ENABLED`, `FANTASYPROS_NEWS_POLL_SECONDS`, `FANTASYPROS_NEWS_IDLE_POLL_SECONDS` | Budgeted live-news backstop; disabled by default, with 5-minute daytime and 20-minute overnight polling. |
+| `FANTASYPROS_NEWS_REQUEST_LIMIT`, `FANTASYPROS_NEWS_REQUEST_RESERVE` | Live-news bucket and shared-ledger reserve; defaults `240` and `75`. |
 | `FANTASYPROS_CORPUS_ENABLED`, `FANTASYPROS_CORPUS_TARGET` | Opt-in, reference-only FantasyPros news corpus; default target `5000`. Corpus rows never enter alerts, recaps, search, dedupe, or automatic urgency decisions. |
 | `FANTASYPROS_CORPUS_MAX_REQUESTS`, `FANTASYPROS_CORPUS_LIVE_RESERVE`, `FANTASYPROS_CORPUS_PLAYER_LIMIT` | Bootstrap controls; defaults `300`, `75`, and `250`. The shared persistent request ledger remains authoritative. |
 | `FANTASYPROS_CORPUS_EMBEDDING_BUDGET_USD`, `FANTASYPROS_CORPUS_EMBEDDING_PRICE_PER_MILLION_USD`, `FANTASYPROS_CORPUS_EMBEDDING_TIMEOUT_SECONDS` | Durable lifetime spend fuse, pinned input-price assumption, and corpus-only provider timeout; defaults `$0.25`, `$0.01/M` tokens, and 30 seconds. A non-default model requires an explicit price. |
@@ -423,7 +405,7 @@ Important configuration:
 | `TELEGRAM_CONTROLS_ENABLED` | Opt in to commands and feedback only when this service exclusively owns the bot's `getUpdates`; default `false`. |
 | `PLAYER_THREAD_HOURS` | Reply-chain lifetime; default `168` matches one week. |
 | `DAILY_DIGEST_ENABLED`, `DAILY_DIGEST_HOUR`, `DAILY_DIGEST_TIMEZONE` | Morning rolling-24h recap; default 8 AM Pacific. |
-| `WAIVER_REPORT_ENABLED`, `WAIVER_REPORT_LEAD_HOURS` | Full per-league report before the live provider deadline; default 8 hours. |
+| `WAIVER_REPORT_ENABLED`, `WAIVER_REPORT_LEAD_HOURS` | Legacy scheduled long-form waiver report; disabled by default. |
 | `DRY_RUN` | Print alerts without sending them. |
 
 X pricing and quotas can change. Verify current terms before enabling the
@@ -491,8 +473,8 @@ such as `run-notifier.py --once` do not keep that control loop alive.
 - `/player <name>` shows current Sleeper status and depth plus ownership in
   each drafted league and recent saved reports.
 - `/news <query>` searches the saved tweet/report journal.
-- `/digest` returns the deduplicated Big News, Smaller Moves, and Learn the
-  Game recap for the prior 24 hours. The same recap is sent automatically at
+- `/digest` returns the concise Your Team and High-Impact News recap for the
+  prior 24 hours. The same recap is sent automatically at
   the configured local hour when enabled; its
   outbound scheduler does not consume Telegram updates and still runs when bot
   controls are disabled.

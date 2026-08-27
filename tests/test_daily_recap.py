@@ -113,10 +113,7 @@ def test_sections_follow_severity_and_roster_relevance() -> None:
         "Roster Player",
         "Available Player",
     ]
-    assert [item.player_name for item in recap.smaller_moves] == [
-        "Practice Player",
-        "Minor Player",
-    ]
+    assert recap.smaller_moves == ()
     rendered = "\n".join(recap.parts)
     assert "Generic Chatter" not in rendered
     assert "Tiny Note" not in rendered
@@ -174,8 +171,7 @@ def test_team_impact_connects_direct_and_position_room_news_without_duplicates()
     assert [item.player_name for item in recap.big_news] == ["Bryce Young"]
     assert rendered.count("Hubbard was limited again Monday") == 1
     assert rendered.count("Panthers released Miles Sanders") == 1
-    assert "YOUR TEAM IMPACT" in rendered
-    assert "Bak Choi Cr · Certified Sped League</b> · 3 players" in rendered
+    assert "YOUR TEAM" in rendered
     assert "Sleeper Draft" not in rendered
     assert "Your player" in rendered
     assert "May affect Jonathan Brooks" in rendered
@@ -408,7 +404,7 @@ def test_team_impact_rejects_ambiguous_and_unrelated_room_inferences() -> None:
 
     assert recap.team_impacts == ()
     rendered = "\n".join(recap.parts)
-    assert "No saved reports directly affecting your players" in rendered
+    assert "YOUR TEAM" not in rendered
     assert "May affect Puka Nacua" not in rendered
 
 
@@ -524,11 +520,11 @@ def test_peak_team_impact_is_capped_and_keeps_valid_telegram_parts() -> None:
     )
     rendered = "\n".join(recap.parts)
 
-    assert len(recap.team_impacts) == 12
-    assert recap.omitted_team_impacts == 8
-    assert "+ 8 more team-impact reports" in rendered
-    assert "4/5 · My Player 11" in rendered
-    assert "4/5 · My Player 12" not in rendered
+    assert len(recap.team_impacts) == 6
+    assert recap.omitted_team_impacts == 14
+    assert "+ 14 more team-impact reports" in rendered
+    assert "4/5 · My Player 05" in rendered
+    assert "4/5 · My Player 06" not in rendered
     for part in recap.parts:
         assert _visible_units(part) <= TELEGRAM_TEXT_LIMIT
         parser = _TagChecker()
@@ -571,7 +567,7 @@ def test_repeated_player_event_reports_collapse_to_latest_fact_and_keep_sources(
     assert "Browns named Watson" in rendered
     assert ">RotoWire</a>" in rendered
     assert ">X</a>" in rendered
-    assert "2 reports combined" in rendered
+    assert "reports combined" not in rendered
 
 
 def test_window_feedback_and_timestamp_fallback_are_enforced() -> None:
@@ -632,7 +628,7 @@ def test_upstream_html_is_normalized_escaped_and_unsafe_links_are_not_emitted() 
     assert "🔗 X · Aug 24" in rendered
 
 
-def test_learn_note_is_deterministic_and_not_player_advice() -> None:
+def test_daily_recap_omits_educational_filler() -> None:
     recap = format_daily_recap(
         [
             _row("Injured Player", "injury", 4),
@@ -642,13 +638,9 @@ def test_learn_note_is_deterministic_and_not_player_advice() -> None:
         now=NOW,
     )
 
-    assert recap.learn_note == (
-        "Injury news can open opportunity, but depth order alone does not "
-        "guarantee snaps or touches. Role changes become meaningful when later "
-        "reports confirm routes, carries, or playing time."
-    )
+    assert recap.learn_note == ""
     rendered = "\n".join(recap.parts)
-    assert "LEARN THE GAME" in rendered
+    assert "LEARN THE GAME" not in rendered
     assert "add Injured Player" not in rendered.casefold()
 
 
@@ -668,17 +660,18 @@ def test_long_recap_splits_only_between_complete_items_with_valid_html() -> None
 
     recap = format_daily_recap(rows, now=NOW)
 
-    assert len(recap.parts) > 1
+    assert len(recap.parts) == 1
     combined = "\n".join(recap.parts)
-    for index in range(30):
+    for index in range(8):
         assert combined.count(f"4/5 · Player {index:02d}") == 1
+    assert "+ 22 more saved reports" in combined
     for part in recap.parts:
         assert _visible_units(part) <= TELEGRAM_TEXT_LIMIT
         parser = _TagChecker()
         parser.feed(part)
         parser.close()
         assert parser.stack == []
-    assert sum("LEARN THE GAME" in part for part in recap.parts) == 1
+    assert "LEARN THE GAME" not in combined
 
 
 def test_peak_day_recap_caps_output_and_reports_deterministic_omissions() -> None:
@@ -715,32 +708,29 @@ def test_peak_day_recap_caps_output_and_reports_deterministic_omissions() -> Non
     rendered = "\n".join(recap.parts)
 
     assert len(recap.parts) <= 20
-    assert rendered.count("+ 100 more saved reports") == 1
+    assert rendered.count("+ 92 more saved reports") == 1
 
     # The cap keeps the deterministic priority order: severity first, then
     # the newest reports.  Lower-ranked overflow is summarized, not rendered.
     assert rendered.index("5/5 · Big Player 000") < rendered.index(
-        "5/5 · Big Player 029"
+        "5/5 · Big Player 007"
     )
-    assert "5/5 · Big Player 030" not in rendered
-    assert rendered.index("2/5 · Small Player 000") < rendered.index(
-        "2/5 · Small Player 019"
-    )
-    assert "2/5 · Small Player 020" not in rendered
+    assert "5/5 · Big Player 008" not in rendered
+    assert "Small Player" not in rendered
     for part in recap.parts:
         assert _visible_units(part) <= TELEGRAM_TEXT_LIMIT
 
 
-def test_empty_recap_is_explicit_and_still_educational() -> None:
+def test_empty_recap_is_explicit_and_compact() -> None:
     recap = format_daily_recap([], now=NOW)
 
     assert recap.big_news == ()
     assert recap.smaller_moves == ()
     assert len(recap.parts) == 1
     rendered = recap.parts[0]
-    assert "No major reports" in rendered
-    assert "No smaller fantasy-relevant moves" in rendered
-    assert "A news headline is one data point" in rendered
+    assert "No high-impact fantasy reports" in rendered
+    assert "SMALLER MOVES" not in rendered
+    assert "LEARN THE GAME" not in rendered
 
 
 @pytest.mark.parametrize("hours", [0, 169])

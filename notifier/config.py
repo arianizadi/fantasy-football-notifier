@@ -17,6 +17,10 @@ DEFAULT_MIN_SEVERITY_OTHER = 3
 DEFAULT_FANTASYPROS_REQUEST_LIMIT = 425
 DEFAULT_FANTASYPROS_REFRESH_HOURS = 2
 DEFAULT_FANTASYPROS_MAX_AGE_HOURS = 12
+DEFAULT_FANTASYPROS_NEWS_POLL_SECONDS = 5 * 60
+DEFAULT_FANTASYPROS_NEWS_IDLE_POLL_SECONDS = 20 * 60
+DEFAULT_FANTASYPROS_NEWS_REQUEST_LIMIT = 240
+DEFAULT_FANTASYPROS_NEWS_REQUEST_RESERVE = 75
 DEFAULT_FANTASYPROS_CORPUS_TARGET = 5000
 DEFAULT_FANTASYPROS_CORPUS_MAX_REQUESTS = 300
 DEFAULT_FANTASYPROS_CORPUS_LIVE_RESERVE = 75
@@ -66,6 +70,11 @@ class Config:
     fantasypros_request_limit: int
     fantasypros_refresh_hours: int
     fantasypros_max_age_hours: int
+    fantasypros_news_enabled: bool
+    fantasypros_news_poll_seconds: int
+    fantasypros_news_idle_poll_seconds: int
+    fantasypros_news_request_limit: int
+    fantasypros_news_request_reserve: int
     fantasypros_corpus_enabled: bool
     fantasypros_corpus_target: int
     fantasypros_corpus_max_requests: int
@@ -267,6 +276,33 @@ def load_config() -> Config:
             1,
             72,
         ),
+        fantasypros_news_enabled=(
+            not dry_run and optional_bool("FANTASYPROS_NEWS_ENABLED", False)
+        ),
+        fantasypros_news_poll_seconds=optional_int(
+            "FANTASYPROS_NEWS_POLL_SECONDS",
+            DEFAULT_FANTASYPROS_NEWS_POLL_SECONDS,
+            60,
+            3600,
+        ),
+        fantasypros_news_idle_poll_seconds=optional_int(
+            "FANTASYPROS_NEWS_IDLE_POLL_SECONDS",
+            DEFAULT_FANTASYPROS_NEWS_IDLE_POLL_SECONDS,
+            60,
+            7200,
+        ),
+        fantasypros_news_request_limit=optional_int(
+            "FANTASYPROS_NEWS_REQUEST_LIMIT",
+            DEFAULT_FANTASYPROS_NEWS_REQUEST_LIMIT,
+            1,
+            400,
+        ),
+        fantasypros_news_request_reserve=optional_int(
+            "FANTASYPROS_NEWS_REQUEST_RESERVE",
+            DEFAULT_FANTASYPROS_NEWS_REQUEST_RESERVE,
+            1,
+            400,
+        ),
         # Historical provider news is collected into its own reference-only
         # table. It cannot become an alert, recap item, dedupe candidate, or
         # automatic urgency lift merely because collection is enabled.
@@ -342,7 +378,7 @@ def load_config() -> Config:
             os.environ.get("DAILY_DIGEST_TIMEZONE", "").strip()
             or "America/Los_Angeles"
         ),
-        waiver_report_enabled=optional_bool("WAIVER_REPORT_ENABLED", True),
+        waiver_report_enabled=optional_bool("WAIVER_REPORT_ENABLED", False),
         waiver_report_lead_hours=optional_int(
             "WAIVER_REPORT_LEAD_HOURS",
             DEFAULT_WAIVER_REPORT_LEAD_HOURS,
@@ -358,6 +394,22 @@ def load_config() -> Config:
         )
     if config.espn_enabled and not (config.espn_swid and config.espn_s2):
         raise NotifierError("ESPN_LEAGUE_ID is set, so ESPN_SWID and ESPN_S2 are required.")
+    if (
+        config.fantasypros_news_enabled
+        and not config.fantasypros_api_key
+    ):
+        raise NotifierError(
+            "FANTASYPROS_NEWS_ENABLED requires FANTASYPROS_API_KEY."
+        )
+    if (
+        config.fantasypros_news_enabled
+        and config.fantasypros_news_request_reserve
+        >= config.fantasypros_request_limit
+    ):
+        raise NotifierError(
+            "FANTASYPROS_NEWS_REQUEST_RESERVE must be below "
+            "FANTASYPROS_REQUEST_LIMIT."
+        )
     if (
         config.fantasypros_corpus_enabled
         and not config.fantasypros_api_key

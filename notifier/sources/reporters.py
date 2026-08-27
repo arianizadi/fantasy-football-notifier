@@ -40,13 +40,26 @@ FANTASY = [
     "FieldYates",       # 2.4/day - fast on signings and roster moves
 ]
 
+# The exact Josh Jacobs contingency report on 2026-08-26 came directly from
+# the Packers media availability before it reached general fantasy feeds.
+# These four handles all posted that same availability and were resolved
+# against X's users/by endpoint on 2026-08-26. Semantic dedupe collapses their
+# overlapping football fact while the redundancy protects against one writer
+# omitting a player's full name.
+PACKERS_BREAKING = [
+    "mattschneidman",
+    "ByRyanWood",
+    "RobDemovsky",
+    "by_JBH",
+]
+
 # Single-team beat writers. High volume for one team's worth of coverage, so
 # only worth the spend if you roster that team heavily.
 BEAT_OPTIONAL = [
     "MikeReiss",  # 10.7/day - Patriots
 ]
 
-ALL_REPORTERS = NATIONAL + FANTASY
+ALL_REPORTERS = NATIONAL + FANTASY + PACKERS_BREAKING
 
 # X caps a single filtered-stream rule at 1024 characters.
 MAX_RULE_CHARS = 1024

@@ -31,7 +31,7 @@ from .models import (
 from .plays import Beneficiary, DepthEntry, LeaguePlays, TeamContext
 
 OUTBOX_FILENAME = "pending-alerts.json"
-SOURCE_PRIORITY = {"twitter": 0, "rotowire": 1}
+SOURCE_PRIORITY = {"twitter": 0, "rotowire": 1, "fantasypros": 2}
 RETRY_DELAYS_SECONDS = (15, 60, 5 * 60, 15 * 60)
 MAX_TRACKED = 1000
 

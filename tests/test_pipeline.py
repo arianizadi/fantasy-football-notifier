@@ -1,5 +1,6 @@
 import queue
 import threading
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -9,6 +10,70 @@ import notifier.pipeline as pipeline_module
 from notifier.dedupe import SeenStore
 from notifier.models import NewsItem, report_revision_identity
 from notifier.pipeline import Notifier, _depth_report_text
+
+
+def test_fantasypros_news_uses_daytime_and_overnight_cadence() -> None:
+    notifier = SimpleNamespace(
+        config=SimpleNamespace(
+            fantasypros_news_poll_seconds=300,
+            fantasypros_news_idle_poll_seconds=1200,
+        )
+    )
+
+    assert Notifier._fantasypros_news_interval(
+        notifier,
+        datetime(2026, 8, 26, 19, 0, tzinfo=timezone.utc),
+    ) == 300
+    assert Notifier._fantasypros_news_interval(
+        notifier,
+        datetime(2026, 8, 26, 9, 0, tzinfo=timezone.utc),
+    ) == 1200
+
+
+def test_first_fantasypros_news_page_primes_without_alerting() -> None:
+    stop = threading.Event()
+    item = NewsItem(
+        source="fantasypros",
+        guid="fantasypros:604265",
+        player_name="Josh Jacobs",
+        headline="Packers preparing for possible suspension",
+        body="Josh Jacobs could be suspended.",
+        url="https://www.fantasypros.com/nfl/news/604265/item.php",
+        published_at=datetime(2026, 8, 26, 16, 27, tzinfo=timezone.utc),
+    )
+
+    def fetch():
+        stop.set()
+        return SimpleNamespace(
+            items=(item,),
+            fetched_at=datetime(2026, 8, 26, 16, 30, tzinfo=timezone.utc),
+        )
+
+    source = SimpleNamespace(
+        fetch=fetch,
+        initialized=False,
+        mark_initialized=Mock(return_value=True),
+    )
+    seen = SimpleNamespace(prime=Mock(), is_new=Mock())
+    process = Mock()
+    notifier = SimpleNamespace(
+        _stop=stop,
+        _fantasypros_news_interval=Mock(return_value=300),
+        fantasypros_news=source,
+        fantasypros=SimpleNamespace(
+            status=Mock(return_value=SimpleNamespace(requests_used=1, request_cap=425))
+        ),
+        seen=seen,
+        _process_items=process,
+        _pool=object(),
+    )
+
+    Notifier._fantasypros_news_loop(notifier)
+
+    seen.prime.assert_called_once_with([item])
+    seen.is_new.assert_not_called()
+    process.assert_not_called()
+    source.mark_initialized.assert_called_once()
 
 
 def test_tweets_are_processed_when_rotowire_is_unavailable() -> None:

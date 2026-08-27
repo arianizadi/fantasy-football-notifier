@@ -51,6 +51,7 @@ from .plays import DepthCharts, LeaguePlays, plays_context_for_model, plays_for_
 from .roster import load_snapshot, refresh_drafted_snapshot, snapshot_mtime
 from .sources import rotowire, sleeper
 from .sources.fantasypros import FantasyProsCache
+from .sources.fantasypros_live import FantasyProsLiveNews
 from .sources.twitter import TwitterStream
 from .telegram_control import TelegramControl
 from .urgency import (
@@ -64,7 +65,7 @@ from .waiver_schedule import WaiverReportCoordinator
 # X is the origin for most breaking news; RotoWire writes it up 1-5 minutes
 # later. Ordering by priority means the faster source claims the semantic
 # dedupe slot and the slower duplicate is suppressed, not the reverse.
-SOURCE_PRIORITY = {"twitter": 0, "rotowire": 1}
+SOURCE_PRIORITY = {"twitter": 0, "rotowire": 1, "fantasypros": 2}
 CLASSIFY_WORKERS = 8
 
 # Before your leagues draft every roster is empty, so roster tiering has
@@ -96,6 +97,10 @@ FANTASYPROS_UNAVAILABLE_RETRY_SECONDS = 6 * 60 * 60
 FANTASYPROS_UNAVAILABLE_ERRORS = frozenset(
     {"dataset_unavailable", "partial_dataset_unavailable"}
 )
+FANTASYPROS_NEWS_BUDGET_ERRORS = frozenset(
+    {"budget_exhausted", "budget_reserved", "request_limit"}
+)
+PACIFIC = ZoneInfo("America/Los_Angeles")
 
 
 def _next_player_index_refresh_at(player_index: dict, now: float) -> float:
@@ -388,6 +393,31 @@ class Notifier:
                 int(getattr(config, "fantasypros_max_age_hours", 12)) * 3600
             ),
         )
+        self.fantasypros_news = FantasyProsLiveNews(
+            self.fantasypros,
+            enabled=bool(
+                getattr(config, "fantasypros_news_enabled", False)
+            ),
+            request_limit=int(
+                getattr(config, "fantasypros_news_request_limit", 240)
+            ),
+            request_reserve=int(
+                getattr(config, "fantasypros_news_request_reserve", 75)
+            ),
+            state_dir=config.state_dir,
+        )
+        corpus_live_reserve = int(
+            getattr(config, "fantasypros_corpus_live_reserve", 75)
+        )
+        if self.fantasypros_news.enabled:
+            corpus_live_reserve = max(
+                corpus_live_reserve,
+                min(
+                    self.fantasypros.status().request_cap - 1,
+                    int(getattr(config, "fantasypros_news_request_limit", 240))
+                    + int(getattr(config, "fantasypros_news_request_reserve", 75)),
+                ),
+            )
         self._fantasypros_thread: threading.Thread | None = None
         self.fantasypros_corpus = FantasyProsCorpusManager(
             self.events,
@@ -417,9 +447,7 @@ class Notifier:
             max_requests=int(
                 getattr(config, "fantasypros_corpus_max_requests", 300)
             ),
-            live_request_reserve=int(
-                getattr(config, "fantasypros_corpus_live_reserve", 75)
-            ),
+            live_request_reserve=corpus_live_reserve,
             player_limit=int(
                 getattr(config, "fantasypros_corpus_player_limit", 250)
             ),
@@ -438,6 +466,7 @@ class Notifier:
                 )
             ),
         )
+        self._fantasypros_news_thread: threading.Thread | None = None
         self._fantasypros_corpus_thread: threading.Thread | None = None
         self._state_lock = threading.RLock()
         self._delivery_lock = threading.RLock()
@@ -498,7 +527,11 @@ class Notifier:
             search_provider=self.news_search_text,
             feedback_provider=self.events.record_feedback,
             daily_recap_provider=self.daily_recap_parts,
-            scheduled_report_provider=self.waiver_reports.due_reports,
+            scheduled_report_provider=(
+                self.waiver_reports.due_reports
+                if bool(getattr(config, "waiver_report_enabled", False))
+                else None
+            ),
         )
         HEALTH.mark(
             "roster",
@@ -545,6 +578,7 @@ class Notifier:
         )
         if self.twitter is not None:
             self.twitter.set_player_index(player_index)
+        self.fantasypros_news.set_player_index(player_index)
         return True
 
     def _reload_roster_if_changed(self) -> None:
@@ -891,6 +925,87 @@ class Notifier:
             daemon=True,
         )
         self._fantasypros_thread.start()
+
+    def _fantasypros_news_interval(self, now: datetime | None = None) -> int:
+        """Use five-minute daytime coverage and a quieter overnight cadence."""
+        stamp = (now or datetime.now(timezone.utc)).astimezone(PACIFIC)
+        active = 6 <= stamp.hour < 22
+        field = (
+            "fantasypros_news_poll_seconds"
+            if active
+            else "fantasypros_news_idle_poll_seconds"
+        )
+        default = 5 * 60 if active else 20 * 60
+        return int(getattr(self.config, field, default))
+
+    def _fantasypros_news_loop(self) -> None:
+        """Poll the independent news backstop without delaying X or RotoWire."""
+        while not self._stop.is_set():
+            wait_seconds = self._fantasypros_news_interval()
+            try:
+                result = self.fantasypros_news.fetch()
+                items = list(result.items)
+                if not self.fantasypros_news.initialized:
+                    # Enabling a newest-100 feed must not dump its existing
+                    # page into Telegram. Prime exact revisions once; future
+                    # restarts use normal SeenStore/outbox recovery semantics.
+                    self.seen.prime(items)
+                    if not self.fantasypros_news.mark_initialized(
+                        fetched_at=result.fetched_at,
+                        item_count=len(items),
+                    ):
+                        raise OSError("live news state write failed")
+                    structured_log(
+                        logging.INFO,
+                        "fantasypros.news_primed",
+                        itemCount=len(items),
+                    )
+                    fresh: list[NewsItem] = []
+                else:
+                    fresh = [item for item in items if self.seen.is_new(item)]
+                    if fresh:
+                        self._process_items(fresh, self._pool)
+
+                status = self.fantasypros.status()
+                HEALTH.mark(
+                    "fantasypros_news",
+                    ok=True,
+                    detail=(
+                        f"{len(items)} items; {len(fresh)} new; "
+                        f"{status.requests_used}/{status.request_cap} requests/24h"
+                    ),
+                )
+            except Exception as error:  # noqa: BLE001 - optional source fails open
+                code = str(error) if str(error) in FANTASYPROS_NEWS_BUDGET_ERRORS else ""
+                if code:
+                    wait_seconds = max(wait_seconds, 60 * 60)
+                HEALTH.mark(
+                    "fantasypros_news",
+                    ok=False,
+                    detail=code or type(error).__name__,
+                )
+                structured_log(
+                    logging.WARNING,
+                    "fantasypros.news_failed",
+                    error=code or "request_failed",
+                    errorType=type(error).__name__,
+                )
+            self._stop.wait(wait_seconds)
+
+    def _start_fantasypros_news_worker(self) -> None:
+        if not self.fantasypros_news.enabled:
+            return
+        if (
+            self._fantasypros_news_thread is not None
+            and self._fantasypros_news_thread.is_alive()
+        ):
+            return
+        self._fantasypros_news_thread = threading.Thread(
+            target=self._fantasypros_news_loop,
+            name="fantasypros-news",
+            daemon=True,
+        )
+        self._fantasypros_news_thread.start()
 
     def _start_fantasypros_corpus_worker(self) -> None:
         """Grow the reference corpus without entering the alert hot path."""
@@ -2023,6 +2138,14 @@ class Notifier:
                 f"requests/24h · last fetch {last}"
             )
 
+        if self.fantasypros_news.enabled:
+            lines.append(
+                self._health_line(
+                    "FantasyPros news",
+                    components.get("fantasypros_news"),
+                )
+            )
+
         corpus_manager = getattr(self, "fantasypros_corpus", None)
         corpus = corpus_manager.status() if corpus_manager is not None else None
         if corpus is not None and corpus.enabled:
@@ -2200,6 +2323,8 @@ class Notifier:
         coordinator = getattr(self, "waiver_reports", None)
         if coordinator is not None:
             coordinator.close()
+        if self._fantasypros_news_thread is not None:
+            self._fantasypros_news_thread.join(timeout=2)
         self.fantasypros.close()
         if self._fantasypros_thread is not None:
             self._fantasypros_thread.join(timeout=2)
@@ -2262,10 +2387,16 @@ class Notifier:
                 getattr(urgency_service, "allow_lift", False)
             ),
             fantasyProsEnabled=self.fantasypros.enabled,
+            fantasyProsNewsEnabled=bool(
+                getattr(getattr(self, "fantasypros_news", None), "enabled", False)
+            ),
             fantasyProsCorpusEnabled=bool(
                 getattr(getattr(self, "fantasypros_corpus", None), "enabled", False)
             ),
         )
+        news_starter = getattr(self, "_start_fantasypros_news_worker", None)
+        if news_starter is not None:
+            news_starter()
         self._start_fantasypros_refresher()
         corpus_starter = getattr(self, "_start_fantasypros_corpus_worker", None)
         if corpus_starter is not None:

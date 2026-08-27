@@ -620,6 +620,7 @@ def _source_line(item) -> str:
     source_name = {
         "twitter": "X source",
         "rotowire": "RotoWire source",
+        "fantasypros": "FantasyPros source",
     }.get(item.source.casefold(), f"{item.source or 'news'} source")
     raw_url = item.url.strip()
     parsed = urlsplit(raw_url)

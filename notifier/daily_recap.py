@@ -1,15 +1,14 @@
 """Deterministic, source-backed daily fantasy news recaps.
 
 The breaking-news path is intentionally fast and terse.  This module provides
-the complementary once-a-day view: collapse repeated reports, sort the facts
-that mattered, and render mobile-friendly Telegram HTML.  It accepts plain
+the complementary once-a-day high-yield view: collapse repeated reports, keep
+only roster effects and major facts, and render mobile-friendly Telegram HTML. It accepts plain
 ``EventStore``-style row dictionaries so callers can decide how to query and
 schedule delivery.  It never calls a model, a league provider, or the network.
 
-Classifier summaries are deliberately not rendered.  Older prompts allowed
-those summaries to contain roster instructions, while a recap cannot recheck
-availability.  The only report prose shown here is the upstream headline/body;
-the educational footer is fixed code keyed only by event type.
+Classifier summaries and low-value educational filler are deliberately not
+rendered. Older prompts allowed summaries to contain roster instructions,
+while a recap cannot recheck availability.
 """
 
 from __future__ import annotations
@@ -30,9 +29,9 @@ from .models import LeagueRef, NewsItem, RosterPlayer, RosterSnapshot
 
 TELEGRAM_TEXT_LIMIT = 4096
 DEFAULT_TIMEZONE = "America/Los_Angeles"
-MAX_BIG_NEWS_ITEMS = 30
-MAX_SMALLER_MOVES_ITEMS = 20
-MAX_TEAM_IMPACT_ITEMS = 12
+MAX_BIG_NEWS_ITEMS = 8
+MAX_SMALLER_MOVES_ITEMS = 0
+MAX_TEAM_IMPACT_ITEMS = 6
 
 BIG_TIERS = frozenset({"mine", "claimable"})
 USEFUL_SMALL_EVENTS = frozenset(
@@ -581,28 +580,14 @@ def _item_markup(
         f"<b>{_escape(event)}</b> · {headline}",
     ]
 
-    body = _plain(item.body)
-    headline_plain = _plain(item.headline)
-    redundant = (
-        not body
-        or body == headline_plain
-        or body.startswith(headline_plain[:120])
-        or headline_plain.startswith(body[:120])
-    )
-    if not redundant:
-        lines.append(f"<blockquote>{_escape(_clip(body, 280))}</blockquote>")
-
     lines.extend(context_lines)
 
-    displayed = item.attributions[:3]
+    displayed = item.attributions[:2]
     if displayed:
         sources = " · ".join(
             _attribution_markup(attribution, zone) for attribution in displayed
         )
         lines.append(f"🔗 {sources}")
-    if item.report_count > 1:
-        noun = "report" if item.report_count == 1 else "reports"
-        lines.append(f"<i>{item.report_count} {noun} combined.</i>")
     if not item.subject_confident:
         lines.append(
             "⚠️ <i>Player attribution is unclear; no roster move is inferred.</i>"
@@ -860,18 +845,17 @@ def format_daily_recap(
         player_index=player_index,
     )
     impact_keys = frozenset(_dedupe_key(impact.item) for impact in selected_impacts)
-    selected_big, selected_smaller = _select_items(
+    selected_big, _selected_smaller = _select_items(
         merged,
         excluded=impact_keys,
     )
     omitted_impacts = max(0, len(selected_impacts) - MAX_TEAM_IMPACT_ITEMS)
     omitted_big = max(0, len(selected_big) - MAX_BIG_NEWS_ITEMS)
-    omitted_smaller = max(0, len(selected_smaller) - MAX_SMALLER_MOVES_ITEMS)
+    omitted_smaller = 0
     impacts = selected_impacts[:MAX_TEAM_IMPACT_ITEMS]
     big = selected_big[:MAX_BIG_NEWS_ITEMS]
-    smaller = selected_smaller[:MAX_SMALLER_MOVES_ITEMS]
-    all_items = tuple(impact.item for impact in impacts) + big + smaller
-    learn = _learn_note(all_items)
+    smaller: tuple[RecapItem, ...] = ()
+    learn = ""
 
     team_section: tuple[tuple[str, Sequence[str]], ...] = ()
     if roster_snapshot is not None:
@@ -881,45 +865,26 @@ def format_daily_recap(
             _impact_markup(impact, zone, roster_snapshot, labels)
             for impact in impacts
         ]
-        if leagues and not impact_blocks:
-            impact_blocks = [
-                "No saved reports directly affecting your players or their "
-                "position rooms in this window."
-            ]
         if omitted_impacts:
             noun = "report" if omitted_impacts == 1 else "reports"
             impact_blocks.append(
                 f"<i>+ {omitted_impacts} more team-impact {noun}; "
                 "use /news to search.</i>"
             )
-        team_section = (
-            (
-                "🏈 <b>YOUR TEAM IMPACT</b>",
-                [_roster_summary_markup(roster_snapshot, zone), *impact_blocks],
-            ),
-        )
+        if impact_blocks:
+            team_section = (("🏈 <b>YOUR TEAM</b>", impact_blocks),)
 
     big_blocks = [_item_markup(item, zone) for item in big]
-    smaller_blocks = [_item_markup(item, zone) for item in smaller]
     if not big_blocks:
         big_blocks = [
             (
-                "No additional major reports outside Your Team Impact."
+                "No additional high-impact reports outside Your Team."
                 if impacts
-                else "No major reports in this window."
-            )
-        ]
-    if not smaller_blocks:
-        smaller_blocks = [
-            (
-                "No additional smaller moves outside Your Team Impact."
-                if impacts
-                else "No smaller fantasy-relevant moves in this window."
+                else "No high-impact fantasy reports in this window."
             )
         ]
 
-    learn_block = f"🎓 <b>LEARN THE GAME</b>\n<i>{_escape(learn)}</i>"
-    omitted_total = omitted_big + omitted_smaller
+    omitted_total = omitted_big
     overflow_blocks = (
         [
             f"<i>+ {omitted_total} more saved "
@@ -934,9 +899,8 @@ def format_daily_recap(
         zone=zone,
         sections=(
             *team_section,
-            ("🔥 <b>BIG NEWS</b>", big_blocks),
-            ("🧩 <b>SMALLER MOVES</b>", smaller_blocks),
-            ("", [*overflow_blocks, learn_block]),
+            ("🔥 <b>HIGH-IMPACT NEWS</b>", big_blocks),
+            ("", overflow_blocks),
         ),
         max_units=max_units,
     )

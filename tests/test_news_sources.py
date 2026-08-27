@@ -9,8 +9,16 @@ from notifier.models import LeagueRef, NewsItem, RosterPlayer, RosterSnapshot
 from notifier.pipeline import _depth_report_text
 from notifier.plays import DepthCharts
 from notifier.sources.rotowire import parse_feed, reattribute_beneficiary_report
-from notifier.sources.reporters import PlayerNameIndex
+from notifier.sources.reporters import ALL_REPORTERS, PlayerNameIndex, build_stream_rules
 from notifier.sources.twitter import TwitterStream
+
+
+def test_stream_rules_include_verified_packers_breaking_reporters() -> None:
+    expected = {"mattschneidman", "ByRyanWood", "RobDemovsky", "by_JBH"}
+    assert expected.issubset(set(ALL_REPORTERS))
+    rendered = " ".join(rule["value"] for rule in build_stream_rules())
+    for handle in expected:
+        assert f"from:{handle}" in rendered
 
 
 def test_rotowire_feed_preserves_source_time_and_cleans_markup() -> None:
