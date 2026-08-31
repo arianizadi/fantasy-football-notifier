@@ -82,6 +82,26 @@ PRESEASON_MIN_SEVERITY = 3
 UNCERTAIN_SUBJECT_MIN_SEVERITY = 4
 PRESEASON_MAX_RANK = 250
 
+# Immediate Telegram is the scarce attention channel. Lower-priority reports
+# remain searchable and available to the daily recap, but only owned-player
+# news, a verified move the manager can make, or genuinely major news about a
+# highly relevant fantasy player may interrupt the user in real time.
+HIGH_YIELD_LEAGUE_MAX_RANK = 150
+HIGH_YIELD_POSITIONS = frozenset({"QB", "RB", "WR", "TE"})
+HIGH_YIELD_LEAGUE_EVENTS = frozenset(
+    {
+        "injury",
+        "inactive",
+        "return",
+        "trade",
+        "signing",
+        "release",
+        "suspension",
+        "depth_chart",
+        "usage",
+    }
+)
+
 ROSTER_STALE_HOURS = 36
 PLAYER_INDEX_REFRESH_SECONDS = sleeper.PLAYER_INDEX_TTL_SECONDS
 PLAYER_INDEX_RETRY_SECONDS = 15 * 60
@@ -133,6 +153,53 @@ def _fantasypros_failure_delay(
     if error in FANTASYPROS_UNAVAILABLE_ERRORS:
         return float(max(healthy_refresh_seconds, FANTASYPROS_UNAVAILABLE_RETRY_SECONDS))
     return _fantasypros_retry_delay(consecutive_failures)
+
+
+def _positive_int(value: object) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _passes_high_yield_live_gate(
+    alert: Alert,
+    player_record: dict | None,
+) -> bool:
+    """Whether this report deserves an immediate Telegram interruption.
+
+    Filtering here does not discard the report: it was already classified,
+    journaled, and embedded, so `/news` and the daily recap can still use it.
+    """
+    urgency = alert.urgency
+    if urgency is None or not alert.item.subject_confident:
+        return False
+
+    if alert.tier == "mine":
+        return urgency.roster_relevant
+
+    if alert.tier == "claimable":
+        return bool(
+            urgency.availability_verified
+            and urgency.action_available
+            and urgency.level in {"act_today", "act_now"}
+        )
+
+    if alert.tier not in {"league", "rival"} or not isinstance(
+        player_record, dict
+    ):
+        return False
+    position = str(player_record.get("position") or "").strip().upper()
+    rank = _positive_int(player_record.get("search_rank"))
+    event = (urgency.canonical_event_type or "other").strip().lower()
+    return bool(
+        alert.classification.severity >= 5
+        and position in HIGH_YIELD_POSITIONS
+        and rank is not None
+        and rank <= HIGH_YIELD_LEAGUE_MAX_RANK
+        and event in HIGH_YIELD_LEAGUE_EVENTS
+    )
 
 
 def _depth_report_text(item: NewsItem) -> str:
@@ -1285,9 +1352,8 @@ class Notifier:
         per_league = self._enrich_fantasypros(per_league)
         tier = self._tier_for(per_league) if per_league else "league"
 
-        # Build and assess before the alert threshold so the searchable
-        # archive learns from lower-priority reports too. Urgency never changes
-        # whether a report passes the existing severity/noise gate.
+        # Build and assess before live delivery gates so the searchable archive,
+        # embeddings, and daily recap still learn from lower-priority reports.
         relevant = [
             plays
             for plays in per_league
@@ -1328,6 +1394,27 @@ class Notifier:
                 tier=tier,
                 severity=classification.severity,
                 threshold=threshold,
+            )
+            return None
+        if not _passes_high_yield_live_gate(alert, record):
+            self._journal_classification(
+                item,
+                classification,
+                tier=tier,
+                outcome="filtered_low_yield",
+            )
+            structured_log(
+                logging.DEBUG,
+                "pipeline.low_yield",
+                player=item.player_name,
+                tier=tier,
+                severity=classification.severity,
+                urgency=alert.urgency.level if alert.urgency is not None else "",
+                actionAvailable=(
+                    alert.urgency.action_available
+                    if alert.urgency is not None
+                    else False
+                ),
             )
             return None
         self._journal_classification(

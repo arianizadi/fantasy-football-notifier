@@ -37,7 +37,7 @@ from .matcher import compact_key
 from .models import ActionUrgency, Alert, Classification
 from .plays import normalized_event_type
 
-POLICY_VERSION = "urgency-v1"
+POLICY_VERSION = "urgency-v2"
 LEVELS = ("fyi", "monitor", "act_today", "act_now")
 LEVEL_RANK = {level: index for index, level in enumerate(LEVELS)}
 MAX_HISTORY_CANDIDATES = 200
@@ -102,6 +102,31 @@ _GAME_AVAILABLE_CUE = re.compile(
     + r")\b",
     re.I,
 )
+_EXPECTED_GAME_AVAILABLE_CUE = re.compile(
+    r"\b(?:"
+    r"(?:is|are|was|were|remains?|remain|should\s+be|will\s+be)\s+"
+    r"(?:expected|likely|projected|hopeful)\s+(?:to\s+(?:be\s+)?)?"
+    r"(?:active|available|play|suit\s+up|[\"'\u201c\u201d]?good\s+to\s+go[\"'\u201c\u201d]?)"
+    r"|(?:is|are|was|were|remains?|remain)\s+on\s+track\s+"
+    r"(?:to\s+(?:be\s+)?(?:play|active|available|suit\s+up)|for\s+"
+    + _GAME_CONTEXT
+    + r")"
+    r"|(?:expected|likely|projected|hopeful|on\s+track)\s+"
+    r"(?:to\s+(?:be\s+)?(?:play|active|available|suit\s+up|"
+    r"[\"'\u201c\u201d]?good\s+to\s+go[\"'\u201c\u201d]?)|for\s+"
+    + _GAME_CONTEXT
+    + r")"
+    r"|(?:should|will)\s+be\s+[\"'\u201c\u201d]?good\s+to\s+go"
+    r"[\"'\u201c\u201d]?(?:\s+for\s+"
+    + _GAME_CONTEXT
+    + r")?"
+    r"|(?:is|are|was|were|will\s+be)\s+(?:being\s+)?counted\s+on\s+"
+    r"(?:to\s+play|for\s+"
+    + _GAME_CONTEXT
+    + r")"
+    r")\b",
+    re.I,
+)
 _RETURN_NEGATION_PREFIX = re.compile(
     # Keep this bounded to the current clause. It covers ordinary NFL wording
     # such as "has not yet been activated" and "is not expected to be
@@ -131,6 +156,30 @@ _SUSPENSION_CONTEXT_CUE = re.compile(r"\b(?:suspension|suspended|ban)\b", re.I)
 _SUSPENSION_RENEWED_CUE = re.compile(
     r"\b(?:re[- ]?suspended|suspended\s+again|again\s+suspended|"
     r"suspension\s+(?:was\s+)?reinstated)\b",
+    re.I,
+)
+_CONFIRMED_SUSPENSION_CUE = re.compile(
+    r"\b(?:suspended|inactive|"
+    r"commissioner(?:['\u2019]s)?[-\s]+exempt\s+list)\b|"
+    r"\b(?:one|two|three|four|five|six|seven|eight|nine|ten|\d+)"
+    r"[-\s]+(?:game|week)[-\s]+suspension\b|"
+    r"\bsuspension\b(?:(?![.!?;\n]).){0,48}\b(?:issued|imposed|announced|"
+    r"upheld|reinstated|begins?|starts?|takes\s+effect|remains?\s+in\s+effect)\b|"
+    r"\b(?:issued|imposed|announced|upheld|reinstated|serving)\b"
+    r"(?:(?![.!?;\n]).){0,48}\bsuspension\b",
+    re.I,
+)
+_SUSPENSION_SPECULATION_PREFIX = re.compile(
+    r"\b(?:could|may|might|should|possibly|potentially|likely|expected|"
+    r"possible|potential|risk|possibility|if|face|faces|facing|seek|seeks|"
+    r"seeking|recommend|recommends|recommended)\b"
+    r"(?:(?![.!?;\n]).){0,64}$",
+    re.I,
+)
+_SUSPENSION_STILL_ACTIVE_CUE = re.compile(
+    r"\b(?:not\s+reinstated\b(?:(?![.!?;\n]).){0,64}\bsuspension\b|"
+    r"suspension\b(?:(?![.!?;\n]).){0,48}\b(?:not\s+lifted|not\s+ended|"
+    r"remains?\s+in\s+effect))",
     re.I,
 )
 _RELEASE_TRANSACTION_CUE = re.compile(
@@ -262,6 +311,45 @@ def _cue_refers_to_subject(text: str, cue: re.Match[str], item: Any) -> bool:
     )
 
 
+def _nearby_status_cue_refers_to_subject(
+    text: str,
+    cue: re.Match[str],
+    item: Any,
+) -> bool:
+    """Bind compact status headlines without borrowing a teammate's status."""
+    if _cue_refers_to_subject(text, cue, item):
+        return True
+    player = _subject_reference_pattern(str(item.player_name or ""))
+    if player is None:
+        return False
+    clause_start, clause_end = _clause_bounds(text, cue)
+    before = text[clause_start : cue.start()]
+    after = text[cue.end() : clause_end]
+    before_matches = list(player.finditer(before))
+    if before_matches:
+        between = before[before_matches[-1].end() :]
+        if len(between) <= 80 and re.search(
+            r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b",
+            between,
+        ) is None:
+            return True
+    after_match = player.search(after[:80])
+    if after_match is not None:
+        lead = after[: after_match.start()]
+        if re.search(
+            r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b",
+            lead,
+        ) is None:
+            return True
+    # RotoWire and FantasyPros establish the subject structurally in their
+    # dedicated title/article even when a compact headline omits the name.
+    return bool(
+        str(item.source or "").casefold() in {"rotowire", "fantasypros"}
+        and bool(getattr(item, "subject_confident", True))
+        and cue.start() < len(str(item.headline or ""))
+    )
+
+
 def _game_available_cue_refers_to_subject(
     text: str,
     cue: re.Match[str],
@@ -292,6 +380,24 @@ def _game_available_cue_refers_to_subject(
         and cue.start() < len(str(item.headline or ""))
         and cue.start() <= 12
     )
+
+
+def _suspension_is_confirmed(text: str, item: Any) -> bool:
+    """Require an actual NFL availability restriction, not legal speculation."""
+    for pattern in (_SUSPENSION_RENEWED_CUE, _SUSPENSION_STILL_ACTIVE_CUE):
+        for match in pattern.finditer(text):
+            if _nearby_status_cue_refers_to_subject(text, match, item):
+                return True
+    for match in _CONFIRMED_SUSPENSION_CUE.finditer(text):
+        prefix = text[max(0, match.start() - 96) : match.start()]
+        if (
+            _RETURN_NEGATION_PREFIX.search(prefix) is not None
+            or _SUSPENSION_SPECULATION_PREFIX.search(prefix) is not None
+        ):
+            continue
+        if _nearby_status_cue_refers_to_subject(text, match, item):
+            return True
+    return False
 
 
 def _suspension_cue_refers_to_subject(
@@ -380,6 +486,11 @@ def canonical_urgency_event(item: Any, classification: Any) -> str:
     text = f"{item.headline}\n{item.body}"
     if event == "suspension" and _suspension_was_resolved(text, item):
         return "return"
+    if event == "suspension" and not _suspension_is_confirmed(text, item):
+        # Arrests, charges, allegations, and investigations can eventually
+        # produce discipline, but they do not remove a player today. Treating
+        # that possibility as an absence creates a false next-man-up alert.
+        return "other"
     if event == "release" and _release_was_reversed(text, item):
         return "signing"
     # A provider/model can label an activation as an injury because the report
@@ -387,6 +498,9 @@ def canonical_urgency_event(item: Any, classification: Any) -> str:
     # cue wins unless the same report explicitly states a renewed absence.
     raw_status_matches = list(_RETURN_STATUS_CUE.finditer(text))
     raw_game_available_matches = list(_GAME_AVAILABLE_CUE.finditer(text))
+    raw_expected_available_matches = list(
+        _EXPECTED_GAME_AVAILABLE_CUE.finditer(text)
+    )
     direct_matches = [
         match
         for match in _DIRECT_RETURN_CUE.finditer(text)
@@ -402,9 +516,18 @@ def canonical_urgency_event(item: Any, classification: Any) -> str:
         for match in raw_game_available_matches
         if _game_available_cue_refers_to_subject(text, match, item)
     ]
+    expected_available_matches = [
+        match
+        for match in raw_expected_available_matches
+        if _nearby_status_cue_refers_to_subject(text, match, item)
+    ]
     positive_status_positions = [
         match.start()
-        for match in (*status_matches, *game_available_matches)
+        for match in (
+            *status_matches,
+            *game_available_matches,
+            *expected_available_matches,
+        )
         if not _return_cue_is_negated(text, match.start())
     ]
     positive_status = bool(positive_status_positions)
@@ -437,7 +560,10 @@ def canonical_urgency_event(item: Any, classification: Any) -> str:
                 not _return_cue_is_negated(text, match.start())
                 for match in direct_matches
             )
-            or bool(game_available_matches and positive_status)
+            or bool(
+                (game_available_matches or expected_available_matches)
+                and positive_status
+            )
         )
         and not renewed_unavailable
     )
@@ -445,8 +571,16 @@ def canonical_urgency_event(item: Any, classification: Any) -> str:
         return "injury"
     if (
         event == "return"
-        and (raw_status_matches or raw_game_available_matches)
-        and not (status_matches or game_available_matches)
+        and (
+            raw_status_matches
+            or raw_game_available_matches
+            or raw_expected_available_matches
+        )
+        and not (
+            status_matches
+            or game_available_matches
+            or expected_available_matches
+        )
     ):
         return "other"
     if event in {"other", "injury", "inactive", "practice_report", "return"} and (
@@ -521,6 +655,13 @@ def _assessment(
 def assess_rule_urgency(alert: Alert) -> ActionUrgency:
     """Return the authoritative rule result from current league facts."""
     event = urgency_event_type(alert)
+    reported_event = normalized_event_type(
+        str(alert.classification.raw.get("model_event_type") or "")
+        or alert.classification.event_type
+    )
+    unconfirmed_suspension = bool(
+        reported_event == "suspension" and event == "other"
+    )
     direction = urgency_direction(alert)
     status = urgency_event_status(alert)
     severity = max(1, min(5, int(alert.classification.severity)))
@@ -593,6 +734,13 @@ def assess_rule_urgency(alert: Alert) -> ActionUrgency:
             "draft_monitor" if severity >= 3 else "informational",
             has_action=False,
             relevant=False,
+        )
+
+    if unconfirmed_suspension:
+        return result(
+            "monitor" if (roster_relevant or severity >= 4) else "fyi",
+            "await_final_status" if roster_relevant else "informational",
+            has_action=False,
         )
 
     if not availability_verified:

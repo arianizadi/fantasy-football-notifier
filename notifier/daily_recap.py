@@ -32,6 +32,8 @@ DEFAULT_TIMEZONE = "America/Los_Angeles"
 MAX_BIG_NEWS_ITEMS = 8
 MAX_SMALLER_MOVES_ITEMS = 0
 MAX_TEAM_IMPACT_ITEMS = 6
+MAX_GENERAL_NEWS_RANK = 150
+MAX_ROOM_IMPACT_RANK = 250
 
 BIG_TIERS = frozenset({"mine", "claimable"})
 USEFUL_SMALL_EVENTS = frozenset(
@@ -406,21 +408,41 @@ def _select_items(
     items: Iterable[RecapItem],
     *,
     excluded: frozenset[tuple[str, str]] = frozenset(),
+    player_index: Mapping[str, Any] | None = None,
 ) -> tuple[tuple[RecapItem, ...], tuple[RecapItem, ...]]:
     big: list[RecapItem] = []
     smaller: list[RecapItem] = []
+    player_records = _player_records_by_name(player_index)
     for item in items:
         if _dedupe_key(item) in excluded:
             continue
-        if item.severity >= 4 or (
-            item.severity >= 3 and item.tier in BIG_TIERS
+        if player_index is None:
+            if item.severity >= 4 or (
+                item.severity >= 3 and item.tier in BIG_TIERS
+            ):
+                big.append(item)
+            elif 2 <= item.severity <= 3 and (
+                item.event_type in USEFUL_SMALL_EVENTS
+                or item.tier in BIG_TIERS
+            ):
+                smaller.append(item)
+            continue
+        if not item.subject_confident or item.event_type not in USEFUL_SMALL_EVENTS:
+            continue
+        if item.severity >= 3 and item.tier in BIG_TIERS:
+            big.append(item)
+            continue
+        record = player_records.get(compact_key(item.player_name))
+        try:
+            search_rank = int(record.get("search_rank")) if record is not None else 0
+        except (TypeError, ValueError):
+            search_rank = 0
+        if (
+            item.severity >= 5
+            and record is not None
+            and 0 < search_rank <= MAX_GENERAL_NEWS_RANK
         ):
             big.append(item)
-        elif 2 <= item.severity <= 3 and (
-            item.event_type in USEFUL_SMALL_EVENTS
-            or item.tier in BIG_TIERS
-        ):
-            smaller.append(item)
 
     big.sort(key=_item_order)
     smaller.sort(key=_item_order)
@@ -504,8 +526,15 @@ def _select_roster_impacts(
 
         direct = tuple(roster_by_name.get(subject_key, ()))
         related: tuple[RosterPlayer, ...] = ()
-        if item.severity >= 3 and item.event_type in ROOM_IMPACT_EVENTS:
+        if item.severity >= 4 and item.event_type in ROOM_IMPACT_EVENTS:
             record = records.get(subject_key)
+            if record is not None:
+                try:
+                    subject_rank = int(record.get("search_rank"))
+                except (TypeError, ValueError):
+                    subject_rank = 0
+                if not (0 < subject_rank <= MAX_ROOM_IMPACT_RANK):
+                    record = None
             if record is not None:
                 teams = {
                     team
@@ -848,6 +877,7 @@ def format_daily_recap(
     selected_big, _selected_smaller = _select_items(
         merged,
         excluded=impact_keys,
+        player_index=player_index,
     )
     omitted_impacts = max(0, len(selected_impacts) - MAX_TEAM_IMPACT_ITEMS)
     omitted_big = max(0, len(selected_big) - MAX_BIG_NEWS_ITEMS)

@@ -96,6 +96,85 @@ def test_high_signal_model_outage_still_passes_preseason_gate(monkeypatch) -> No
     assert alert.classification.event_type == "injury"
 
 
+def test_release_keeps_event_label_without_universal_severity_floor(monkeypatch) -> None:
+    session = Mock()
+    session.post.side_effect = requests.Timeout("offline")
+    monkeypatch.setattr("notifier.classify.time.sleep", Mock())
+
+    fallback = classify(
+        session,
+        _config(),
+        _item("Example Player was waived during final roster cuts"),
+    )
+
+    assert fallback.event_type == "release"
+    assert fallback.severity == 3
+    assert fallback.raw["high_signal_floor"] is False
+
+    session = Mock()
+    session.post.return_value = _response(
+        '{"event_type":"release","direction":"negative","severity":1,'
+        '"fantasy_impact":"No meaningful fantasy role changes",'
+        '"is_actionable":false}'
+    )
+
+    classified = classify(
+        session,
+        _config(),
+        _item("Example Player was waived during final roster cuts"),
+    )
+
+    assert classified.event_type == "release"
+    assert classified.severity == 1
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Example Player was arrested and charged with DUI",
+        "Example Player could be suspended after an allegation",
+        "Example Player faces a possible two-game suspension after an allegation",
+        "Example Player was not suspended after the investigation",
+    ],
+)
+def test_legal_speculation_is_not_a_high_signal_suspension_during_outage(
+    monkeypatch,
+    text: str,
+) -> None:
+    session = Mock()
+    session.post.side_effect = requests.Timeout("offline")
+    monkeypatch.setattr("notifier.classify.time.sleep", Mock())
+
+    result = classify(session, _config(), _item(text))
+
+    assert result.event_type == "other"
+    assert result.severity == 3
+    assert result.raw["high_signal_floor"] is False
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "The NFL suspended Example Player for two games",
+        "Example Player was placed on the Commissioner Exempt List",
+        "Example Player's two-game suspension was upheld",
+    ],
+)
+def test_confirmed_suspension_keeps_high_signal_floor_during_outage(
+    monkeypatch,
+    text: str,
+) -> None:
+    session = Mock()
+    session.post.side_effect = requests.Timeout("offline")
+    monkeypatch.setattr("notifier.classify.time.sleep", Mock())
+
+    result = classify(session, _config(), _item(text))
+
+    assert result.event_type == "suspension"
+    assert result.severity == 4
+    assert result.raw["high_signal_floor"] is True
+
+
 @pytest.mark.parametrize(
     ("severity", "should_alert"),
     [(2, False), (3, True)],

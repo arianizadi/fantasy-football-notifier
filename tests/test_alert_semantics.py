@@ -244,6 +244,7 @@ def test_deep_release_does_not_promote_an_even_deeper_player() -> None:
         subject_state="free_agent",
         subject_owner="",
         subject_depth_order=7,
+        subject_position="WR",
         beneficiaries=[Beneficiary("Depth WR", "WR", 8, "free_agent")],
     )
 
@@ -260,6 +261,7 @@ def test_starter_release_can_still_surface_the_immediate_successor() -> None:
         subject_state="rostered",
         subject_owner="Opponent",
         subject_depth_order=1,
+        subject_position="RB",
         beneficiaries=[Beneficiary("Next Player", "RB", 2, "free_agent")],
     )
 
@@ -274,6 +276,8 @@ def test_major_injury_retains_deterministic_add_and_start_moves() -> None:
         league=league,
         subject_state="mine",
         subject_owner="Mine",
+        subject_depth_order=1,
+        subject_position="TE",
         beneficiaries=[Beneficiary("Jake Tonges", "TE", 2, "free_agent")],
         bench_options=["Sam LaPorta"],
     )
@@ -295,6 +299,58 @@ def test_major_injury_retains_deterministic_add_and_start_moves() -> None:
     assert "<b>Sunday Crew</b>" in text
     assert "Pickup option\n🟢 <b>Jake Tonges</b> · Sleeper TE2" in text
     assert "Start instead: <b>Sam LaPorta</b>" in text
+
+
+@pytest.mark.parametrize(
+    ("position", "depth_order"),
+    [("QB", 2), ("RB", 5), ("WR", 7), ("TE", 2)],
+)
+def test_deep_absence_does_not_create_a_waiver_move(
+    position: str,
+    depth_order: int,
+) -> None:
+    league = LeagueRef("sleeper", "1234", "Home League", "Mine")
+    raw = LeaguePlays(
+        league=league,
+        subject_state="rostered",
+        subject_owner="Opponent",
+        subject_depth_order=depth_order,
+        subject_position=position,
+        beneficiaries=[
+            Beneficiary("Deeper Player", position, depth_order + 1, "free_agent")
+        ],
+    )
+
+    filtered = plays_for_event([raw], "injury", 4)[0]
+
+    assert filtered.claimable == []
+    assert not filtered.has_action
+
+
+def test_explicitly_named_successor_can_override_depth_boundary() -> None:
+    league = LeagueRef("sleeper", "1234", "Home League", "Mine")
+    raw = LeaguePlays(
+        league=league,
+        subject_state="rostered",
+        subject_owner="Opponent",
+        subject_depth_order=5,
+        subject_position="RB",
+        beneficiaries=[
+            Beneficiary(
+                "Named Replacement",
+                "RB",
+                6,
+                "free_agent",
+                named_in_report=True,
+            )
+        ],
+    )
+
+    filtered = plays_for_event([raw], "injury", 4)[0]
+
+    assert [candidate.name for candidate in filtered.claimable] == [
+        "Named Replacement"
+    ]
 
 
 def test_unsettled_backfield_shows_two_alternatives_and_roster_capacity() -> None:

@@ -36,7 +36,12 @@ ROLE_METADATA_MIGRATION_VERSION = 1
 MAX_FEEDBACK = 1000
 MAX_FEEDBACK_TARGETS = 2000
 ALERT_RETENTION_DAYS = 8
-EDIT_WINDOW_SECONDS = 6 * 60 * 60
+EDIT_WINDOW_SECONDS = 24 * 60 * 60
+EPISODE_COALESCE_EVENTS = frozenset({"release", "suspension"})
+EPISODE_COALESCE_STATUSES = frozenset(
+    {"season_out", "injured_reserve", "inactive", "cleared"}
+)
+_URGENCY_RANK = {"": 0, "fyi": 1, "monitor": 2, "act_today": 3, "act_now": 4}
 SCHEDULED_REPORT_RETENTION_DAYS = 30
 MAX_SCHEDULED_REPORTS = 120
 
@@ -491,6 +496,16 @@ class TelegramState:
                     status=current_status,
                 )
             )
+            same_episode_phase = bool(
+                alert.item.subject_confident
+                and current_event == previous_event
+                and current_status
+                and current_status == previous_status
+                and (
+                    current_event in EPISODE_COALESCE_EVENTS
+                    or current_status in EPISODE_COALESCE_STATUSES
+                )
+            )
             embedding_state_match = bool(
                 embedding_hint
                 and alert.item.subject_confident
@@ -509,7 +524,11 @@ class TelegramState:
                     )
                 )
             )
-            if not deterministic_match and not embedding_state_match:
+            if (
+                not deterministic_match
+                and not embedding_state_match
+                and not same_episode_phase
+            ):
                 return None
             same_role_fact = (
                 current_event == "depth_chart"
@@ -531,6 +550,19 @@ class TelegramState:
                 and current_severity > previous_severity
                 and not same_role_fact
                 and not same_trade_fact
+            ):
+                return None
+            previous_urgency = str(entry.get("urgencyLevel") or "").strip().lower()
+            current_urgency = (
+                alert.urgency.level.strip().lower()
+                if alert.urgency is not None
+                else ""
+            )
+            if (
+                previous_urgency
+                and current_urgency
+                and _URGENCY_RANK.get(current_urgency, 0)
+                > _URGENCY_RANK.get(previous_urgency, 0)
             ):
                 return None
 
@@ -754,7 +786,7 @@ class TelegramState:
                 return False
 
             previous_payload = copy.deepcopy(self._payload)
-            # Keep sentAt stable so repeated edits cannot extend the six-hour
+            # Keep sentAt stable so repeated edits cannot extend the 24-hour
             # coalescing window. Rotate the token because the visible text now
             # represents this report; the old target and any old vote remain
             # in feedbackTargets/feedback as historical evidence.

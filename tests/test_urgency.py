@@ -399,6 +399,81 @@ def test_resolved_suspension_never_creates_a_removal_action(headline: str) -> No
 @pytest.mark.parametrize(
     "headline",
     [
+        "Keenan Allen was arrested and charged with DUI",
+        "Keenan Allen faces two misdemeanor charges after an allegation",
+        "Keenan Allen could be suspended if the NFL disciplines him",
+        "Keenan Allen faces a possible two-game suspension after an allegation",
+        "Keenan Allen was not suspended after the investigation",
+    ],
+)
+def test_legal_news_without_confirmed_restriction_never_creates_removal_action(
+    headline: str,
+) -> None:
+    alert = _alert(
+        player="Keenan Allen",
+        headline=headline,
+        event="suspension",
+        tier="claimable",
+        subject_state="rostered",
+        severity=4,
+        claimable=True,
+    )
+
+    urgency = assess_rule_urgency(alert)
+    corrected = _canonicalize_classification(alert.item, alert.classification)
+    filtered = plays_for_event(
+        alert.per_league,
+        urgency.canonical_event_type,
+        alert.classification.severity,
+    )
+
+    assert urgency.canonical_event_type == "other"
+    assert urgency.level == "monitor"
+    assert urgency.action_available is False
+    assert corrected.event_type == "other"
+    assert all(not plays.has_action for plays in filtered)
+
+
+@pytest.mark.parametrize(
+    "headline",
+    [
+        "The NFL suspended Mike Evans for two games",
+        "The NFL placed Mike Evans on the Commissioner Exempt List",
+        "Mike Evans' two-game suspension was upheld",
+        "Mike Evans is inactive after receiving a suspension",
+    ],
+)
+def test_explicit_suspension_or_exempt_status_remains_a_removal_action(
+    headline: str,
+) -> None:
+    alert = _alert(
+        player="Mike Evans",
+        headline=headline,
+        event="suspension",
+        tier="claimable",
+        subject_state="rostered",
+        severity=4,
+        claimable=True,
+    )
+
+    urgency = assess_rule_urgency(alert)
+    corrected = _canonicalize_classification(alert.item, alert.classification)
+    filtered = plays_for_event(
+        alert.per_league,
+        urgency.canonical_event_type,
+        alert.classification.severity,
+    )
+
+    assert urgency.canonical_event_type == "suspension"
+    assert urgency.level == "act_now"
+    assert urgency.action_available is True
+    assert corrected.event_type == "suspension"
+    assert any(plays.has_action for plays in filtered)
+
+
+@pytest.mark.parametrize(
+    "headline",
+    [
         "Mike Evans was not reinstated after his suspension",
         "Mike Evans was reinstated Monday but suspended again Tuesday",
         "Mike Evans was reinstated Monday and then re-suspended Tuesday",
@@ -437,6 +512,85 @@ def test_other_players_reinstatement_does_not_clear_subject_suspension() -> None
     urgency = assess_rule_urgency(alert)
 
     assert urgency.canonical_event_type == "suspension"
+    assert urgency.direction == "negative"
+    assert urgency.level == "act_now"
+
+
+@pytest.mark.parametrize(
+    "headline",
+    [
+        'TreVeyon Henderson is expected to be "good to go" for Week 1',
+        "Mike Evans is on track to play Sunday",
+        "Mike Evans is hopeful to be available for the season opener",
+        "Mike Evans should be good to go for Week 1",
+    ],
+)
+def test_expected_game_availability_never_creates_backup_removal_action(
+    headline: str,
+) -> None:
+    alert = _alert(
+        player="Mike Evans" if "Mike Evans" in headline else "TreVeyon Henderson",
+        headline=headline,
+        event="injury",
+        tier="claimable",
+        subject_state="rostered",
+        severity=3,
+        claimable=True,
+    )
+
+    urgency = assess_rule_urgency(alert)
+    corrected = _canonicalize_classification(alert.item, alert.classification)
+    filtered = plays_for_event(
+        alert.per_league,
+        urgency.canonical_event_type,
+        alert.classification.severity,
+    )
+
+    assert urgency.canonical_event_type == "return"
+    assert urgency.direction == "positive"
+    assert urgency.level == "monitor"
+    assert urgency.action_available is False
+    assert corrected.event_type == "return"
+    assert all(not plays.has_action for plays in filtered)
+
+
+def test_structured_on_track_headline_without_repeated_subject_is_a_return() -> None:
+    alert = _alert(
+        player="TreVeyon Henderson",
+        headline="On track for Week 1",
+        event="injury",
+        tier="claimable",
+        subject_state="rostered",
+        severity=3,
+        claimable=True,
+    )
+    alert = replace(alert, item=replace(alert.item, source="rotowire"))
+
+    urgency = assess_rule_urgency(alert)
+    filtered = plays_for_event(
+        alert.per_league,
+        urgency.canonical_event_type,
+        alert.classification.severity,
+    )
+
+    assert urgency.canonical_event_type == "return"
+    assert urgency.action_available is False
+    assert all(not plays.has_action for plays in filtered)
+
+
+def test_expected_return_followed_by_ruled_out_preserves_newer_absence() -> None:
+    alert = _alert(
+        player="Mike Evans",
+        headline="Mike Evans was expected to play Sunday but was ruled out Monday",
+        event="injury",
+        slot="WR",
+        severity=4,
+        bench=True,
+    )
+
+    urgency = assess_rule_urgency(alert)
+
+    assert urgency.canonical_event_type == "injury"
     assert urgency.direction == "negative"
     assert urgency.level == "act_now"
 

@@ -1075,15 +1075,68 @@ def test_legacy_thread_without_event_metadata_fails_safe_to_new_send(tmp_path) -
     assert session.payloads[0]["reply_parameters"]["message_id"] == 77
 
 
-def test_coalescing_window_is_six_hours_from_original_send(tmp_path) -> None:
+def test_coalescing_window_is_24_hours_from_original_send(tmp_path) -> None:
     state = TelegramState(tmp_path / "telegram-state.json")
     alert = _alert("tweet:window")
     state.record_sent(alert, 42)
     persisted = json.loads((tmp_path / "telegram-state.json").read_text())
     sent_at = persisted["threads"]["georgekittle"]["sentAt"]
 
-    assert state.coalescing_target(alert, now=sent_at + (6 * 60 * 60) - 1) is not None
-    assert state.coalescing_target(alert, now=sent_at + (6 * 60 * 60)) is None
+    assert state.coalescing_target(alert, now=sent_at + (24 * 60 * 60) - 1) is not None
+    assert state.coalescing_target(alert, now=sent_at + (24 * 60 * 60)) is None
+
+
+def test_same_ir_phase_edits_even_when_later_report_adds_diagnosis(tmp_path) -> None:
+    state = TelegramState(tmp_path / "telegram-state.json")
+    first = _alert(
+        "tweet:ir:first",
+        player_name="Jordyn Tyson",
+        headline="Jordyn Tyson was placed on injured reserve",
+        event_type="injury",
+        severity=5,
+    )
+    state.record_sent(first, 42)
+    detail = _alert(
+        "tweet:ir:detail",
+        player_name="Jordyn Tyson",
+        headline="Jordyn Tyson is on injured reserve after knee surgery",
+        event_type="injury",
+        severity=5,
+    )
+
+    assert state.coalescing_target(detail).message_id == 42
+
+
+def test_same_suspension_phase_edits_but_urgency_escalation_is_new(tmp_path) -> None:
+    state = TelegramState(tmp_path / "telegram-state.json")
+    first = replace(
+        _alert(
+            "tweet:suspension:first",
+            player_name="Example Player",
+            headline="Example Player was suspended",
+            event_type="suspension",
+            severity=4,
+        ),
+        urgency=ActionUrgency(rule_level="monitor", level="monitor"),
+    )
+    state.record_sent(first, 42)
+    detail = replace(
+        _alert(
+            "tweet:suspension:detail",
+            player_name="Example Player",
+            headline="Example Player's suspension will last four games",
+            event_type="suspension",
+            severity=4,
+        ),
+        urgency=ActionUrgency(rule_level="monitor", level="monitor"),
+    )
+    escalated = replace(
+        detail,
+        urgency=ActionUrgency(rule_level="act_now", level="act_now"),
+    )
+
+    assert state.coalescing_target(detail).message_id == 42
+    assert state.coalescing_target(escalated) is None
 
 
 def test_dry_run_does_not_create_telegram_state(tmp_path) -> None:

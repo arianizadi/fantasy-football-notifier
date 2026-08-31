@@ -47,17 +47,26 @@ Return ONLY a JSON object with these keys:
   direction: one of positive, negative, mixed, neutral for this player's
     fantasy outlook (not the emotional tone of the writing)
   severity: integer 1-5 for fantasy relevance
-    1 = noise (preseason rest, routine veteran day off, minor note)
+    1 = noise (preseason rest, routine veteran day off, minor note, fringe
+        roster cut, or non-fantasy-position transaction)
     2 = worth knowing (limited practice, small role change)
     3 = notable (questionable tag, timeshare shift, DNP Wednesday)
     4 = major (ruled out, multi-week injury, starter change, trade)
-    5 = season-defining (IR, ACL/Achilles tear, suspension, released)
+    5 = season-defining for a fantasy-relevant player (season-ending injury,
+        confirmed suspension, or a starting player's release)
   fantasy_impact: one factual sentence, max 140 chars, describing the likely
     fantasy consequence only. Never give add/drop/start/sit/activate/draft
     instructions; deterministic application code owns all roster advice.
   is_actionable: true if the manager should consider a lineup or waiver move
 
 Judge severity by fantasy consequence, not by how dramatic the wording is.
+For legal or disciplinary news, use suspension only when the player is
+explicitly suspended or placed on the Commissioner Exempt List; use inactive
+when that is the explicit game status. An arrest, charge, allegation,
+investigation, or possible future suspension is other until availability is
+actually restricted. A release or waiver is not inherently important: a
+fringe or deep-depth player being cut is severity 1 unless the transaction
+materially changes a fantasy-relevant role.
 Preseason starters being rested is severity 1."""
 
 
@@ -70,8 +79,30 @@ HIGH_SIGNAL = re.compile(
     r"activated\b[^.\n]{0,100}\b(?:from|off)\s+(?:the\s+)?(?:active/)?"
     r"(?:pup|physically\s+unable\s+to\s+perform|injured\s+reserve|ir)|ruptured|"
     r"injured\s+reserve|placed\s+on\s+ir|out\s+for\s+the\s+season|"
-    r"season[-\s]ending|suspended|released|waived|carted\s+off|"
+    r"season[-\s]ending|carted\s+off|"
     r"ruled\s+out|will\s+miss\s+\d+\s+(game|week))",
+    re.IGNORECASE,
+)
+CONFIRMED_SUSPENSION = re.compile(
+    r"\b(?:suspended|commissioner(?:['\u2019]s)?[-\s]+exempt\s+list)\b|"
+    r"\b(?:one|two|three|four|five|six|seven|eight|nine|ten|\d+)"
+    r"[-\s]+(?:game|week)[-\s]+suspension\b|"
+    r"\bsuspension\b(?:(?![.!?;\n]).){0,48}\b(?:issued|imposed|announced|"
+    r"upheld|reinstated|begins?|starts?|takes\s+effect|remains?\s+in\s+effect)\b|"
+    r"\b(?:issued|imposed|announced|upheld|reinstated|serving)\b"
+    r"(?:(?![.!?;\n]).){0,48}\bsuspension\b",
+    re.IGNORECASE,
+)
+SUSPENSION_SPECULATION_PREFIX = re.compile(
+    r"\b(?:could|may|might|should|possibly|potentially|likely|expected|"
+    r"possible|potential|risk|possibility|if|face|faces|facing|seek|seeks|"
+    r"seeking|recommend|recommends|recommended)\b"
+    r"(?:(?![.!?;\n]).){0,64}$",
+    re.IGNORECASE,
+)
+SUSPENSION_NEGATION_PREFIX = re.compile(
+    r"\b(?:not|never|isn['\u2019]t|wasn['\u2019]t|won['\u2019]t)\b"
+    r"(?:(?![.!?;\n]).){0,40}$",
     re.IGNORECASE,
 )
 HIGH_SIGNAL_FLOOR = 4
@@ -90,8 +121,20 @@ def _extract_json(text: str) -> dict:
     return json.loads(candidate)
 
 
+def _has_confirmed_suspension(text: str) -> bool:
+    for match in CONFIRMED_SUSPENSION.finditer(text):
+        prefix = text[max(0, match.start() - 96) : match.start()]
+        if (
+            SUSPENSION_SPECULATION_PREFIX.search(prefix) is None
+            and SUSPENSION_NEGATION_PREFIX.search(prefix) is None
+        ):
+            return True
+    return False
+
+
 def _has_high_signal(item: NewsItem) -> bool:
-    return bool(HIGH_SIGNAL.search(f"{item.headline} {item.body}"))
+    text = f"{item.headline} {item.body}"
+    return bool(HIGH_SIGNAL.search(text) or _has_confirmed_suspension(text))
 
 
 def _fallback_event_type(item: NewsItem) -> str:
@@ -99,7 +142,7 @@ def _fallback_event_type(item: NewsItem) -> str:
     text = f"{item.headline} {item.body}".lower()
     if re.search(r"\b(released|waived)\b", text):
         return "release"
-    if "suspend" in text:
+    if _has_confirmed_suspension(f"{item.headline} {item.body}"):
         return "suspension"
     if re.search(r"\b(activated|return(?:ed|s|ing)?|cleared)\b", text):
         return "return"

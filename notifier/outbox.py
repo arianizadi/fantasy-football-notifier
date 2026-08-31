@@ -213,6 +213,7 @@ def _league_plays(payload: dict[str, Any]) -> LeaguePlays:
         subject_state=str(payload.get("subject_state") or "free_agent"),
         subject_owner=str(payload.get("subject_owner") or ""),
         subject_depth_order=_optional_int(payload.get("subject_depth_order")),
+        subject_position=str(payload.get("subject_position") or ""),
         subject_lineup_slot=str(payload.get("subject_lineup_slot") or ""),
         subject_fantasy_starter=(
             bool(payload.get("subject_fantasy_starter"))

@@ -52,6 +52,16 @@ BACKUP_MOVE_MIN_SEVERITY = {
     "suspension": 4,
     "release": 4,
 }
+# A depth-chart vacancy is actionable only when it can plausibly create real
+# fantasy work.  Cutdown-day RB6/RB7 and WR7/WR8 chains are roster trivia, not
+# waiver opportunities.  A source that explicitly names the successor can
+# still override this conservative positional boundary.
+MAX_ACTIONABLE_SUBJECT_DEPTH = {
+    "QB": 1,
+    "RB": 2,
+    "WR": 3,
+    "TE": 1,
+}
 LINEUP_SUB_MIN_SEVERITY = {
     "injury": 4,
     "inactive": 3,
@@ -134,6 +144,7 @@ class LeaguePlays:
     subject_state: str  # "mine" | "rostered" | "free_agent"
     subject_owner: str
     subject_depth_order: int | None = None
+    subject_position: str = ""
     # Provider-normalized slot for the user's copy of the subject. Empty for
     # another manager's player or when the provider omitted the slot.
     subject_lineup_slot: str = ""
@@ -158,11 +169,36 @@ class LeaguePlays:
     def for_event(self, event_type: str, severity: int) -> LeaguePlays:
         """Copy containing only recommendations valid for this classified event."""
         event = normalized_event_type(event_type)
-        release_has_meaningful_vacancy = not (
-            event == "release"
-            and (
-                self.subject_depth_order is None
-                or self.subject_depth_order > 3
+        inferred_position = self.subject_position or next(
+            (
+                beneficiary.position
+                for beneficiary in self.beneficiaries
+                if beneficiary.position
+            ),
+            "",
+        )
+        max_depth = (
+            1
+            if event == "release"
+            else MAX_ACTIONABLE_SUBJECT_DEPTH.get(inferred_position.upper())
+        )
+        named_successor = any(
+            beneficiary.named_in_report for beneficiary in self.beneficiaries
+        )
+        meaningful_vacancy = bool(
+            named_successor
+            or (
+                max_depth is not None
+                and self.subject_depth_order is not None
+                and self.subject_depth_order <= max_depth
+            )
+            # Pending alerts serialized before subject position/depth existed
+            # can retain an already-computed option only for the user's own
+            # player. Unknown-depth external chains still fail closed.
+            or (
+                self.subject_state == "mine"
+                and not self.subject_position
+                and self.subject_depth_order is None
             )
         )
         return replace(
@@ -171,7 +207,7 @@ class LeaguePlays:
                 self.beneficiaries
                 if (
                     event_allows_backup_moves(event, severity)
-                    and release_has_meaningful_vacancy
+                    and meaningful_vacancy
                 )
                 else []
             ),
@@ -439,6 +475,7 @@ class DepthCharts:
                 subject_state=state,
                 subject_owner=owner,
                 subject_depth_order=order,
+                subject_position=position,
                 subject_lineup_slot=self._my_lineup_slots.get(league.key, {}).get(
                     compact_key(subject_name), ""
                 ),

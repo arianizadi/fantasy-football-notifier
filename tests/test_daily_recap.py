@@ -99,14 +99,25 @@ def test_sections_follow_severity_and_roster_relevance() -> None:
     rows = [
         _row("Roster Player", "injury", 3, tier="mine"),
         _row("Available Player", "usage", 3, tier="claimable", minutes_ago=31),
-        _row("League Star", "trade", 4, minutes_ago=32),
+        _row("League Star", "trade", 5, minutes_ago=32),
         _row("Practice Player", "practice_report", 3, minutes_ago=33),
         _row("Minor Player", "injury", 2, minutes_ago=34),
         _row("Generic Chatter", "other", 2, minutes_ago=35),
         _row("Tiny Note", "injury", 1, minutes_ago=36),
     ]
 
-    recap = format_daily_recap(rows, now=NOW)
+    recap = format_daily_recap(
+        rows,
+        now=NOW,
+        player_index={
+            "star": {
+                "full_name": "League Star",
+                "position": "WR",
+                "team": "SEA",
+                "search_rank": 20,
+            }
+        },
+    )
 
     assert [item.player_name for item in recap.big_news] == [
         "League Star",
@@ -119,6 +130,37 @@ def test_sections_follow_severity_and_roster_relevance() -> None:
     assert "Tiny Note" not in rendered
 
 
+def test_general_recap_omits_low_rank_and_unmatched_severity_five_news() -> None:
+    rows = [
+        _row("Top Player", "injury", 5),
+        _row("Fringe Player", "release", 5, minutes_ago=31),
+        _row("Unknown Cut", "release", 5, minutes_ago=32),
+    ]
+    recap = format_daily_recap(
+        rows,
+        now=NOW,
+        player_index={
+            "top": {
+                "full_name": "Top Player",
+                "position": "RB",
+                "team": "ARI",
+                "search_rank": 15,
+            },
+            "fringe": {
+                "full_name": "Fringe Player",
+                "position": "WR",
+                "team": "ARI",
+                "search_rank": 700,
+            },
+        },
+    )
+
+    assert [item.player_name for item in recap.big_news] == ["Top Player"]
+    rendered = "\n".join(recap.parts)
+    assert "Fringe Player" not in rendered
+    assert "Unknown Cut" not in rendered
+
+
 def test_team_impact_connects_direct_and_position_room_news_without_duplicates() -> None:
     espn = LeagueRef("espn", "1", "Certified Sped League", "Bak Choi Cr")
     sleeper = LeagueRef("sleeper", "2", "Sleeper Draft", "Future Team")
@@ -129,7 +171,12 @@ def test_team_impact_connects_direct_and_position_room_news_without_duplicates()
         leagues=[espn, sleeper],
     )
     player_index = {
-        "1": {"full_name": "Chuba Hubbard", "position": "RB", "team": "CAR"},
+        "1": {
+            "full_name": "Chuba Hubbard",
+            "position": "RB",
+            "team": "CAR",
+            "search_rank": 66,
+        },
         "2": {"full_name": "Miles Sanders", "position": "RB", "team": ""},
         "3": {"full_name": "Bryce Young", "position": "QB", "team": "CAR"},
     }
@@ -166,16 +213,16 @@ def test_team_impact_connects_direct_and_position_room_news_without_duplicates()
 
     assert [impact.item.player_name for impact in recap.team_impacts] == [
         "Chuba Hubbard",
-        "Miles Sanders",
     ]
-    assert [item.player_name for item in recap.big_news] == ["Bryce Young"]
+    assert recap.big_news == ()
     assert rendered.count("Hubbard was limited again Monday") == 1
-    assert rendered.count("Panthers released Miles Sanders") == 1
+    assert "Panthers released Miles Sanders" not in rendered
+    assert "Bryce Young" not in rendered
     assert "YOUR TEAM" in rendered
     assert "Sleeper Draft" not in rendered
     assert "Your player" in rendered
     assert "May affect Jonathan Brooks" in rendered
-    assert "May affect Chuba Hubbard" in rendered
+    assert "May affect Chuba Hubbard" not in rendered
     assert "same CAR RB room" in rendered
 
 
@@ -190,14 +237,14 @@ def test_trade_context_uses_explicit_origin_and_destination_not_pick_provenance(
         _row(
             "Kayshon Boutte",
             "trade",
-            3,
+            4,
             minutes_ago=20,
             headline="Kayshon Boutte heads to the Texans from the Patriots",
         ),
         _row(
             "Kayshon Boutte",
             "trade",
-            3,
+            4,
             minutes_ago=10,
             headline=(
                 "It's a 2028 seventh-rounder, the Saints one, going in the trade. "
@@ -211,7 +258,12 @@ def test_trade_context_uses_explicit_origin_and_destination_not_pick_provenance(
         now=NOW,
         roster_snapshot=snapshot,
         player_index={
-            "1": {"full_name": "Kayshon Boutte", "position": "WR", "team": "HOU"}
+            "1": {
+                "full_name": "Kayshon Boutte",
+                "position": "WR",
+                "team": "HOU",
+                "search_rank": 164,
+            }
         },
     )
     rendered = "\n".join(recap.parts)
@@ -234,7 +286,7 @@ def test_trade_compensation_provenance_is_not_a_player_team() -> None:
             _row(
                 "Kayshon Boutte",
                 "trade",
-                3,
+                4,
                 headline=(
                     "Kayshon Boutte was traded for a seventh-round pick "
                     "originally from the Saints to the Texans"
@@ -244,7 +296,12 @@ def test_trade_compensation_provenance_is_not_a_player_team() -> None:
         now=NOW,
         roster_snapshot=snapshot,
         player_index={
-            "1": {"full_name": "Kayshon Boutte", "position": "WR", "team": "HOU"}
+            "1": {
+                "full_name": "Kayshon Boutte",
+                "position": "WR",
+                "team": "HOU",
+                "search_rank": 164,
+            }
         },
     )
     rendered = "\n".join(recap.parts)
@@ -281,14 +338,19 @@ def test_trade_prefix_uses_nearest_subject_clause_not_an_earlier_team(
             _row(
                 "Kayshon Boutte",
                 "trade",
-                3,
+                4,
                 headline=headline,
             )
         ],
         now=NOW,
         roster_snapshot=snapshot,
         player_index={
-            "1": {"full_name": "Kayshon Boutte", "position": "WR", "team": "NE"}
+            "1": {
+                "full_name": "Kayshon Boutte",
+                "position": "WR",
+                "team": "NE",
+                "search_rank": 164,
+            }
         },
     )
     rendered = "\n".join(recap.parts)
@@ -320,7 +382,12 @@ def test_release_context_survives_sleeper_clearing_the_players_team() -> None:
         now=NOW,
         roster_snapshot=snapshot,
         player_index={
-            "1": {"full_name": "Noah Brown", "position": "WR", "team": ""}
+            "1": {
+                "full_name": "Noah Brown",
+                "position": "WR",
+                "team": "",
+                "search_rank": 150,
+            }
         },
     )
 
@@ -348,7 +415,7 @@ def test_signing_context_stays_in_the_subject_clause(headline: str) -> None:
             _row(
                 "Noah Brown",
                 "signing",
-                3,
+                4,
                 source="rotowire",
                 headline=headline,
             )
@@ -356,7 +423,12 @@ def test_signing_context_stays_in_the_subject_clause(headline: str) -> None:
         now=NOW,
         roster_snapshot=snapshot,
         player_index={
-            "1": {"full_name": "Noah Brown", "position": "WR", "team": ""}
+            "1": {
+                "full_name": "Noah Brown",
+                "position": "WR",
+                "team": "",
+                "search_rank": 150,
+            }
         },
     )
 
@@ -437,11 +509,16 @@ def test_position_room_matching_normalizes_provider_team_aliases() -> None:
     snapshot = _roster_snapshot(("Brian Robinson", "RB", "WSH", "RB", espn))
 
     recap = format_daily_recap(
-        [_row("Austin Ekeler", "injury", 3)],
+        [_row("Austin Ekeler", "injury", 4)],
         now=NOW,
         roster_snapshot=snapshot,
         player_index={
-            "1": {"full_name": "Austin Ekeler", "position": "RB", "team": "WAS"}
+            "1": {
+                "full_name": "Austin Ekeler",
+                "position": "RB",
+                "team": "WAS",
+                "search_rank": 80,
+            }
         },
     )
 
@@ -455,7 +532,7 @@ def test_same_named_defender_does_not_mask_a_fantasy_position_record() -> None:
     snapshot = _roster_snapshot(("A.J. Brown", "WR", "PHI", "WR", espn))
 
     recap = format_daily_recap(
-        [_row("DeVonta Smith", "injury", 3)],
+        [_row("DeVonta Smith", "injury", 4)],
         now=NOW,
         roster_snapshot=snapshot,
         player_index={
@@ -468,6 +545,7 @@ def test_same_named_defender_does_not_mask_a_fantasy_position_record() -> None:
                 "full_name": "DeVonta Smith",
                 "position": "WR",
                 "team": "PHI",
+                "search_rank": 35,
             },
         },
     )

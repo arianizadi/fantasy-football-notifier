@@ -16,6 +16,7 @@ import shutil
 import sqlite3
 import tempfile
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 from pathlib import Path
@@ -46,6 +47,8 @@ ARCHIVE_URGENCY_GUARD_SQL = """
     )
 """
 SNAPSHOT_ATTEMPTS = 5
+INITIALIZE_BUSY_TIMEOUT_SECONDS = 10
+INITIALIZE_BUSY_RETRY_SECONDS = 0.01
 
 
 def archive_urgency_can_write(row: dict[str, Any]) -> bool:
@@ -350,7 +353,25 @@ class EventStore:
 
     def _initialize(self) -> None:
         with self._lock:
-            self._connection.execute("PRAGMA journal_mode=WAL")
+            # Changing journal mode briefly needs an exclusive database lock,
+            # but SQLite's busy timeout is not consistently honored by this
+            # PRAGMA. Concurrent process/thread startup can therefore fail
+            # immediately before BEGIN IMMEDIATE gets a chance to serialize
+            # schema migration. Retry only the transient busy/locked case;
+            # every other SQLite error remains fail-fast.
+            deadline = time.monotonic() + INITIALIZE_BUSY_TIMEOUT_SECONDS
+            while True:
+                try:
+                    self._connection.execute("PRAGMA journal_mode=WAL")
+                    break
+                except sqlite3.OperationalError as error:
+                    message = str(error).casefold()
+                    if "locked" not in message and "busy" not in message:
+                        raise
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise
+                    time.sleep(min(INITIALIZE_BUSY_RETRY_SECONDS, remaining))
             self._connection.execute("PRAGMA synchronous=NORMAL")
             try:
                 # Serialize schema inspection and DDL across independent

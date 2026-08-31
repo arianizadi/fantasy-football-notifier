@@ -2026,18 +2026,8 @@ def test_ambiguous_multi_player_report_never_triggers_roster_moves(monkeypatch) 
 
     alert = notifier._evaluate(item)
 
-    assert alert is not None
+    assert alert is None
     notifier._refresh_ownership_just_in_time.assert_not_called()
-    assert alert.classification.event_type == "other"
-    assert alert.classification.raw["subject_attribution"] == "uncertain"
-    assert all(not plays.has_action for plays in alert.per_league)
-    rendered = format_alert(alert)
-    assert "automatic pickup and lineup moves are withheld" in rendered
-    assert "<b>UPDATE</b>" in rendered
-    assert "<b>INJURY</b>" not in rendered
-    assert "Backup Player will take over" not in rendered
-    assert "Pickup option" not in rendered
-    assert "Start instead" not in rendered
 
 
 def test_ambiguous_league_commentary_requires_severity_four() -> None:
@@ -2051,7 +2041,7 @@ def test_ambiguous_league_commentary_requires_severity_four() -> None:
     assert notifier._threshold_for("league", subject_confident=False) == 4
 
 
-def test_non_transaction_release_fails_closed_through_fallback_pipeline(monkeypatch) -> None:
+def test_ambiguous_release_without_model_is_filtered_by_threshold(monkeypatch) -> None:
     notifier = Notifier.__new__(Notifier)
     league = LeagueRef("sleeper", "1234", "Home League", "Mine")
     plays = LeaguePlays(
@@ -2099,17 +2089,13 @@ def test_non_transaction_release_fails_closed_through_fallback_pipeline(monkeypa
     stream._session.close()
 
     assert item.subject_confident is False
-    assert _fallback("test outage", item).event_type == "release"
+    fallback = _fallback("test outage", item)
+    assert fallback.event_type == "release"
+    assert fallback.severity == 3
     alert = notifier._evaluate(item)
 
-    assert alert is not None
-    assert alert.classification.event_type == "other"
-    assert alert.classification.raw["subject_attribution"] == "uncertain"
-    assert all(not league_plays.has_action for league_plays in alert.per_league)
-    rendered = format_alert(alert)
-    assert "automatic pickup and lineup moves are withheld" in rendered
-    assert "Pickup option" not in rendered
-    assert "Start instead" not in rendered
+    assert alert is None
+    notifier._refresh_ownership_just_in_time.assert_not_called()
 
 
 def test_outbox_retries_preserve_chronological_order_across_sources(tmp_path) -> None:

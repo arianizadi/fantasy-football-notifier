@@ -114,11 +114,13 @@ def test_mobile_waiver_alert_has_scan_first_sections_and_one_option_per_line():
         classification=Classification("injury", 3, "", True, {}),
         tier="claimable",
         per_league=[
-            LeaguePlays(
-                league=league,
-                subject_state="rostered",
-                subject_owner="CMC Tax Ret",
-                beneficiaries=[
+                LeaguePlays(
+                    league=league,
+                    subject_state="rostered",
+                    subject_owner="CMC Tax Ret",
+                    subject_depth_order=1,
+                    subject_position="RB",
+                    beneficiaries=[
                     Beneficiary("Jam Miller", "RB", 3, "free_agent"),
                     Beneficiary("Reggie Gilliam", "RB", 4, "free_agent"),
                 ],
