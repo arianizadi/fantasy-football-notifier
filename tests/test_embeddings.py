@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
+import requests
+from unittest.mock import Mock
 
 from notifier.dedupe import semantic_event_type
 from notifier.embeddings import (
@@ -144,6 +146,41 @@ def test_openrouter_client_validates_payload_and_vector() -> None:
     assert vector.values == pytest.approx((0.6, 0.8))
     assert vector.prompt_tokens == 7
     assert vector.input_hash == embedding_input_hash("hello")
+
+
+@pytest.mark.parametrize("error", [requests.ReadTimeout, requests.ConnectionError])
+def test_embedding_transport_retry_recovers_without_opening_circuit(monkeypatch, error):
+    monkeypatch.setattr("notifier.embeddings.time.sleep", lambda _: None)
+    response = Mock()
+    response.json.return_value = {"data": [{"index": 0, "embedding": [3, 4]}]}
+    post = Mock(side_effect=[error("temporary"), response])
+    client = OpenRouterEmbeddingClient("secret", "model", 2, post=post)
+    assert client.embed_one("hello").values == pytest.approx((0.6, 0.8))
+    assert post.call_count == 2
+    assert client._failures == 0
+
+
+def test_embedding_transport_retry_is_bounded_and_preserves_circuit(monkeypatch):
+    monkeypatch.setattr("notifier.embeddings.time.sleep", lambda _: None)
+    post = Mock(side_effect=requests.ReadTimeout("temporary"))
+    client = OpenRouterEmbeddingClient("secret", "model", 2, post=post)
+    for _ in range(2):
+        with pytest.raises(EmbeddingUnavailable):
+            client.embed_one("hello")
+    assert post.call_count == 4
+    with pytest.raises(EmbeddingUnavailable, match="circuit"):
+        client.embed_one("hello")
+    assert post.call_count == 4
+
+
+def test_embedding_auth_error_is_not_retried():
+    response = Mock()
+    response.raise_for_status.side_effect = requests.HTTPError("unauthorized")
+    post = Mock(return_value=response)
+    client = OpenRouterEmbeddingClient("secret", "model", 2, post=post)
+    with pytest.raises(EmbeddingUnavailable):
+        client.embed_one("hello")
+    assert post.call_count == 1
 
 
 def test_openrouter_client_fails_closed_on_malformed_vector() -> None:

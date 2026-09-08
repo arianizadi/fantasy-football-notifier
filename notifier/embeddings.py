@@ -314,7 +314,7 @@ class OpenRouterEmbeddingClient:
             raise EmbeddingUnavailable("OpenRouter embedding key is unavailable")
         self._before_request()
         try:
-            response = self._post(
+            response = self._post_with_retry(
                 OPENROUTER_EMBEDDINGS_URL,
                 headers={
                     "Authorization": f"Bearer {self.api_key}",
@@ -380,6 +380,19 @@ class OpenRouterEmbeddingClient:
 
     def embed_one(self, text: str) -> EmbeddingVector:
         return self.embed_many([text])[0]
+
+    def _post_with_retry(self, *args: Any, **kwargs: Any) -> Any:
+        """Retry a transient transport failure once in the background worker.
+
+        HTTP errors and malformed vectors still fail immediately. The caller's
+        circuit breaker records exhausted requests, not recovered attempts.
+        """
+        try:
+            return self._post(*args, **kwargs)
+        except (requests.Timeout, requests.ConnectionError):
+            time.sleep(0.5)
+            self._before_request()
+            return self._post(*args, **kwargs)
 
 
 class EmbeddingService:
