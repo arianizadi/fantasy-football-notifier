@@ -5,6 +5,7 @@ import pytest
 import requests
 
 from notifier.classify import classify
+from notifier.config import DEFAULT_MODEL
 from notifier.models import Classification, NewsItem, RosterSnapshot
 from notifier.pipeline import Notifier
 
@@ -28,13 +29,133 @@ def _config():
     )
 
 
-def _response(payload: str) -> Mock:
+def _response(payload: object) -> Mock:
     response = Mock()
     response.raise_for_status.return_value = None
     response.json.return_value = {
         "choices": [{"message": {"content": payload}}],
     }
     return response
+
+
+MALFORMED_CONTENT = [
+    pytest.param(None, id="missing-content"),
+    pytest.param({}, id="object-content"),
+    pytest.param([], id="list-content"),
+    pytest.param("", id="empty-content"),
+    pytest.param('{"event_type":"injury",', id="truncated-json"),
+    pytest.param("null", id="json-null"),
+    pytest.param("[]", id="json-list"),
+    pytest.param('[{"severity":4}]', id="json-list-of-objects"),
+    pytest.param('"not an object"', id="json-string"),
+    pytest.param('"{}"', id="json-string-with-braces"),
+    pytest.param("```json\n[{}]\n```", id="fenced-json-list"),
+]
+
+
+@pytest.mark.parametrize("content", MALFORMED_CONTENT)
+def test_malformed_model_content_recovers_on_later_response(
+    monkeypatch, content: object
+) -> None:
+    session = Mock()
+    session.post.side_effect = [
+        _response(content),
+        _response(
+            '{"event_type":"practice_report","direction":"neutral",'
+            '"severity":2,"fantasy_impact":"Limited practice participation",'
+            '"is_actionable":false}'
+        ),
+    ]
+    sleep = Mock()
+    monkeypatch.setattr("notifier.classify.time.sleep", sleep)
+
+    result = classify(session, _config(), _item("Example Player was limited"))
+
+    assert result.event_type == "practice_report"
+    assert result.severity == 2
+    assert result.is_actionable is False
+    assert "error" not in result.raw
+    assert session.post.call_count == 2
+    sleep.assert_called_once_with(0.5)
+
+
+@pytest.mark.parametrize("content", MALFORMED_CONTENT)
+@pytest.mark.parametrize(
+    ("headline", "event_type", "severity", "high_signal"),
+    [
+        ("Routine player update", "other", 3, False),
+        ("Example Player suffered a torn ACL", "injury", 4, True),
+    ],
+)
+def test_malformed_model_content_falls_back_after_bounded_retries(
+    monkeypatch,
+    content: object,
+    headline: str,
+    event_type: str,
+    severity: int,
+    high_signal: bool,
+) -> None:
+    session = Mock()
+    session.post.return_value = _response(content)
+    sleep = Mock()
+    monkeypatch.setattr("notifier.classify.time.sleep", sleep)
+
+    result = classify(session, _config(), _item(headline))
+
+    assert result.event_type == event_type
+    assert result.severity == severity
+    assert result.is_actionable is True
+    assert result.raw["error"] == "unparseable_response"
+    assert result.raw["high_signal_floor"] is high_signal
+    assert session.post.call_count == 3
+    assert [call.args[0] for call in sleep.call_args_list] == [0.5, 1.0]
+
+
+@pytest.mark.parametrize(
+    "wrapper",
+    ["{payload}", "```json\n{payload}\n```", "Classification: {payload}"],
+)
+def test_valid_json_objects_still_allow_fences_and_prose(wrapper: str) -> None:
+    session = Mock()
+    payload = (
+        '{"event_type":"practice_report","severity":2,'
+        '"fantasy_impact":"Limited practice participation",'
+        '"is_actionable":false}'
+    )
+    session.post.return_value = _response(wrapper.format(payload=payload))
+
+    result = classify(session, _config(), _item("Example Player was limited"))
+
+    assert result.event_type == "practice_report"
+    assert result.severity == 2
+    assert "error" not in result.raw
+    session.post.assert_called_once()
+
+
+def test_default_model_request_preserves_fast_json_contract() -> None:
+    session = Mock()
+    session.post.return_value = _response(
+        '{"event_type":"practice_report","direction":"neutral",'
+        '"severity":2,"fantasy_impact":"Limited practice participation",'
+        '"is_actionable":false}'
+    )
+    config = _config()
+    config.openrouter_model = DEFAULT_MODEL
+
+    result = classify(session, config, _item("Example Player was limited"))
+
+    assert result.severity == 2
+    session.post.assert_called_once()
+    request = session.post.call_args
+    assert request.args == ("https://openrouter.ai/api/v1/chat/completions",)
+    assert request.kwargs["timeout"] == 20
+    payload = request.kwargs["json"]
+    assert payload["model"] == DEFAULT_MODEL
+    assert payload["reasoning"] == {"enabled": False}
+    assert payload["response_format"] == {"type": "json_object"}
+    assert payload["max_tokens"] == 400
+    assert payload["temperature"] == 0
+    assert payload["provider"] == {"sort": "throughput"}
 
 
 def test_transient_model_failures_retry_with_bounded_backoff(monkeypatch) -> None:

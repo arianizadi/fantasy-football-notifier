@@ -9,7 +9,7 @@ from pathlib import Path
 
 from .logging_utils import NotifierError
 
-DEFAULT_MODEL = "deepseek/deepseek-v4-flash-0731"
+DEFAULT_MODEL = "deepseek/deepseek-v4.1-flash"
 DEFAULT_POLL_SECONDS = 15
 DEFAULT_POLL_SECONDS_IDLE = 60
 DEFAULT_MIN_SEVERITY = 2
@@ -157,7 +157,7 @@ def validate_model(value: str, *, variable: str = "OPENROUTER_MODEL") -> str:
     if "/" not in value:
         raise NotifierError(
             f"{variable} must be a full OpenRouter slug, e.g. "
-            "deepseek/deepseek-v4-flash-0731"
+            "deepseek/deepseek-v4.1-flash"
         )
     return value
 

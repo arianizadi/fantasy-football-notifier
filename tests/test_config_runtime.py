@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -9,6 +10,38 @@ from notifier.logging_utils import NotifierError
 from notifier.models import RosterSnapshot
 from notifier.pipeline import Notifier
 from notifier.sources.sleeper import PlayerIndex
+
+
+@pytest.mark.parametrize(
+    ("override", "expected"),
+    [
+        (None, "deepseek/deepseek-v4.1-flash"),
+        ("  ", "deepseek/deepseek-v4.1-flash"),
+        ("deepseek/deepseek-v4-flash-0731", "deepseek/deepseek-v4-flash-0731"),
+    ],
+)
+def test_classifier_model_default_and_explicit_rollback(
+    tmp_path, monkeypatch, override, expected
+) -> None:
+    # Isolate from any developer/provider settings in the surrounding shell.
+    for name in tuple(os.environ):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in {
+        "TELEGRAM_BOT_TOKEN": "fake-token",
+        "TELEGRAM_CHAT_ID": "123",
+        "OPENROUTER_API_KEY": "fake-key",
+        "SLEEPER_USERNAME": "example",
+        "NOTIFIER_STATE_DIR": str(tmp_path / "state"),
+        "DRY_RUN": "true",
+    }.items():
+        monkeypatch.setenv(name, value)
+    if override is not None:
+        monkeypatch.setenv("OPENROUTER_MODEL", override)
+
+    config = load_config()
+
+    assert config.openrouter_model == expected
+    assert config.embedding_model == "qwen/qwen3-embedding-8b"
 
 
 @pytest.mark.parametrize("value", ["nan", "inf", "-inf"])

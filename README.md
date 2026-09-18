@@ -384,7 +384,7 @@ Important configuration:
 | Variable | Purpose |
 |---|---|
 | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | Telegram destination. |
-| `OPENROUTER_API_KEY`, `OPENROUTER_MODEL` | Pinned classifier provider/model. |
+| `OPENROUTER_API_KEY`, `OPENROUTER_MODEL` | Pinned classifier provider/model; defaults to `deepseek/deepseek-v4.1-flash`. |
 | `EMBEDDING_MODE`, `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS` | Optional OpenRouter vector archive and guarded coalescing (`off`, `shadow`, or `coalesce`). |
 | `EMBEDDING_SIMILARITY_THRESHOLD`, `EMBEDDING_WINDOW_HOURS` | Similarity gate and same-player comparison window; defaults `0.90` and six hours. |
 | `URGENCY_EMBEDDING_THRESHOLD`, `URGENCY_EMBEDDING_MIN_NEIGHBORS`, `URGENCY_EMBEDDING_HISTORY_DAYS`, `URGENCY_EMBEDDING_LIFT_ENABLED` | Conservative, context-matched history gate for urgency corroboration; defaults `0.70`, two independent players, 365 days, and no automatic band lift. |
@@ -407,6 +407,13 @@ Important configuration:
 | `DAILY_DIGEST_ENABLED`, `DAILY_DIGEST_HOUR`, `DAILY_DIGEST_TIMEZONE` | Morning rolling-24h recap; default 8 AM Pacific. |
 | `WAIVER_REPORT_ENABLED`, `WAIVER_REPORT_LEAD_HOURS` | Legacy scheduled long-form waiver report; disabled by default. |
 | `DRY_RUN` | Print alerts without sending them. |
+
+The classifier requests JSON with reasoning disabled and a 400-token output
+limit. Existing deployments must update `OPENROUTER_MODEL` in their private
+`.env` and restart: an explicit environment value overrides the code default.
+To roll back the model, set it to `deepseek/deepseek-v4-flash-0731` and restart.
+This classifier upgrade does not change the embedding model, stored vectors,
+or deterministic roster-action and notification gates.
 
 X pricing and quotas can change. Verify current terms before enabling the
 stream; `bin/measure-reporters.py` can measure configured account volume.

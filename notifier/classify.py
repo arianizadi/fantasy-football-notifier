@@ -1,4 +1,4 @@
-"""Classify a news item with DeepSeek V4 Flash via OpenRouter.
+"""Classify a news item with the configured model via OpenRouter.
 
 Every draft-relevant or in-season feed item can reach this stage.
 Classification failure is non-fatal: an unclassifiable item still alerts,
@@ -60,6 +60,9 @@ Return ONLY a JSON object with these keys:
   is_actionable: true if the manager should consider a lineup or waiver move
 
 Judge severity by fantasy consequence, not by how dramatic the wording is.
+Questionable and doubtful injury designations are injury or practice_report,
+not inactive. Use inactive only for an explicit inactive or ruled-out status.
+Do not turn a possible absence into a confirmed absence in fantasy_impact.
 For legal or disciplinary news, use suspension only when the player is
 explicitly suspended or placed on the Commissioner Exempt List; use inactive
 when that is the explicit game status. An arrest, charge, allegation,
@@ -108,17 +111,24 @@ SUSPENSION_NEGATION_PREFIX = re.compile(
 HIGH_SIGNAL_FLOOR = 4
 
 
-def _extract_json(text: str) -> dict:
+def _extract_json(text: object) -> dict:
     """Parse the model's JSON, tolerating markdown fences or stray prose."""
+    if not isinstance(text, str):
+        raise TypeError("Model response content must be a string")
     candidate = text.strip()
-    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", candidate, re.DOTALL)
+    fenced = re.search(r"```(?:json)?\s*(.*?)\s*```", candidate, re.DOTALL)
     if fenced:
         candidate = fenced.group(1)
-    else:
+    try:
+        parsed = json.loads(candidate)
+    except json.JSONDecodeError:
         braced = re.search(r"\{.*\}", candidate, re.DOTALL)
-        if braced:
-            candidate = braced.group(0)
-    return json.loads(candidate)
+        if not braced:
+            raise
+        parsed = json.loads(braced.group(0))
+    if not isinstance(parsed, dict):
+        raise ValueError("Model response must decode to a JSON object")
+    return parsed
 
 
 def _has_confirmed_suspension(text: str) -> bool:
@@ -223,15 +233,10 @@ def classify(
                     "temperature": 0,
                     "max_tokens": 400,
                     "response_format": {"type": "json_object"},
-                    # DeepSeek v4 emits reasoning tokens by default, which for this
-                    # task burned 1500+ tokens, returned NO content at all, and took
-                    # 66s per call. Disabling it is 37x faster and 11x cheaper with
-                    # identical classifications. Measured, not assumed.
+                    # Keep the small completion budget available for the JSON
+                    # classification instead of intermediate reasoning tokens.
                     "reasoning": {"enabled": False},
-                    # Default routing sprays across ~6 providers and the tail
-                    # reached 8.9s. Pinning by throughput held max at 1.5s --
-                    # a 5.8x better worst case, which matters more than median
-                    # for a breaking-news alert.
+                    # Prefer faster providers for the breaking-news alert path.
                     "provider": {"sort": "throughput"},
                     "messages": [
                         {
@@ -262,7 +267,7 @@ def classify(
                 break
         except (KeyError, IndexError, TypeError, ValueError) as error:
             # A provider occasionally returns a successful HTTP response with
-            # empty content. Retry it just like a transient transport failure.
+            # malformed content. Retry it like a transient transport failure.
             failure_reason = "unparseable_response"
             retrying = attempt < MAX_REQUEST_ATTEMPTS
             structured_log(
